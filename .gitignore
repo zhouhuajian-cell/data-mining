@@ -1,0 +1,30 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 模型文件（体积大，不推）
+*.pt
+*.pt.*
+*.part
+*.pth
+*.onnx
+
+# 数据 / 生成产物
+workspace/
+有效/
+*.npy
+*.faiss
+
+# 临时/输出文件
+_app_out.txt
+_check.txt
+
+# 系统文件
+.DS_Store
+Thumbs.db

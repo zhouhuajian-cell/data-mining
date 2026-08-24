@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>自动驾驶场景挖掘引擎 (带目标计数的标签版)</title>
+    <style>
+        :root { --primary: #2563eb; --bg: #f3f4f6; --card: #ffffff; --border: #e5e7eb; }
+        body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: var(--bg); color: #1f2937; }
+        header { background: #111827; color: white; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+        .container { padding: 24px; max-width: 1400px; margin: 0 auto; }
+        .panel { background: var(--card); padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 24px; }
+        .panel-header { font-size: 1.1rem; font-weight: 600; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+        .control-group { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+        input[type="text"], input[type="number"] { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; outline: none; }
+        input[type="text"] { flex: 1; min-width: 300px; }
+        button { padding: 8px 16px; background: var(--primary); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; transition: background 0.2s; }
+        button:hover { background: #1d4ed8; }
+        button.secondary { background: #6b7280; }
+        button.yolo-btn { background: #059669; }
+        button.export-btn { background: #eab308; color: #000; font-weight: 600; }
+        button.export-btn:hover { background: #ca8a04; }
+        .slider-container { display: flex; align-items: center; gap: 12px; font-size: 14px; background: #f9fafb; padding: 8px 16px; border-radius: 6px; }
+        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
+        .card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: white; transition: box-shadow 0.2s; position: relative; }
+        .img-wrapper { position: relative; width: 100%; background: #000; display: flex; align-items: center; justify-content: center; }
+        .img-wrapper img { width: 100%; height: auto; display: block; cursor: zoom-in; }
+        .box-overlay { position: absolute; border: 2px solid #10b981; background: rgba(16, 185, 129, 0.15); pointer-events: none; }
+        .box-label { position: absolute; top: -20px; left: -2px; background: #10b981; color: white; font-size: 11px; padding: 2px 4px; border-radius: 2px; white-space: nowrap; font-weight: bold; }
+        .card-info { padding: 12px; font-size: 14px; }
+        .badge { background: #dbeafe; color: #1e40af; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; display: inline-block; margin-bottom: 4px; }
+        .meta-text { color: #6b7280; font-size: 12px; margin-top: 8px; word-break: break-all; }
+        .select-checkbox { transform: scale(1.5); cursor: pointer; margin-right: 8px; accent-color: #10b981;}
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.85); align-items: center; justify-content: center; }
+        .modal.active { display: flex; }
+        .modal-content { position: relative; display: inline-block; max-width: 90vw; max-height: 90vh; }
+        .modal-content img { display: block; max-width: 90vw; max-height: 90vh; width: auto; height: auto; border-radius: 4px; }
+        .close-btn { position: absolute; top: -40px; right: 0; color: white; font-size: 30px; font-weight: bold; cursor: pointer; z-index: 1001; }
+        .stats-bar { margin-bottom: 16px; font-size: 15px; font-weight: 600; color: #1e40af; background: #e0e7ff; padding: 12px 16px; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; border: 1px solid #bfdbfe; }
+        .stats-number { font-size: 18px; font-weight: 800; padding: 0 4px; }
+        .progress-container { width: 100%; background-color: #e5e7eb; border-radius: 4px; margin-top: 10px; display: none; height: 12px; overflow: hidden; }
+        .progress-bar { height: 100%; background-color: #059669; width: 0%; transition: width 0.3s; }
+        .pagination-bar { display: none; background: #f8fafc; padding: 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 16px; align-items: center; justify-content: space-between; }
+        .pagination-controls { display: flex; gap: 8px; align-items: center; }
+        .page-btn { background: #fff; color: #374151; border: 1px solid #d1d5db; }
+        .page-btn:hover { background: #f3f4f6; }
+        .page-btn:disabled { background: #e5e7eb; color: #9ca3af; cursor: not-allowed; }
+        
+        .tags-container { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .tag-item { background: #dbeafe; color: #1d4ed8; padding: 2px 8px; border-radius: 4px; font-size: 12px; display: flex; align-items: center; border: 1px solid #bfdbfe; }
+        .tag-remove { margin-left: 6px; color: #ef4444; cursor: pointer; font-weight: bold; }
+        .tag-remove:hover { color: #b91c1c; }
+        .tag-add-btn { background: #f3f4f6; border: 1px dashed #9ca3af; padding: 2px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; color: #4b5563; }
+        .tag-add-btn:hover { background: #e5e7eb; }
+    </style>
+</head>
+<body>
+    <header>
+        <div style="font-weight: 600; font-size: 1.2rem;">自动驾驶场景挖掘与标注引擎</div>
+        <div>
+            <button class="secondary" onclick="exportData()">⬇️ 导出已勾选 JSON</button>
+            <button class="export-btn" onclick="exportImagesZip()" style="margin-left: 12px;">📦 导出已勾选图片 (ZIP)</button>
+        </div>
+    </header>
+    <div class="container">
+        <!-- 模块 1 -->
+        <div class="panel">
+            <div class="panel-header">1. 本地数据池挂载 (全自动流式入库)</div>
+            <div class="control-group">
+                <input type="file" id="fileInput" multiple accept="image/*">
+                <button id="uploadBtn" onclick="uploadImagesInBatches()">一键全量入库</button>
+                <span id="indexStatus" style="color: #059669; font-weight: 500;">等待上传...</span>
+            </div>
+            <div id="progressContainer" class="progress-container">
+                <div id="progressBar" class="progress-bar"></div>
+            </div>
+        </div>
+
+        <!-- 模块 2 -->
+        <div class="panel">
+            <div class="panel-header">2. 数据池去重与冗余分析</div>
+            <div class="control-group">
+                相似度判定阈值: <input type="number" id="dedupThreshold" value="0.95" step="0.01" min="0.5" max="1.0" style="width: 80px;">
+                <button onclick="runDeduplicationAnalysis()" style="background: #e11d48;">📊 全局特征去重扫描</button>
+                <button id="exportRedundantBtn" onclick="exportRedundantList()" style="background: #475569; display: none;">🗑️ 导出清单 (TXT)</button>
+                <button id="deleteAndSyncBtn" onclick="deleteAndSync()" style="background: #dc2626; display: none; margin-left: 8px;">🧹 永久删除冗余并同步底库</button>
+                <span id="dedupStatus" style="font-size: 14px; font-weight: 500;"></span>
+            </div>
+            <div id="statsSummary" style="display: none; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 16px;">
+                <div style="background: #f8fafc; padding: 12px; border-radius: 6px; text-align: center; border: 1px solid var(--border);"><div style="color: #64748b; font-size: 12px;">底库总帧数</div><div id="statTotal" style="font-size: 20px; font-weight: bold; color: #1e293b;">0</div></div>
+                <div style="background: #f0fdf4; padding: 12px; border-radius: 6px; text-align: center; border: 1px solid #bbf7d0;"><div style="color: #166534; font-size: 12px;">唯一有效帧</div><div id="statUnique" style="font-size: 20px; font-weight: bold; color: #15803d;">0</div></div>
+                <div style="background: #fef2f2; padding: 12px; border-radius: 6px; text-align: center; border: 1px solid #fecaca;"><div style="color: #991b1b; font-size: 12px;">冗余重复帧</div><div id="statDuplicates" style="font-size: 20px; font-weight: bold; color: #b91c1c;">0</div></div>
+                <div style="background: #fff7ed; padding: 12px; border-radius: 6px; text-align: center; border: 1px solid #fed7aa;"><div style="color: #9a3412; font-size: 12px;">整体冗余率</div><div id="statRate" style="font-size: 20px; font-weight: bold; color: #c2410c;">0%</div></div>
+            </div>
+        </div>
+
+        <!-- 模块 3 -->
+        <div class="panel">
+            <div class="panel-header">3. 语义场景挖掘 & 目标定位</div>
+            
+            <div class="control-group">
+                <input type="text" id="queryInput" placeholder="全局检索场景，例如: a photo of vehicles on the street...">
+                Top K: <input type="number" id="topKInput" value="500" style="width: 80px;">
+                <button onclick="searchScenes()">多模态检索 (文本搜图)</button>
+                <button onclick="startBrowseAll()" style="background: #0ea5e9; margin-left: 8px;">📂 全库分页浏览</button>
+            </div>
+            
+            <!-- 👇 新增：按文件名搜索控件 👇 -->
+            <div class="control-group" style="border-top: 1px dashed var(--border); padding-top: 16px;">
+                <span style="font-weight: 500; font-size: 14px; color: #4b5563;">🔍 精确打捞:</span>
+                <input type="text" id="filenameInput" placeholder="输入部分或完整文件名 (如: 1781259270)">
+                <button onclick="searchByFilename()" style="background: #f97316;">精准文件名检索</button>
+            </div>
+            
+            <div class="control-group" style="border-top: 1px dashed var(--border); padding-top: 16px;">
+                <span style="font-weight: 500; font-size: 14px; color: #4b5563;">🎯 搜同类图:</span>
+                <input type="file" id="externalImageInput" accept="image/*">
+                <button onclick="searchByExternalImage()" style="background: #8b5cf6;">上传该图并搜索底库</button>
+            </div>
+            
+            <div class="control-group" style="border-top: 1px dashed var(--border); padding-top: 16px;">
+                <button class="yolo-btn" onclick="runBatchDetection('yolo')">执行 YOLOv8x 快速检测</button>
+                <span style="color: #9ca3af; margin: 0 8px;">|</span>
+                <input type="text" id="dinoPrompt" placeholder="DINO 开放词汇检测，如: road sign.">
+                <button onclick="runBatchDetection('dino')">执行 DINO 细粒度检测</button>
+            </div>
+            
+            <div class="control-group" style="flex-direction: column; align-items: flex-start; gap: 10px;">
+                <div class="slider-container" style="width: 100%;">
+                    <span style="width: 220px;">🖼️ CLIP 匹配度底线: <span id="clipThresholdVal" style="font-weight:bold; color:var(--primary);">0.20</span></span>
+                    <input type="range" id="clipSlider" min="-1" max="1" step="0.01" value="0.20" oninput="updateClipThreshold(this.value)" style="flex: 1;">
+                </div>
+                <div class="slider-container" style="width: 100%; background: #f0fdf4;">
+                    <span style="width: 220px;">🎯 YOLO/DINO 置信度: <span id="boxThresholdVal" style="font-weight:bold; color:#10b981;">0.50</span></span>
+                    <input type="range" id="boxSlider" min="0" max="1" step="0.01" value="0.50" oninput="updateBoxThreshold(this.value)" style="flex: 1;">
+                </div>
+            </div>
+            
+            <div class="stats-bar">
+                <div>
+                    👁️ 当前展示: <span id="dispCount" class="stats-number" style="color: #1d4ed8;">0</span> 张 
+                    <span style="margin: 0 16px; color: #94a3b8;">|</span> 
+                    🎯 包含有效目标的图片: <span id="targetCount" class="stats-number" style="color: #059669;">0</span> 张
+                </div>
+                <div style="font-size: 13px; font-weight: normal; color: #475569;">
+                    (自动勾选包含有效目标的图片，可手动编辑标签。导出的 JSON 均基于已勾选项及最终标签)
+                </div>
+            </div>
+            
+            <!-- 分页控制台 -->
+            <div id="paginationBar" class="pagination-bar">
+                <div style="font-size: 14px; color: #4b5563;">
+                    全库数据浏览中... 当前第 <span id="pageCurrent" style="font-weight: bold; color: var(--primary);">1</span> 页 / 共 <span id="pageTotal" style="font-weight: bold;">0</span> 页 
+                    (总计 <span id="itemTotal">0</span> 帧)
+                </div>
+                <div class="pagination-controls">
+                    <button id="prevPageBtn" class="page-btn" onclick="changePage(-1)">上一页</button>
+                    <input type="number" id="jumpPageInput" min="1" style="width: 60px; padding: 4px 8px; margin: 0 4px;" placeholder="页码">
+                    <button class="page-btn" onclick="jumpToPage()" style="background: var(--bg);">跳转</button>
+                    <button id="nextPageBtn" class="page-btn" onclick="changePage(1)">下一页</button>
+                </div>
+            </div>
+
+            <div id="gallery" class="gallery"></div>
+        </div>
+    </div>
+
+    <div id="imageModal" class="modal" onclick="closeModal(event)">
+        <div class="modal-content" id="modalContentWrapper">
+            <span class="close-btn" onclick="closeModal(event)">&times;</span>
+            <img id="modalImg" src="">
+            <div id="modalBoxContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = "http://localhost:8008"; 
+        let currentResults = []; 
+        let currentClipThreshold = 0.20; 
+        let currentBoxThreshold = 0.50;  
+        let redundantFilesList = [];
+        
+        let currentPage = 1;
+        let totalPages = 0;
+        let isBrowseMode = false;
+        
+        const pageSize = 30; 
+
+        window.onload = function() {
+            startBrowseAll();
+        };
+
+        function removeTag(itemIndex, tagText) {
+            const item = currentResults[itemIndex];
+            if(item.userTags) {
+                item.userTags = item.userTags.filter(t => t !== tagText);
+                renderGallery(); 
+            }
+        }
+
+        function addTag(itemIndex) {
+            const newTag = prompt("请输入要添加的标签名称:");
+            if(newTag && newTag.trim() !== "") {
+                const item = currentResults[itemIndex];
+                if(!item.userTags) item.userTags = [];
+                if(!item.userTags.includes(newTag.trim())) {
+                    item.userTags.push(newTag.trim());
+                    renderGallery();
+                }
+            }
+        }
+
+        async function uploadImagesInBatches() {
+            const files = document.getElementById('fileInput').files;
+            if (!files.length) return alert('请先选择图片文件');
+            
+            const totalFiles = files.length;
+            if (totalFiles > 30000) return alert(`当前单次任务容量限制为 30000 张。`);
+            
+            const btn = document.getElementById('uploadBtn');
+            const statusSpan = document.getElementById('indexStatus');
+            const progressContainer = document.getElementById('progressContainer');
+            const progressBar = document.getElementById('progressBar');
+            
+            btn.disabled = true;
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            statusSpan.style.color = '#2563eb';
+            
+            const batchSize = 50; 
+            let totalIndexed = 0;
+            let processedSoFar = 0;
+
+            for (let i = 0; i < totalFiles; i += batchSize) {
+                const chunk = Array.from(files).slice(i, i + batchSize);
+                const formData = new FormData();
+                chunk.forEach(f => formData.append('files', f));
+                
+                statusSpan.innerText = `正在处理第 ${i + 1} 到 ${Math.min(i + batchSize, totalFiles)} 张 / 共 ${totalFiles} 张...`;
+                
+                try {
+                    const res = await fetch(`${API_BASE}/api/upload_batch`, { method: 'POST', body: formData });
+                    const data = await res.json();
+                    
+                    if (!res.ok) { 
+                        alert(`入库被中断: ${data.error}`); 
+                        break; 
+                    }
+                    totalIndexed = data.total_indexed;
+                    processedSoFar += chunk.length;
+                    
+                    const percent = Math.round((processedSoFar / totalFiles) * 100);
+                    progressBar.style.width = `${percent}%`;
+
+                } catch (e) {
+                    alert(`网络请求中断，当前已安全落盘 ${totalIndexed} 帧。由于后端显存释放或并发限制，剩余图片未上传。`);
+                    break;
+                }
+            }
+            
+            btn.disabled = false;
+            if (processedSoFar === totalFiles) {
+                statusSpan.innerText = `✅ 全量入库成功！当前底库总容量: ${totalIndexed} 帧`;
+                statusSpan.style.color = "#059669";
+                startBrowseAll(); 
+            } else {
+                statusSpan.innerText = `⚠️ 任务未完全结束，当前底层实有容量: ${totalIndexed} 帧`;
+                statusSpan.style.color = "#dc2626";
+            }
+        }
+
+        function openModal(index) {
+            const item = currentResults[index];
+            document.getElementById('modalImg').src = `${API_BASE}/api/image/${item.id}`;
+            const boxContainer = document.getElementById('modalBoxContainer');
+            boxContainer.innerHTML = ''; 
+            if (item.detections && item.detections.width) {
+                const origW = item.detections.width, origH = item.detections.height;
+                let validBoxes = item.detections.scores ? item.detections.scores.map((score, i) => ({ score, label: item.detections.labels[i], box: item.detections.boxes[i] })).filter(b => b.score >= currentBoxThreshold) : [];
+                let boxesHTML = '';
+                validBoxes.forEach(b => {
+                    const left = (b.box[0] / origW) * 100, top = (b.box[1] / origH) * 100, width = ((b.box[2] - b.box[0]) / origW) * 100, height = ((b.box[3] - b.box[1]) / origH) * 100;
+                    boxesHTML += `<div class="box-overlay" style="left: ${left}%; top: ${top}%; width: ${width}%; height: ${height}%; border-width: 3px;"><div class="box-label" style="font-size: 14px; top: -24px;">${b.label} ${b.score.toFixed(2)}</div></div>`;
+                });
+                boxContainer.innerHTML = boxesHTML;
+            }
+            document.getElementById('imageModal').classList.add('active');
+        }
+
+        function closeModal(e) {
+            if(e.target.id === 'imageModal' || e.target.className === 'close-btn') { document.getElementById('imageModal').classList.remove('active'); }
+        }
+
+        function hidePagination() {
+            isBrowseMode = false;
+            document.getElementById('paginationBar').style.display = 'none';
+        }
+
+        function startBrowseAll() {
+            currentPage = 1;
+            loadPageData();
+        }
+        
+        function changePage(delta) {
+            let targetPage = currentPage + delta;
+            if (targetPage < 1 || targetPage > totalPages) return;
+            currentPage = targetPage;
+            loadPageData();
+        }
+        
+        function jumpToPage() {
+            const inputVal = parseInt(document.getElementById('jumpPageInput').value);
+            if (inputVal >= 1 && inputVal <= totalPages) {
+                currentPage = inputVal;
+                loadPageData();
+            } else {
+                alert(`页码无效。请输入 1 到 ${totalPages} 之间的数字。`);
+            }
+        }
+
+        async function loadPageData() {
+            isBrowseMode = true;
+            document.body.style.cursor = 'wait';
+            // 不再清空所有框，仅拉取数据
+            document.getElementById('paginationBar').style.display = 'flex'; 
+            
+            try {
+                const res = await fetch(`${API_BASE}/api/list_all?page=${currentPage}&size=${pageSize}`);
+                const data = await res.json();
+                
+                if(data.total === 0) {
+                    hidePagination();
+                    document.getElementById('gallery').innerHTML = '<div style="color: #6b7280; font-style: italic; width: 100%; text-align: center; padding: 20px;">底库暂无数据，请先挂载入库。</div>';
+                    document.getElementById('dispCount').innerText = 0;
+                    document.getElementById('targetCount').innerText = 0;
+                } else {
+                    totalPages = data.total_pages;
+                    currentPage = data.current_page;
+                    
+                    document.getElementById('pageCurrent').innerText = currentPage;
+                    document.getElementById('pageTotal').innerText = totalPages;
+                    document.getElementById('itemTotal').innerText = data.total;
+                    
+                    document.getElementById('prevPageBtn').disabled = (currentPage === 1);
+                    document.getElementById('nextPageBtn').disabled = (currentPage === totalPages);
+                    
+                    currentResults = data.results.map(item => ({ ...item, detections: null, userTags: null }));
+                    renderGallery();
+                }
+            } catch (e) {
+                console.error(e);
+                hidePagination();
+            }
+            document.body.style.cursor = 'default';
+        }
+
+        async function searchScenes() {
+            const query = document.getElementById('queryInput').value;
+            const topK = document.getElementById('topKInput').value;
+            if (!query) return alert('请输入检索词');
+            hidePagination(); 
+            isBrowseMode = false;
+            
+            const formData = new FormData();
+            formData.append('query', query); formData.append('top_k', topK);
+            
+            document.body.style.cursor = 'wait';
+            const res = await fetch(`${API_BASE}/api/search`, { method: 'POST', body: formData });
+            const data = await res.json();
+            currentResults = data.results.map(item => ({ ...item, detections: null, userTags: null }));
+            renderGallery();
+            document.body.style.cursor = 'default';
+        }
+        
+        // 👇 新增：按文件名检索功能 👇
+        async function searchByFilename() {
+            const query = document.getElementById('filenameInput').value.trim();
+            if (!query) return alert('请输入文件名关键字');
+            
+            hidePagination();
+            // 文件名检索我们强制设为浏览模式(原图分数)，这样就不会被 CLIP 滑块过滤掉
+            isBrowseMode = true; 
+            
+            const formData = new FormData();
+            formData.append('filename_query', query);
+            
+            document.body.style.cursor = 'wait';
+            try {
+                const res = await fetch(`${API_BASE}/api/search_by_filename`, { method: 'POST', body: formData });
+                const data = await res.json();
+                
+                if (data.results.length === 0) {
+                    alert(`未找到文件名包含 "${query}" 的图片`);
+                } else {
+                    currentResults = data.results.map(item => ({ ...item, detections: null, userTags: null }));
+                    renderGallery();
+                }
+            } catch (e) {
+                alert("检索失败，请检查后端。");
+            }
+            document.body.style.cursor = 'default';
+        }
+
+        async function searchByExternalImage() {
+            const fileInput = document.getElementById('externalImageInput');
+            if (!fileInput.files.length) return alert('请先选择外部图片');
+            hidePagination(); 
+            isBrowseMode = false;
+            const topK = document.getElementById('topKInput').value || 24;
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]); formData.append('top_k', topK);
+            document.body.style.cursor = 'wait';
+            
+            const res = await fetch(`${API_BASE}/api/search_by_external_image`, { method: 'POST', body: formData });
+            const data = await res.json();
+            currentResults = data.results.map(item => ({ ...item, detections: null, userTags: null }));
+            renderGallery();
+            document.body.style.cursor = 'default';
+        }
+
+        async function searchByImage(imageId) {
+            hidePagination(); 
+            isBrowseMode = false;
+            const topK = document.getElementById('topKInput').value || 24;
+            const formData = new FormData();
+            formData.append('image_id', imageId); formData.append('top_k', topK);
+            document.body.style.cursor = 'wait';
+            
+            const res = await fetch(`${API_BASE}/api/search_by_image`, { method: 'POST', body: formData });
+            const data = await res.json();
+            currentResults = data.results.map(item => ({ ...item, detections: null, userTags: null }));
+            renderGallery();
+            document.body.style.cursor = 'default';
+        }
+
+        async function runDeduplicationAnalysis() {
+            const threshold = document.getElementById('dedupThreshold').value || 0.95;
+            const statusText = document.getElementById('dedupStatus');
+            statusText.innerText = "高维特征矩阵扫描与聚类中，请稍候...";
+            statusText.style.color = "#2563eb";
+            const formData = new FormData();
+            formData.append('sim_threshold', threshold);
+            
+            redundantFilesList = []; 
+            document.getElementById('exportRedundantBtn').style.display = 'none';
+            document.getElementById('deleteAndSyncBtn').style.display = 'none';
+
+            try {
+                const res = await fetch(`${API_BASE}/api/dedup_stats`, { method: 'POST', body: formData });
+                const data = await res.json();
+                document.getElementById('statsSummary').style.display = 'grid';
+                document.getElementById('statTotal').innerText = data.total_images;
+                document.getElementById('statUnique').innerText = data.unique_images;
+                document.getElementById('statDuplicates').innerText = data.duplicate_count;
+                document.getElementById('statRate').innerText = data.dedup_rate;
+                statusText.innerText = `分析完成！共发现 ${data.clusters.length} 个重复组，包含 ${data.duplicate_count} 张冗余样本。`;
+                statusText.style.color = "#059669";
+                
+                if (data.clusters.length > 0) {
+                    let flatDuplicates = [];
+                    data.clusters.forEach(cluster => {
+                        for (let k = 1; k < cluster.items.length; k++) {
+                            const item = cluster.items[k];
+                            redundantFilesList.push(item.id);
+                        }
+                        flatDuplicates = flatDuplicates.concat(cluster.items); 
+                    });
+                    
+                    if(redundantFilesList.length > 0) {
+                        document.getElementById('exportRedundantBtn').style.display = 'inline-block';
+                        document.getElementById('deleteAndSyncBtn').style.display = 'inline-block';
+                    }
+                    
+                    hidePagination(); 
+                    // 去重分析本质上也是原图展示
+                    isBrowseMode = true; 
+                    currentResults = flatDuplicates.map(item => ({ ...item, detections: null, userTags: null }));
+                    renderGallery();
+                }
+            } catch(e) {
+                statusText.innerText = "分析请求失败。";
+                statusText.style.color = "#dc2626";
+            }
+        }
+        
+        function exportRedundantList() {
+            if (redundantFilesList.length === 0) return alert('没有需要导出的冗余文件。');
+            const txtContent = redundantFilesList.join('\n');
+            const blob = new Blob([txtContent], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `AD_Workspace_Redundant_IDs_${Date.now()}.txt`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        async function deleteAndSync() {
+            if (redundantFilesList.length === 0) return alert('没有需要清理的文件。');
+            if (!confirm(`⚠️ 警告：这将在硬盘上永久粉碎 ${redundantFilesList.length} 张冗余图片，并实时重组特征库！\n\n确定要继续吗？`)) return;
+            
+            document.body.style.cursor = 'wait';
+            const formData = new FormData();
+            formData.append('image_ids', redundantFilesList.join(','));
+            
+            try {
+                const res = await fetch(`${API_BASE}/api/delete_and_sync`, { method: 'POST', body: formData });
+                const data = await res.json();
+                
+                alert(`🎉 清理完成！\n成功物理删除: ${data.deleted_count} 张\n当前底库剩余: ${data.total_indexed} 帧`);
+                
+                redundantFilesList = [];
+                document.getElementById('exportRedundantBtn').style.display = 'none';
+                document.getElementById('deleteAndSyncBtn').style.display = 'none';
+                currentResults = [];
+                renderGallery();
+                
+                document.getElementById('statTotal').innerText = data.total_indexed;
+                document.getElementById('statUnique').innerText = data.total_indexed;
+                document.getElementById('statDuplicates').innerText = 0;
+                document.getElementById('statRate').innerText = "0.00%";
+                document.getElementById('dedupStatus').innerText = "底库净化并同步完成。";
+                
+                startBrowseAll();
+                
+            } catch (e) {
+                alert("清理失败，请确保后端服务正常运行。");
+            }
+            document.body.style.cursor = 'default';
+        }
+
+        async function runBatchDetection(mode) {
+            if (currentResults.length === 0) return alert('请先加载或检索图片');
+            const prompt = document.getElementById('dinoPrompt').value;
+            if (mode === 'dino' && !prompt) return alert('请输入 DINO 定位提示词');
+            const endpoint = mode === 'yolo' ? `${API_BASE}/api/yolo_detect` : `${API_BASE}/api/ground_detect`;
+            document.body.style.cursor = 'wait';
+            for (let i = 0; i < currentResults.length; i++) {
+                const item = currentResults[i];
+                if (!isBrowseMode && item.score < currentClipThreshold && item.score !== 1.0) continue;
+                
+                const formData = new FormData();
+                formData.append('image_id', item.id);
+                if (mode === 'dino') formData.append('text_prompt', prompt);
+                try {
+                    const res = await fetch(endpoint, { method: 'POST', body: formData });
+                    if (!res.ok) continue;
+                    const data = await res.json();
+                    currentResults[i].detections = data;
+                    
+                    if (data.scores && data.labels) {
+                        const counts = {};
+                        data.scores.forEach((score, idx) => {
+                            if (score >= currentBoxThreshold) {
+                                const label = data.labels[idx];
+                                counts[label] = (counts[label] || 0) + 1;
+                            }
+                        });
+                        
+                        currentResults[i].userTags = [];
+                        for (const label in counts) {
+                            currentResults[i].userTags.push(`${label} ${counts[label]}`);
+                        }
+                    }
+                    
+                    renderGallery(); 
+                } catch (e) { }
+            }
+            document.body.style.cursor = 'default';
+        }
+
+        function updateClipThreshold(val) {
+            currentClipThreshold = parseFloat(val);
+            document.getElementById('clipThresholdVal').innerText = currentClipThreshold.toFixed(2);
+            renderGallery(); 
+        }
+
+        function updateBoxThreshold(val) {
+            currentBoxThreshold = parseFloat(val);
+            document.getElementById('boxThresholdVal').innerText = currentBoxThreshold.toFixed(2);
+            renderGallery(); 
+        }
+
+        function renderGallery() {
+            const container = document.getElementById('gallery');
+            container.innerHTML = '';
+            
+            let displayedCount = 0;
+            let withTargetCount = 0;
+
+            currentResults.forEach((item, index) => {
+                if (!isBrowseMode && item.score < currentClipThreshold && item.score !== 1.0) return;
+                displayedCount++;
+                
+                let validBoxes = item.detections && item.detections.scores ? 
+                    item.detections.scores.map((score, i) => ({ 
+                        score, 
+                        label: item.detections.labels[i], 
+                        box: item.detections.boxes[i] 
+                    })).filter(b => b.score >= currentBoxThreshold) : [];
+                
+                const totalTagsCount = item.userTags ? item.userTags.length : 0;
+                if (validBoxes.length > 0 || totalTagsCount > 0) {
+                    withTargetCount++;
+                }
+
+                const isAutoChecked = (validBoxes.length > 0 || totalTagsCount > 0) ? 'checked' : '';
+
+                const card = document.createElement('div');
+                card.className = 'card';
+                let boxesHTML = '';
+                if (item.detections && item.detections.width) {
+                    const origW = item.detections.width, origH = item.detections.height;
+                    validBoxes.forEach(b => {
+                        const left = (b.box[0] / origW) * 100, top = (b.box[1] / origH) * 100, width = ((b.box[2] - b.box[0]) / origW) * 100, height = ((b.box[3] - b.box[1]) / origH) * 100;
+                        boxesHTML += `<div class="box-overlay" style="left: ${left}%; top: ${top}%; width: ${width}%; height: ${height}%;"><div class="box-label">${b.label} ${b.score.toFixed(2)}</div></div>`;
+                    });
+                }
+                
+                const scoreBadge = isBrowseMode ? 
+                    `<span class="badge" style="background:#f1f5f9; color:#475569;">原图</span>` : 
+                    `<span class="badge" style="background:#e0e7ff; color:#3730a3;">匹配度: ${item.score.toFixed(3)}</span>`;
+
+                let tagsHTML = '';
+                if (item.userTags && item.userTags.length > 0) {
+                    item.userTags.forEach(tag => {
+                        tagsHTML += `
+                            <div class="tag-item">
+                                ${tag} 
+                                <span class="tag-remove" onclick="removeTag(${index}, '${tag}')" title="删除标签">×</span>
+                            </div>
+                        `;
+                    });
+                }
+                tagsHTML += `<div class="tag-add-btn" onclick="addTag(${index})" title="手动添加标签">+ Add Tag</div>`;
+
+                card.innerHTML = `
+                    <div class="img-wrapper">
+                        <img src="${API_BASE}/api/image/${item.id}" alt="Scene Image" onclick="openModal(${index})" title="点击放大查看原图与检测细节">
+                        ${boxesHTML}
+                    </div>
+                    <div class="card-info">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <div style="display: flex; align-items: center;">
+                                <input type="checkbox" class="select-checkbox" value="${item.id}" ${isAutoChecked} title="勾选以导出">
+                                <span class="badge" style="margin-left: 4px;">ID: ${item.id}</span> 
+                            </div>
+                            ${scoreBadge}
+                        </div>
+                        <div class="meta-text">${item.filename}</div>
+                        <div class="tags-container">
+                            ${tagsHTML}
+                        </div>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+
+            document.getElementById('dispCount').innerText = displayedCount;
+            document.getElementById('targetCount').innerText = withTargetCount;
+        }
+
+        function exportData() {
+            const checkedBoxes = document.querySelectorAll('.select-checkbox:checked');
+            const validIds = Array.from(checkedBoxes).map(cb => parseInt(cb.value));
+
+            if (validIds.length === 0) {
+                return alert('⚠️ 当前没有勾选任何图片！请先勾选需要导出 JSON 的图片。');
+            }
+
+            const exportPayload = currentResults.filter(item => validIds.includes(item.id)).map(item => {
+                let filteredDetections = null;
+                if (item.detections) {
+                    const validIndices = item.detections.scores.map((s, i) => s >= currentBoxThreshold ? i : -1).filter(i => i !== -1);
+                    filteredDetections = {
+                        boxes: validIndices.map(i => item.detections.boxes[i]), 
+                        labels: validIndices.map(i => item.detections.labels[i]), 
+                        scores: validIndices.map(i => item.detections.scores[i]),
+                    };
+                }
+                
+                const expectedPath = `./workspace/images/${item.id}_${item.filename}`;
+                const exportScore = isBrowseMode ? 1.0 : item.score;
+                
+                return { 
+                    image_id: item.id, 
+                    filename: item.filename, 
+                    file_path: expectedPath,  
+                    score: exportScore, 
+                    annotations: filteredDetections,
+                    final_tags: item.userTags || []
+                };
+            });
+
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(exportPayload, null, 2));
+            const dlAnchorElem = document.createElement('a');
+            dlAnchorElem.setAttribute("href", dataStr);
+            dlAnchorElem.setAttribute("download", `AD_Selected_Data_With_Tags_${Date.now()}.json`);
+            dlAnchorElem.click();
+        }
+
+        function exportImagesZip() {
+            const checkedBoxes = document.querySelectorAll('.select-checkbox:checked');
+            const validIds = Array.from(checkedBoxes).map(cb => cb.value);
+
+            if (validIds.length === 0) {
+                return alert('⚠️ 当前没有勾选任何图片！请先在面板上勾选需要导出的图片。');
+            }
+            
+            alert(`确认导出 ${validIds.length} 张已勾选图片，浏览器即将弹出下载...`);
+            
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = `${API_BASE}/api/export_images`;
+            
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'image_ids';
+            input.value = validIds.join(',');
+            
+            form.appendChild(input);
+            document.body.appendChild(form);
+            form.submit();
+            document.body.removeChild(form);
+        }
+    </script>
+</body>
+</html>

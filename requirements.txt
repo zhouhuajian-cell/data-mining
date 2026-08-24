@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+torch
+torchvision
+transformers
+pillow
+faiss-cpu
+git+https://github.com/IDEA-Research/GroundingDINO.git
