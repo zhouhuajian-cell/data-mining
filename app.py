@@ -3,7 +3,6 @@ import os
 import json
 import zipfile
 import tempfile
-import random
 import math
 import asyncio
 from typing import List
@@ -22,6 +21,7 @@ from ultralytics import YOLO
 
 app = FastAPI(title="AD Scene Mining Backend")
 
+# 跨域配置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,25 +43,24 @@ class CustomFormParserMiddleware(BaseHTTPMiddleware):
 app.add_middleware(CustomFormParserMiddleware)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# 👇 调整为 8 线程，平衡推理速度与日常办公 👇
 torch.set_num_threads(8)
-
-# 保持 FP16 半精度，这是防爆显存卡死的核心
 weight_dtype = torch.float16 if device == "cuda" else torch.float32
 
+# 1. 加载 CLIP 
 clip_model_name = "openai/clip-vit-large-patch14"
 print(f"Loading CLIP model {clip_model_name} on {device} (FP16)...")
 clip_model = CLIPModel.from_pretrained(clip_model_name, torch_dtype=weight_dtype).to(device)
 clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
 
+# 2. 加载 Grounding DINO
 dino_model_name = "IDEA-Research/grounding-dino-tiny"
 print(f"Loading Grounding DINO model on {device} (FP16)...")
 dino_processor = AutoProcessor.from_pretrained(dino_model_name)
 dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_model_name, torch_dtype=weight_dtype).to(device)
 
-print(f"Loading YOLO model on {device}...")
-yolo_model = YOLO("yolov8x.pt") 
+# 3. YOLOv8x (按需加载)
+yolo_model = None
+print("YOLOv8x is set to lazy-load.")
 
 WORKSPACE_DIR = "./workspace"
 IMG_DIR = os.path.join(WORKSPACE_DIR, "images")
@@ -73,14 +72,14 @@ os.makedirs(IMG_DIR, exist_ok=True)
 embedding_dim = 768
 
 if os.path.exists(INDEX_PATH) and os.path.exists(META_PATH) and os.path.exists(FEAT_PATH):
-    print("检测到本地历史数据，正在从硬盘恢复...")
+    print("检测到历史数据，正在恢复...")
     index = faiss.read_index(INDEX_PATH)
     with open(META_PATH, "r", encoding="utf-8") as f:
         image_database = json.load(f)
     image_features_list = np.load(FEAT_PATH).tolist()
     print(f"✅ 成功加载 {len(image_database)} 帧历史特征！")
 else:
-    print("未检测到历史数据，初始化全新空库。")
+    print("初始化全新空库。")
     index = faiss.IndexFlatIP(embedding_dim)
     image_database = []
     image_features_list = []
@@ -109,30 +108,34 @@ def extract_clip_text_feature(text: str) -> np.ndarray:
         feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
     return feats.cpu().numpy().astype(np.float32)
 
+@app.get("/api/db_stats")
+def get_db_stats():
+    if not os.path.exists(IMG_DIR):
+        return {"total_raw": 0, "indexed": len(image_database), "unprocessed": 0}
+    raw_count = sum(1 for f in os.listdir(IMG_DIR) if f.lower().endswith(('.jpg', '.png', '.jpeg')))
+    indexed_count = len(image_database)
+    unprocessed = max(0, raw_count - indexed_count)
+    return {"total_raw": raw_count, "indexed": indexed_count, "unprocessed": unprocessed}
+
 @app.post("/api/upload_batch")
 async def upload_batch(files: List[UploadFile] = File(...)):
     global image_database, index, image_features_list
     if index.ntotal + len(files) > 30000:
-        return JSONResponse(status_code=400, content={"error": "系统容量限制为 30000 张。"})
-
+        return JSONResponse(status_code=400, content={"error": "容量限制 30000 张。"})
     for file in files:
         try:
             contents = await file.read()
             image = Image.open(io.BytesIO(contents)).convert("RGB")
             img_filename = file.filename
             img_path = os.path.join(IMG_DIR, img_filename)
-            
             image.save(img_path, format="JPEG", quality=90)
             feat = extract_clip_image_feature(image)
             index.add(feat)
             image_database.append({"filename": img_filename, "path": img_path})
             image_features_list.append(feat[0])
-            
             await asyncio.sleep(0.01)
-            
         except Exception as e:
-            print(f"处理出错: {e}")
-            
+            print(f"入库出错: {e}")
     save_persistence()
     return {"status": "success", "total_indexed": index.ntotal}
 
@@ -163,15 +166,31 @@ async def search_by_filename(filename_query: str = Form(...)):
     return {"results": results}
 
 @app.post("/api/search_by_external_image")
-async def search_by_external_image(file: UploadFile = File(...), top_k: int = Form(24)):
+async def search_by_external_image(files: List[UploadFile] = File(...), top_k: int = Form(24)):
+    """多图联合检索：合并结果并保留最高分数"""
     if index.ntotal == 0: return {"results": []}
-    contents = await file.read()
-    image = Image.open(io.BytesIO(contents)).convert("RGB")
-    image_feat = extract_clip_image_feature(image)
-    scores, indices = index.search(image_feat, min(top_k, index.ntotal))
-    results = [{"id": int(idx), "filename": image_database[idx]["filename"], "score": float(score)} 
-               for score, idx in zip(scores[0], indices[0]) if idx != -1]
-    return {"results": results}
+    all_results_dict = {}
+    
+    for file in files:
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        image_feat = extract_clip_image_feature(image)
+        scores, indices = index.search(image_feat, min(top_k, index.ntotal))
+        
+        for score, idx in zip(scores[0], indices[0]):
+            if idx != -1:
+                idx = int(idx)
+                score = float(score)
+                # 去重并保留针对同一张底库图片检索出的最高分
+                if idx not in all_results_dict or score > all_results_dict[idx]["score"]:
+                    all_results_dict[idx] = {
+                        "id": idx, 
+                        "filename": image_database[idx]["filename"], 
+                        "score": score
+                    }
+                    
+    merged_results = sorted(list(all_results_dict.values()), key=lambda x: x["score"], reverse=True)
+    return {"results": merged_results}
 
 @app.post("/api/search_by_image")
 async def search_by_image(image_id: int = Form(...), top_k: int = Form(24)):
@@ -186,7 +205,8 @@ async def search_by_image(image_id: int = Form(...), top_k: int = Form(24)):
 
 @app.get("/api/image/{image_id}")
 async def get_image(image_id: int):
-    if image_id < 0 or image_id >= len(image_database): return JSONResponse({"error": "Not found"}, status_code=404)
+    if image_id < 0 or image_id >= len(image_database): 
+        return JSONResponse({"error": "Not found"}, status_code=404)
     return FileResponse(image_database[image_id]["path"], media_type="image/jpeg")
 
 @app.post("/api/ground_detect")
@@ -210,6 +230,9 @@ def ground_detect(image_id: int = Form(...), text_prompt: str = Form(...)):
 
 @app.post("/api/yolo_detect")
 def api_yolo_detect(image_id: int = Form(...)):
+    global yolo_model
+    if yolo_model is None:
+        yolo_model = YOLO("yolov8x.pt")
     img_path = image_database[image_id]["path"]
     image = Image.open(img_path).convert("RGB")
     results = yolo_model(image, verbose=False)[0]
@@ -264,20 +287,6 @@ async def dedup_stats(sim_threshold: float = Form(0.95)):
         "clusters": duplicate_clusters
     }
 
-@app.post("/api/export_images")
-async def export_images(image_ids: str = Form(...)):
-    if not image_ids: return JSONResponse({"error": "没有提供图片ID"}, status_code=400)
-    ids = [int(x) for x in image_ids.split(",") if x.strip().isdigit()]
-    fd, temp_zip_path = tempfile.mkstemp(suffix=".zip")
-    os.close(fd)
-    with zipfile.ZipFile(temp_zip_path, "w", zipfile.ZIP_STORED) as zip_file:
-        for img_id in ids:
-            if 0 <= img_id < len(image_database):
-                img_path = image_database[img_id]["path"]
-                if os.path.exists(img_path):
-                    zip_file.write(img_path, image_database[img_id]["filename"])
-    return FileResponse(temp_zip_path, media_type="application/zip", filename=f"AD_Selected_Images.zip", background=BackgroundTask(os.remove, temp_zip_path))
-
 @app.post("/api/delete_and_sync")
 async def delete_and_sync(image_ids: str = Form(...)):
     global image_database, index, image_features_list
@@ -303,15 +312,21 @@ async def delete_and_sync(image_ids: str = Form(...)):
     return {"deleted_count": deleted_count, "total_indexed": index.ntotal}
 
 @app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(content=b"", media_type="image/x-icon")
+async def favicon(): return Response(content=b"", media_type="image/x-icon")
+
+# 托管前端静态图片资源（引导页背景、顶栏 Logo 等）
+@app.get("/landing-bg.jpg", include_in_schema=False)
+async def landing_bg(): return FileResponse("landing-bg.jpg", media_type="image/jpeg")
+
+@app.get("/TT.png", include_in_schema=False)
+async def logo_png(): return FileResponse("TT.png", media_type="image/png")
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "前端.html")
     if os.path.exists(html_path):
         with open(html_path, "r", encoding="utf-8") as f: return f.read()
-    return f"""<h3 style="color:red;">文件未找到！</h3>"""
+    return f"""<h3>前端.html 文件未找到！</h3>"""
 
 if __name__ == "__main__":
     import uvicorn
