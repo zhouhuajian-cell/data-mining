@@ -1,6 +1,11 @@
 import io
 import os
 import json
+
+# 👇 新增：强制让 Hugging Face 使用国内镜像加速下载 👇
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 👆 新增结束 👆
+
 import zipfile
 import tempfile
 import math
@@ -330,4 +335,4 @@ async def serve_index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8008)
+    uvicorn.run(app, host="0.0.0.0", port=8009)

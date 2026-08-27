@@ -283,20 +283,32 @@
         .progress-bar { height: 100%; background: linear-gradient(90deg, var(--primary-dark), var(--primary)); width: 0%; transition: width 0.3s ease; box-shadow: 0 0 12px var(--primary); border-radius: 4px; }
 
         /* Holographic Gallery Cards */
-        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 26px; margin-top: 26px; }
+        /* 1. 将网格的最小宽度调整为 340px，让卡片显示稍微小一点 */
+        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 24px; margin-top: 24px; }
+        
         .card { 
             border-radius: var(--radius-md); overflow: hidden; 
-            background: rgba(15, 23, 42, 0.65); 
-            border: 1px solid rgba(255, 255, 255, 0.1); 
+            background: rgba(15, 23, 42, 0.6); 
+            border: 1px solid rgba(255,255,255,0.08); 
             transition: var(--transition-all); display: flex; flex-direction: column; 
-            backdrop-filter: blur(10px);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+            backdrop-filter: blur(8px);
         }
-        .card:hover { transform: translateY(-6px); box-shadow: 0 15px 35px rgba(0,0,0,0.6), 0 0 20px rgba(0,212,255,0.25); border-color: rgba(0,212,255,0.5); }
+        .card:hover { transform: translateY(-4px); box-shadow: 0 10px 30px rgba(0,0,0,0.5); border-color: rgba(0,212,255,0.4); }
         
-        .img-wrapper { position: relative; width: 100%; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; border-bottom: 1px solid rgba(255,255,255,0.1); }
-        .img-wrapper img { width: 100%; height: auto; display: block; cursor: zoom-in; transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1); opacity: 0.92; }
-        .img-wrapper:hover img { transform: scale(1.04); opacity: 1; }
+        /* 2. 强制图片外框为 2:1 比例，比 16:9 更矮一些 */
+        .img-wrapper { 
+            position: relative; width: 100%; 
+            aspect-ratio: 2 / 1; /* 更扁的比例，降低高度 */
+            background: #000; display: flex; align-items: center; justify-content: center; 
+            overflow: hidden; border-bottom: 1px solid rgba(255,255,255,0.08); 
+        }
+        
+        /* 3. 让图片高度 100% 铺满，采用 fill 拉伸填满整个框 */
+        .img-wrapper img { 
+            width: 100%; height: 100%; object-fit: fill; 
+            display: block; cursor: zoom-in; transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1); opacity: 0.9; 
+        }
+        .img-wrapper:hover img { transform: scale(1.03); opacity: 1; }
         
         .box-overlay { position: absolute; border: 1.5px solid var(--success); background: rgba(16, 185, 129, 0.12); pointer-events: none; box-shadow: 0 0 10px rgba(16, 185, 129, 0.5); }
         .box-label { position: absolute; top: -24px; left: -1px; background: var(--success); color: white; font-size: 12px; padding: 2px 8px; white-space: nowrap; font-weight: 700; border-radius: 3px 3px 3px 0; box-shadow: 0 0 8px rgba(16, 185, 129, 0.6); }
@@ -325,6 +337,8 @@
         
         /* Pagination */
         .pagination-bar { display: none; background: rgba(0,0,0,0.35); padding: 18px 26px; border-radius: var(--radius-md); margin-bottom: 20px; align-items: center; justify-content: space-between; border: 1px solid rgba(255,255,255,0.12); backdrop-filter: blur(10px); box-shadow: inset 0 1px 1px rgba(255,255,255,0.05); }
+        /* 页码跳转控件悬浮固定在网页最右下角 */
+        .pagination-controls { position: fixed; right: 24px; bottom: 24px; z-index: 999; display: flex; gap: 10px; align-items: center; background: rgba(2,6,23,0.9); padding: 12px 16px; border-radius: var(--radius-md); border: 1px solid rgba(0,212,255,0.3); backdrop-filter: blur(12px); box-shadow: 0 8px 30px rgba(0,0,0,0.6), 0 0 20px rgba(0,212,255,0.15); }
         .page-btn { background: rgba(255,255,255,0.06); color: var(--text-main); border: 1px solid rgba(255,255,255,0.15); box-shadow: none; padding: 9px 18px; border-radius: var(--radius-sm); }
         .page-btn:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.35); box-shadow: 0 0 12px rgba(255,255,255,0.15); }
         .page-btn:disabled { background: transparent; color: rgba(255,255,255,0.2); border-color: rgba(255,255,255,0.05); box-shadow: none; cursor: not-allowed; transform: none; }
@@ -546,12 +560,6 @@
                         第 <span id="pageCurrent" style="color: var(--primary); font-size: 16px; text-shadow: 0 0 8px var(--primary);">1</span> / <span id="pageTotal">0</span> 页 
                         <span style="margin-left: 10px; font-size: 13px; color: var(--text-muted);">(池内总计 <span id="itemTotal">0</span> 帧)</span>
                     </div>
-                    <div class="pagination-controls" style="display: flex; gap: 10px; align-items: center;">
-                        <button id="prevPageBtn" class="page-btn" onclick="changePage(-1)">上一页</button>
-                        <input type="number" id="jumpPageInput" min="1" style="width: 70px; text-align: center;" placeholder="页码">
-                        <button class="page-btn" onclick="jumpToPage()">跳转</button>
-                        <button id="nextPageBtn" class="page-btn" onclick="changePage(1)">下一页</button>
-                    </div>
                 </div>
 
                 <!-- 画廊 -->
@@ -560,6 +568,14 @@
         </div>
     </div>
     <!-- 👆 主工作区结束 👆 -->
+
+    <!-- 悬浮页码跳转控件 (固定于网页最右下角) -->
+    <div id="paginationControls" class="pagination-controls" style="display: none;">
+        <button id="prevPageBtn" class="page-btn" onclick="changePage(-1)">上一页</button>
+        <input type="number" id="jumpPageInput" min="1" style="width: 70px; text-align: center;" placeholder="页码">
+        <button class="page-btn" onclick="jumpToPage()">跳转</button>
+        <button id="nextPageBtn" class="page-btn" onclick="changePage(1)">下一页</button>
+    </div>
 
     <!-- 弹窗 -->
     <div id="imageModal" class="modal" onclick="closeModal(event)">
@@ -586,7 +602,7 @@
             }, 800); 
         }
 
-        const API_BASE = "http://localhost:8008"; 
+        const API_BASE = "http://localhost:8009"; 
         let allFrontendData = [];  
         let currentResults = [];   
         let currentMode = 'browse'; 
@@ -733,6 +749,7 @@
             document.getElementById('prevPageBtn').disabled = (currentPage === 1);
             document.getElementById('nextPageBtn').disabled = (currentPage === totalPages);
             document.getElementById('paginationBar').style.display = 'flex';
+            document.getElementById('paginationControls').style.display = 'flex';
             currentResults = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
             renderGallery();
         }
@@ -750,12 +767,13 @@
         }
 
         async function loadPageData() {
-            document.body.style.cursor = 'wait'; document.getElementById('paginationBar').style.display = 'flex'; 
+            document.body.style.cursor = 'wait'; document.getElementById('paginationBar').style.display = 'flex'; document.getElementById('paginationControls').style.display = 'flex'; 
             try {
                 const res = await fetch(`${API_BASE}/api/list_all?page=${currentPage}&size=${pageSize}`);
                 const data = await res.json();
                 if(data.total === 0) {
                     document.getElementById('paginationBar').style.display = 'none';
+                    document.getElementById('paginationControls').style.display = 'none';
                     document.getElementById('gallery').innerHTML = '<div style="color:var(--text-muted); width:100%; text-align:center; padding:40px;">数据池为空，请先入库。</div>';
                     document.getElementById('dispCount').innerText = 0; document.getElementById('targetCount').innerText = 0; updateSelectionStats();
                 } else {
@@ -797,14 +815,42 @@
             if (!fileInput.files.length) return alert('请选择图片');
             
             const formData = new FormData();
-            for (let i = 0; i < fileInput.files.length; i++) { formData.append('files', fileInput.files[i]); }
-            formData.append('top_k', document.getElementById('topKInput').value || 24);
+            for (let i = 0; i < fileInput.files.length; i++) {
+                formData.append('files', fileInput.files[i]);
+            }
+            formData.append('top_k', 1000); 
             
             document.body.style.cursor = 'wait';
-            const res = await fetch(`${API_BASE}/api/search_by_external_image`, { method: 'POST', body: formData });
-            handleFrontendData((await res.json()).results, 'search');
-            document.body.style.cursor = 'default';
+            try {
+                const res = await fetch(`${API_BASE}/api/search_by_external_image`, { method: 'POST', body: formData });
+                const data = await res.json();
+                
+                if (data.results && data.results.length > 0) {
+                    // 👇 核心升级：图片与图片的相似度天生极高，自动将过滤底线拉升至 0.65！
+                    const imageSearchThreshold = 0.65; 
+                    
+                    // 联动更新页面左下角的滑块 UI，让你直观看到阈值被调高了
+                    document.getElementById('clipSlider').value = imageSearchThreshold;
+                    currentClipThreshold = imageSearchThreshold;
+                    document.getElementById('clipThresholdVal').innerText = imageSearchThreshold.toFixed(2);
+                    
+                    // 严格剔除低于 0.65 的背景相似杂图
+                    const filteredResults = data.results.filter(item => item.score >= imageSearchThreshold);
+                    
+                    if (filteredResults.length === 0) {
+                        alert(`⚠️ 系统比对了底库，但没有找到相似度极高的匹配项（分数均低于 0.65）。\n\n💡 黄金建议：CLIP 模型容易被背景干扰。请尽量【裁剪】您的参考图，只保留要搜的障碍物本身，裁掉天空和无关的马路后再试！`);
+                    }
+                    
+                    // 将严格过滤后的高分图喂给前端展示
+                    handleFrontendData(filteredResults, 'search');
+                } else {
+                    handleFrontendData([], 'search');
+                }
+            } catch (e) {
+                alert("请求失败，请检查后端服务。");
+            }
             
+            document.body.style.cursor = 'default';
             fileInput.value = ''; 
         }
 

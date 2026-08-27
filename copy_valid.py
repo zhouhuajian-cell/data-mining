@@ -4,10 +4,10 @@ import json
 import os
 import shutil
 
-json_path = r"C:\Users\zhouhuajian\Downloads\AD_Selected_Data_With_Tags_1787550785216.json"
+json_path = r"C:\Users\zhouhuajian\Downloads\AD_CLIP_RawSearch_2441_Items_1787725947280.json"
 project_root = r"C:\Users\zhouhuajian\Desktop\数据挖掘"
 image_dir = os.path.join(project_root, "workspace", "images")
-valid_dir = os.path.join(project_root, "有效", "0.2 0.22")  # 新建的有效文件夹
+valid_dir = os.path.join(project_root, "有效", "Clip初筛")  # 新建的有效文件夹
 
 with open(json_path, encoding="utf-8") as f:
     data = json.load(f)
