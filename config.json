@@ -1,0 +1,12 @@
+{
+  "workspace": "/opt/ad_mining/workspace",
+  "valid_dir": "/opt/ad_mining/valid_output",
+  "server_host": "0.0.0.0",
+  "server_port": 8009,
+  "clip_model": "openai/clip-vit-large-patch14",
+  "dino_model": "IDEA-Research/grounding-dino-tiny",
+  "yolo_model": "yolov8x.pt",
+  "batch_size": 8,
+  "num_workers": 2,
+  "device": "auto"
+}

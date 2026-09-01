@@ -1,65 +1,83 @@
 # -*- coding: utf-8 -*-
-"""从 AD_Selected_Data json 提取 filename，在 workspace/images 匹配对应图片，复制到"有效"文件夹。"""
+"""从 JSON 导出文件中提取 filename，匹配 workspace/images 中的图片，复制到交付文件夹。"""
 import json
 import os
 import shutil
+import argparse
+from tqdm import tqdm
 
-json_path = r"C:\Users\zhouhuajian\Downloads\AD_CLIP_RawSearch_2441_Items_1787725947280.json"
-project_root = r"C:\Users\zhouhuajian\Desktop\数据挖掘"
-image_dir = os.path.join(project_root, "workspace", "images")
-valid_dir = os.path.join(project_root, "有效", "Clip初筛")  # 新建的有效文件夹
+def copy_valid(args):
+    json_path = args.json
+    project_root = args.root
+    image_dir = args.image_dir
+    output_dir = args.output
 
-with open(json_path, encoding="utf-8") as f:
-    data = json.load(f)
+    os.makedirs(output_dir, exist_ok=True)
 
-filenames = [d.get("filename") for d in data if d.get("filename")]
-print(f"JSON 条目数: {len(data)}")
-print(f"filename 数量: {len(filenames)}")
-print(f"filename 唯一数: {len(set(filenames))}")
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
 
-os.makedirs(valid_dir, exist_ok=True)
+    filenames = [d.get("filename") for d in data if d.get("filename")]
+    print(f"JSON entries: {len(data)}")
+    print(f"filename count: {len(filenames)}")
+    print(f"filename unique: {len(set(filenames))}")
 
-# 建立图片目录内文件名索引
-all_files = set(os.listdir(image_dir))
-name_to_path = {fn: os.path.join(image_dir, fn) for fn in all_files}
+    all_files = set(os.listdir(image_dir))
 
-moved = 0
-missing = 0
-matched_names = []
+    copied = 0
+    missing = 0
 
-for d in data:
-    fn = d.get("filename")
-    if not fn:
-        continue
-    fp = d.get("file_path", "").lstrip("./").replace("/", "\\")
-    src = None
-    # 1) 优先用 file_path 精确定位
-    cand_path = os.path.join(project_root, fp)
-    if fp and os.path.isfile(cand_path):
-        src = cand_path
-        matched_names.append(os.path.basename(cand_path))
-    else:
-        # 2) 其次按 filename 在图片目录中匹配（带 id_ 前缀或同名）
-        candidates = [fn] + [f for f in all_files if f.endswith("_" + fn)]
-        for c in candidates:
-            p = os.path.join(image_dir, c)
-            if os.path.isfile(p):
-                src = p
-                matched_names.append(c)
-                break
-    if src is None:
-        print(f"未匹配: {fn}")
-        missing += 1
-        continue
+    for d in tqdm(data, desc="导出图片", unit="张"):
+        fn = d.get("filename")
+        if not fn:
+            continue
 
-    dst = os.path.join(valid_dir, os.path.basename(src))
-    shutil.copy2(src, dst)  # 复制，保留源文件
-    moved += 1
-    print(f"已复制: {os.path.basename(src)}")
+        src = None
 
-valid_count = len([f for f in os.listdir(valid_dir) if os.path.isfile(os.path.join(valid_dir, f))])
-print("\n===== 完成 =====")
-print(f"匹配并复制: {moved} 张")
-print(f"未匹配: {missing} 张")
-print(f"有效文件夹: {valid_dir}")
-print(f"有效文件夹内图片数: {valid_count}")
+        if fn in all_files:
+            src = os.path.join(image_dir, fn)
+
+        if src is None:
+            for f in all_files:
+                if f.endswith("_" + fn):
+                    src = os.path.join(image_dir, f)
+                    break
+
+        if src is None:
+            fp = d.get("file_path", "").lstrip("./")
+            if fp:
+                fp = fp.replace("\\", "/")
+                candidate = os.path.join(project_root, fp)
+                if os.path.isfile(candidate):
+                    src = candidate
+
+        if src is None:
+            missing += 1
+            continue
+
+        dst = os.path.join(output_dir, os.path.basename(src))
+        shutil.copy2(src, dst)
+        copied += 1
+
+    valid_count = len([f for f in os.listdir(output_dir)
+                       if os.path.isfile(os.path.join(output_dir, f))])
+    print(f"\n===== Done =====")
+    print(f"Copied: {copied}")
+    print(f"Missing: {missing}")
+    print(f"Output: {output_dir}")
+    print(f"Output count: {valid_count}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Copy valid images from JSON export")
+    parser.add_argument("--json", required=True, help="Path to exported JSON file")
+    parser.add_argument("--root", default="/opt/ad_mining", help="Project root")
+    parser.add_argument("--image-dir", default=None, help="Image directory")
+    parser.add_argument("--output", default=None, help="Output directory")
+    args = parser.parse_args()
+
+    if args.image_dir is None:
+        args.image_dir = os.path.join(args.root, "workspace", "images")
+    if args.output is None:
+        args.output = os.path.join(args.root, "有效", "Clip初筛")
+
+    copy_valid(args)

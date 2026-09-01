@@ -1,0 +1,27 @@
+[Unit]
+Description=Zhiyun Scene Mining (CLIP + Grounding DINO + YOLOv8x) FastAPI
+After=network.target
+
+[Service]
+Type=simple
+# 改成你实际部署的用户与目录
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/scene-mining
+
+# HuggingFace 镜像(首次拉取 CLIP / Grounding DINO 用)
+Environment=HF_ENDPOINT=https://hf-mirror.com
+
+# 单进程; 满载多 worker 改为:
+#   ExecStart=/opt/scene-mining/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8009 --workers 4
+ExecStart=/opt/scene-mining/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8009
+
+Restart=on-failure
+RestartSec=5
+
+# 日志走 journald: journalctl -u zhiyun-scene-mining -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

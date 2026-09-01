@@ -1,32 +1,41 @@
-import io
+# -*- coding: utf-8 -*-
 import os
-import json
-
-# 👇 新增：强制让 Hugging Face 使用国内镜像加速下载 👇
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# 👆 新增结束 👆
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
+import sys
+import json
+import shutil
 import zipfile
-import tempfile
-import math
-import asyncio
-from typing import List
-from fastapi import FastAPI, UploadFile, File, Form, Request
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.datastructures import FormData
-from starlette.background import BackgroundTask
-from PIL import Image
-import torch
-import faiss
+import re
+from typing import List, Optional
 import numpy as np
-from transformers import CLIPProcessor, CLIPModel, AutoProcessor, AutoModelForZeroShotObjectDetection
-from ultralytics import YOLO
+from PIL import Image
 
-app = FastAPI(title="AD Scene Mining Backend")
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+import faiss
+from transformers import AutoProcessor, CLIPModel
 
-# 跨域配置
+# ----------------- 路径与轻量配置 -----------------
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE = os.path.join(PROJECT_DIR, "workspace")
+PROJECTS_ROOT = os.path.join(WORKSPACE, "projects")
+os.makedirs(PROJECTS_ROOT, exist_ok=True)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 极速轻量模型 (~300MB，CPU 秒跑)
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+FEAT_DIM = 512  # Base-Patch32 特征维度为 512
+
+app = FastAPI(title="Maxieye Lightweight Scene Mining")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,304 +44,413 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class CustomFormParserMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        async def custom_form() -> FormData:
-            if not hasattr(request, "_form"):
-                form = await request._form(max_files=100000, max_fields=100000)
-                request._form = form
-            return request._form
-        request.form = custom_form
-        return await call_next(request)
+if os.path.exists(PROJECT_DIR):
+    app.mount("/static_root", StaticFiles(directory=PROJECT_DIR), name="static_root")
 
-app.add_middleware(CustomFormParserMiddleware)
+# 全局状态
+clip_model = None
+clip_processor = None
+project_cache = {}
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-torch.set_num_threads(8)
-weight_dtype = torch.float16 if device == "cuda" else torch.float32
+# ----------------- 224x224 轻量 DataLoader -----------------
+class FastImageDataset(Dataset):
+    def __init__(self, file_paths):
+        self.file_paths = file_paths
+        self.transform = transforms.Compose([
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.48145466, 0.4578275, 0.40821073),
+                std=(0.26862954, 0.26130258, 0.27577711)
+            ),
+        ])
 
-# 1. 加载 CLIP 
-clip_model_name = "openai/clip-vit-large-patch14"
-print(f"Loading CLIP model {clip_model_name} on {device} (FP16)...")
-clip_model = CLIPModel.from_pretrained(clip_model_name, torch_dtype=weight_dtype).to(device)
-clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+    def __len__(self):
+        return len(self.file_paths)
 
-# 2. 加载 Grounding DINO
-dino_model_name = "IDEA-Research/grounding-dino-tiny"
-print(f"Loading Grounding DINO model on {device} (FP16)...")
-dino_processor = AutoProcessor.from_pretrained(dino_model_name)
-dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_model_name, torch_dtype=weight_dtype).to(device)
+    def __getitem__(self, idx):
+        path = self.file_paths[idx]
+        try:
+            with open(path, "rb") as f:
+                img = Image.open(f).convert("RGB")
+                tensor = self.transform(img)
+            return tensor, path, 1
+        except Exception:
+            return torch.zeros((3, 224, 224)), path, 0
 
-# 3. YOLOv8x (按需加载)
-yolo_model = None
-print("YOLOv8x is set to lazy-load.")
+# ----------------- 项目空间管理器 -----------------
+def sanitize_project_name(name: str) -> str:
+    clean = re.sub(r'[^a-zA-Z0-9_\-\u4e00-\u9fa5]', '_', (name or "").strip())
+    return clean if clean else "default"
 
-WORKSPACE_DIR = "./workspace"
-IMG_DIR = os.path.join(WORKSPACE_DIR, "images")
-INDEX_PATH = os.path.join(WORKSPACE_DIR, "index.faiss")
-META_PATH = os.path.join(WORKSPACE_DIR, "metadata.json")
-FEAT_PATH = os.path.join(WORKSPACE_DIR, "features.npy")
+def get_project_paths(project_name: str):
+    p_name = sanitize_project_name(project_name)
+    p_dir = os.path.join(PROJECTS_ROOT, p_name)
+    img_dir = os.path.join(p_dir, "images")
+    idx_path = os.path.join(p_dir, "index.faiss")
+    meta_path = os.path.join(p_dir, "metadata.json")
+    os.makedirs(img_dir, exist_ok=True)
+    return p_name, p_dir, img_dir, idx_path, meta_path
 
-os.makedirs(IMG_DIR, exist_ok=True)
-embedding_dim = 768
+def load_project_context(project_name: str):
+    p_name, p_dir, img_dir, idx_path, meta_path = get_project_paths(project_name)
+    if p_name in project_cache:
+        return project_cache[p_name]
 
-if os.path.exists(INDEX_PATH) and os.path.exists(META_PATH) and os.path.exists(FEAT_PATH):
-    print("检测到历史数据，正在恢复...")
-    index = faiss.read_index(INDEX_PATH)
-    with open(META_PATH, "r", encoding="utf-8") as f:
-        image_database = json.load(f)
-    image_features_list = np.load(FEAT_PATH).tolist()
-    print(f"✅ 成功加载 {len(image_database)} 帧历史特征！")
-else:
-    print("初始化全新空库。")
-    index = faiss.IndexFlatIP(embedding_dim)
-    image_database = []
-    image_features_list = []
+    if os.path.exists(idx_path) and os.path.exists(meta_path):
+        try:
+            index = faiss.read_index(idx_path)
+            if index.d != FEAT_DIM:
+                print(f"[!] 项目 {p_name} 索引维度 ({index.d}) 与当前轻量模型 ({FEAT_DIM}) 不匹配，初始化新索引")
+                index = faiss.IndexFlatIP(FEAT_DIM)
+                metadata = []
+            else:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+        except Exception as e:
+            print(f"[!] 读取项目 {p_name} 索引异常: {e}，初始化新索引")
+            index = faiss.IndexFlatIP(FEAT_DIM)
+            metadata = []
+    else:
+        index = faiss.IndexFlatIP(FEAT_DIM)
+        metadata = []
 
-def save_persistence():
-    faiss.write_index(index, INDEX_PATH)
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump(image_database, f, ensure_ascii=False)
-    np.save(FEAT_PATH, np.array(image_features_list, dtype=np.float32))
+    ctx = {
+        "name": p_name, "dir": p_dir, "img_dir": img_dir,
+        "idx_path": idx_path, "meta_path": meta_path,
+        "index": index, "metadata": metadata
+    }
+    project_cache[p_name] = ctx
+    return ctx
 
-def extract_clip_image_feature(image: Image.Image) -> np.ndarray:
-    inputs = clip_processor(images=image, return_tensors="pt").to(device, dtype=weight_dtype)
-    with torch.no_grad():
-        feats = clip_model.get_image_features(**inputs)
-        if hasattr(feats, "pooler_output"): feats = feats.pooler_output
-        elif hasattr(feats, "image_embeds"): feats = feats.image_embeds
-        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
-    return feats.cpu().numpy().astype(np.float32)
+def save_project_context(ctx):
+    faiss.write_index(ctx["index"], ctx["idx_path"])
+    with open(ctx["meta_path"], "w", encoding="utf-8") as f:
+        json.dump(ctx["metadata"], f, ensure_ascii=False)
 
-def extract_clip_text_feature(text: str) -> np.ndarray:
-    inputs = clip_processor(text=[text], return_tensors="pt").to(device)
-    with torch.no_grad():
-        feats = clip_model.get_text_features(**inputs)
-        if hasattr(feats, "pooler_output"): feats = feats.pooler_output
-        elif hasattr(feats, "text_embeds"): feats = feats.text_embeds
-        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
-    return feats.cpu().numpy().astype(np.float32)
+# ----------------- 系统启动 -----------------
+@app.on_event("startup")
+def startup_event():
+    global clip_model, clip_processor
+    print(f"[*] 启动轻量级测试环境，运行设备: {DEVICE}")
+
+    get_project_paths("default")
+    load_project_context("default")
+
+    print(f"[*] 正在载入轻量 CLIP 模型: {CLIP_MODEL_NAME} ...")
+    try:
+        clip_processor = AutoProcessor.from_pretrained(CLIP_MODEL_NAME, local_files_only=True)
+        clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, local_files_only=True).to(DEVICE)
+    except Exception:
+        print("[!] 本地无缓存，尝试通过国内镜像同步下载...")
+        clip_processor = AutoProcessor.from_pretrained(CLIP_MODEL_NAME)
+        clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(DEVICE)
+    
+    clip_model.eval()
+    print("[✓] 轻量 CLIP 模型已就绪")
+
+# ----------------- API 路由 -----------------
+@app.get("/")
+def read_index():
+    index_html = os.path.join(PROJECT_DIR, "前端.html")
+    if os.path.exists(index_html):
+        return FileResponse(index_html)
+    return {"msg": "前端.html 不存在"}
+
+@app.get("/api/projects")
+def list_projects():
+    if not os.path.exists(PROJECTS_ROOT):
+        return {"projects": ["default"]}
+    items = [d for d in os.listdir(PROJECTS_ROOT) if os.path.isdir(os.path.join(PROJECTS_ROOT, d))]
+    return {"projects": sorted(items) if items else ["default"]}
+
+@app.post("/api/projects/create")
+def create_project(project_name: str = Form(...)):
+    clean_name = sanitize_project_name(project_name)
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="项目名不合法")
+    get_project_paths(clean_name)
+    load_project_context(clean_name)
+    return {"code": 200, "msg": f"项目 [{clean_name}] 创建成功", "project": clean_name}
+
+@app.get("/api/image/{project}/{image_id}")
+def get_image(project: str, image_id: int):
+    ctx = load_project_context(project)
+    meta = ctx["metadata"]
+    if 0 <= image_id < len(meta):
+        path = meta[image_id].get("path")
+        if path and os.path.exists(path):
+            return FileResponse(path)
+    return JSONResponse(status_code=404, content={"msg": "图片不存在"})
 
 @app.get("/api/db_stats")
-def get_db_stats():
-    if not os.path.exists(IMG_DIR):
-        return {"total_raw": 0, "indexed": len(image_database), "unprocessed": 0}
-    raw_count = sum(1 for f in os.listdir(IMG_DIR) if f.lower().endswith(('.jpg', '.png', '.jpeg')))
-    indexed_count = len(image_database)
-    unprocessed = max(0, raw_count - indexed_count)
-    return {"total_raw": raw_count, "indexed": indexed_count, "unprocessed": unprocessed}
-
-@app.post("/api/upload_batch")
-async def upload_batch(files: List[UploadFile] = File(...)):
-    global image_database, index, image_features_list
-    if index.ntotal + len(files) > 30000:
-        return JSONResponse(status_code=400, content={"error": "容量限制 30000 张。"})
-    for file in files:
-        try:
-            contents = await file.read()
-            image = Image.open(io.BytesIO(contents)).convert("RGB")
-            img_filename = file.filename
-            img_path = os.path.join(IMG_DIR, img_filename)
-            image.save(img_path, format="JPEG", quality=90)
-            feat = extract_clip_image_feature(image)
-            index.add(feat)
-            image_database.append({"filename": img_filename, "path": img_path})
-            image_features_list.append(feat[0])
-            await asyncio.sleep(0.01)
-        except Exception as e:
-            print(f"入库出错: {e}")
-    save_persistence()
-    return {"status": "success", "total_indexed": index.ntotal}
-
-@app.get("/api/list_all")
-async def list_all_images(page: int = 1, size: int = 60):
-    total = len(image_database)
-    if total == 0: return {"results": [], "total": 0, "total_pages": 0, "current_page": 1}
-    start_idx = (page - 1) * size
-    end_idx = min(start_idx + size, total)
-    results = [{"id": idx, "filename": image_database[idx]["filename"], "score": 1.0} for idx in range(start_idx, end_idx)]
-    return {"results": results, "total": total, "total_pages": math.ceil(total / size), "current_page": page}
-
-@app.post("/api/search")
-async def search_scenes(query: str = Form(...), top_k: int = Form(24)):
-    if index.ntotal == 0: return {"results": []}
-    text_feat = extract_clip_text_feature(query)
-    scores, indices = index.search(text_feat, min(top_k, index.ntotal))
-    results = [{"id": int(idx), "filename": image_database[idx]["filename"], "score": float(score)} 
-               for score, idx in zip(scores[0], indices[0]) if idx != -1]
-    return {"results": results}
-
-@app.post("/api/search_by_filename")
-async def search_by_filename(filename_query: str = Form(...)):
-    if index.ntotal == 0 or not filename_query: return {"results": []}
-    query = filename_query.lower()
-    results = [{"id": idx, "filename": item["filename"], "score": 1.0} 
-               for idx, item in enumerate(image_database) if query in item["filename"].lower()]
-    return {"results": results}
-
-@app.post("/api/search_by_external_image")
-async def search_by_external_image(files: List[UploadFile] = File(...), top_k: int = Form(24)):
-    """多图联合检索：合并结果并保留最高分数"""
-    if index.ntotal == 0: return {"results": []}
-    all_results_dict = {}
-    
-    for file in files:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_feat = extract_clip_image_feature(image)
-        scores, indices = index.search(image_feat, min(top_k, index.ntotal))
-        
-        for score, idx in zip(scores[0], indices[0]):
-            if idx != -1:
-                idx = int(idx)
-                score = float(score)
-                # 去重并保留针对同一张底库图片检索出的最高分
-                if idx not in all_results_dict or score > all_results_dict[idx]["score"]:
-                    all_results_dict[idx] = {
-                        "id": idx, 
-                        "filename": image_database[idx]["filename"], 
-                        "score": score
-                    }
-                    
-    merged_results = sorted(list(all_results_dict.values()), key=lambda x: x["score"], reverse=True)
-    return {"results": merged_results}
-
-@app.post("/api/search_by_image")
-async def search_by_image(image_id: int = Form(...), top_k: int = Form(24)):
-    if index.ntotal == 0 or image_id < 0 or image_id >= len(image_database): return {"results": []}
-    img_path = image_database[image_id]["path"]
-    query_image = Image.open(img_path).convert("RGB")
-    image_feat = extract_clip_image_feature(query_image)
-    scores, indices = index.search(image_feat, min(top_k, index.ntotal))
-    results = [{"id": int(idx), "filename": image_database[idx]["filename"], "score": float(score)} 
-               for score, idx in zip(scores[0], indices[0]) if idx != -1]
-    return {"results": results}
-
-@app.get("/api/image/{image_id}")
-async def get_image(image_id: int):
-    if image_id < 0 or image_id >= len(image_database): 
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return FileResponse(image_database[image_id]["path"], media_type="image/jpeg")
-
-@app.post("/api/ground_detect")
-def ground_detect(image_id: int = Form(...), text_prompt: str = Form(...)):
-    img_path = image_database[image_id]["path"]
-    image = Image.open(img_path).convert("RGB")
-    prompt = text_prompt.strip()
-    if not prompt.endswith("."): prompt += "."
-    inputs = dino_processor(images=image, text=prompt, return_tensors="pt").to(device, dtype=weight_dtype)
-    with torch.no_grad():
-        outputs = dino_model(**inputs)
-    results = dino_processor.post_process_grounded_object_detection(
-        outputs, inputs.input_ids, target_sizes=[image.size[::-1]]
-    )[0]
+def get_db_stats(project: str = Query("default")):
+    ctx = load_project_context(project)
+    raw_images = [f for f in os.listdir(ctx["img_dir"]) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))]
+    raw_count = len(raw_images)
+    processed_count = ctx["index"].ntotal if ctx["index"] is not None else 0
     return {
-        "image_id": image_id, "width": image.width, "height": image.height,
-        "boxes": results["boxes"].cpu().tolist(),
-        "labels": results["labels"],
-        "scores": results["scores"].cpu().tolist()
+        "project": ctx["name"],
+        "raw_count": raw_count,
+        "processed_count": processed_count,
+        "pending_count": max(0, raw_count - processed_count),
+        "total_raw": raw_count,
+        "indexed": processed_count,
+        "unprocessed": max(0, raw_count - processed_count)
     }
 
-@app.post("/api/yolo_detect")
-def api_yolo_detect(image_id: int = Form(...)):
-    global yolo_model
-    if yolo_model is None:
-        yolo_model = YOLO("yolov8x.pt")
-    img_path = image_database[image_id]["path"]
-    image = Image.open(img_path).convert("RGB")
-    results = yolo_model(image, verbose=False)[0]
+def extract_and_index_project(ctx, image_paths: List[str]):
+    if not image_paths:
+        return 0
+
+    dataset = FastImageDataset(image_paths)
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=2)
+
+    extracted_feats = []
+    extracted_records = []
+
+    with torch.no_grad():
+        for tensors, paths, valids in dataloader:
+            mask = (valids == 1)
+            if not mask.any():
+                continue
+            valid_tensors = tensors[mask].to(DEVICE)
+            feats = clip_model.get_image_features(pixel_values=valid_tensors)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            extracted_feats.append(feats.cpu().numpy().astype(np.float32))
+
+            valid_paths = [paths[i] for i in range(len(paths)) if valids[i] == 1]
+            for p in valid_paths:
+                current_id = len(ctx["metadata"]) + len(extracted_records)
+                extracted_records.append({
+                    "id": current_id,
+                    "filename": os.path.basename(p),
+                    "path": p,
+                    "url": f"/api/image/{ctx['name']}/{current_id}"
+                })
+
+    if extracted_feats:
+        all_new_feats = np.vstack(extracted_feats)
+        if ctx["index"] is None or ctx["index"].d != FEAT_DIM:
+            ctx["index"] = faiss.IndexFlatIP(FEAT_DIM)
+        ctx["index"].add(all_new_feats)
+        ctx["metadata"].extend(extracted_records)
+        save_project_context(ctx)
+
+    return len(extracted_records)
+
+@app.post("/api/upload_batch")
+async def upload_batch(project: str = Form("default"), files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="未接收到文件")
+
+    ctx = load_project_context(project)
+    new_saved_paths = []
+
+    for file in files:
+        file_path = os.path.join(ctx["img_dir"], file.filename)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        if file.filename.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    for member in zip_ref.namelist():
+                        if member.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')) and not member.startswith('__MACOSX'):
+                            fn = os.path.basename(member)
+                            if fn:
+                                ext_path = os.path.join(ctx["img_dir"], fn)
+                                with zip_ref.open(member) as s, open(ext_path, "wb") as t:
+                                    shutil.copyfileobj(s, t)
+                                new_saved_paths.append(ext_path)
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        elif file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+            new_saved_paths.append(file_path)
+
+    processed_count = extract_and_index_project(ctx, new_saved_paths)
     return {
-        "image_id": image_id, "width": image.width, "height": image.height,
-        "boxes": results.boxes.xyxy.cpu().tolist(),
-        "labels": [results.names[int(c)] for c in results.boxes.cls.cpu().tolist()],
-        "scores": results.boxes.conf.cpu().tolist()
+        "code": 200,
+        "msg": f"成功入库并向量化 {processed_count} 张图片",
+        "processed_count": ctx["index"].ntotal,
+        "total_indexed": ctx["index"].ntotal
+    }
+
+@app.post("/api/build_index_online")
+async def build_index_online(project: str = Query("default")):
+    ctx = load_project_context(project)
+    all_imgs = [os.path.join(ctx["img_dir"], f) for f in os.listdir(ctx["img_dir"]) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))]
+    indexed_paths = set([m['path'] for m in ctx["metadata"] if 'path' in m])
+    unprocessed_paths = [p for p in all_imgs if p not in indexed_paths]
+
+    if not unprocessed_paths:
+        return {"code": 200, "msg": "该项目所有图片均已完成向量化", "processed": 0}
+
+    processed_count = extract_and_index_project(ctx, unprocessed_paths)
+    return {
+        "code": 200,
+        "msg": f"成功完成 {processed_count} 张图片的向量化！",
+        "processed_count": ctx["index"].ntotal
+    }
+
+@app.get("/api/search")
+def search_text(project: str = Query("default"), query: str = Query(..., min_length=1), top_k: int = 500):
+    ctx = load_project_context(project)
+    if ctx["index"] is None or ctx["index"].ntotal == 0:
+        return {"code": 200, "results": [], "total": 0}
+
+    inputs = clip_processor(text=[query], return_tensors="pt", padding=True).to(DEVICE)
+    with torch.no_grad():
+        text_feat = clip_model.get_text_features(**inputs)
+        text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+        text_np = text_feat.cpu().numpy().astype(np.float32)
+
+    actual_k = min(top_k, ctx["index"].ntotal)
+    scores, indices = ctx["index"].search(text_np, actual_k)
+
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if 0 <= idx < len(ctx["metadata"]):
+            item = ctx["metadata"][idx].copy()
+            item["score"] = float(f"{score:.4f}")
+            results.append(item)
+
+    return {"code": 200, "results": results, "total": len(results)}
+
+@app.post("/api/search_by_filename")
+def search_by_filename(project: str = Form("default"), filename_query: str = Form(...)):
+    ctx = load_project_context(project)
+    results = [m for m in ctx["metadata"] if filename_query.lower() in m.get("filename", "").lower()]
+    return {"code": 200, "results": results}
+
+@app.post("/api/search_by_external_image")
+async def search_by_external_image(project: str = Form("default"), files: List[UploadFile] = File(...), top_k: int = 500):
+    ctx = load_project_context(project)
+    if ctx["index"] is None or ctx["index"].ntotal == 0 or not files:
+        return {"code": 200, "results": []}
+
+    pil_imgs = []
+    for f in files:
+        try:
+            pil_imgs.append(Image.open(f.file).convert("RGB"))
+        except Exception:
+            continue
+
+    if not pil_imgs:
+        return {"code": 200, "results": []}
+
+    inputs = clip_processor(images=pil_imgs, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        img_feats = clip_model.get_image_features(**inputs)
+        img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
+        img_np = img_feats.cpu().numpy().astype(np.float32)
+
+    actual_k = min(top_k, ctx["index"].ntotal)
+    scores, indices = ctx["index"].search(img_np, actual_k)
+
+    max_scores = {}
+    for q_idx in range(len(pil_imgs)):
+        for score, idx in zip(scores[q_idx], indices[q_idx]):
+            if 0 <= idx < len(ctx["metadata"]):
+                max_scores[idx] = max(max_scores.get(idx, -1.0), float(score))
+
+    sorted_indices = sorted(max_scores.keys(), key=lambda k: max_scores[k], reverse=True)
+    results = []
+    for idx in sorted_indices:
+        item = ctx["metadata"][idx].copy()
+        item["score"] = float(f"{max_scores[idx]:.4f}")
+        results.append(item)
+
+    return {"code": 200, "results": results}
+
+@app.get("/api/list_all")
+def list_all(project: str = Query("default"), page: int = 1, size: int = 30):
+    ctx = load_project_context(project)
+    total = len(ctx["metadata"])
+    start = (page - 1) * size
+    end = start + size
+    items = ctx["metadata"][start:end] if start < total else []
+    total_pages = int(np.ceil(total / size)) if total > 0 else 1
+    return {
+        "code": 200, "total": total, "total_raw": total,
+        "current_page": page, "total_pages": total_pages,
+        "items": items, "results": items
     }
 
 @app.post("/api/dedup_stats")
-async def dedup_stats(sim_threshold: float = Form(0.95)):
-    n = len(image_database)
-    if n == 0 or len(image_features_list) == 0:
-        return {"total_images": 0, "unique_images": 0, "duplicate_count": 0, "dedup_rate": "0.00%", "clusters": []}
-    feats = np.array(image_features_list)
+def dedup_stats(project: str = Form("default"), sim_threshold: float = Form(0.95)):
+    ctx = load_project_context(project)
+    total = len(ctx["metadata"])
+    if total < 2 or ctx["index"] is None:
+        return {"total_images": total, "unique_images": total, "duplicate_count": 0, "dedup_rate": "0.0%", "clusters": []}
+
+    feats = ctx["index"].reconstruct_n(0, total)
     sim_matrix = np.dot(feats, feats.T)
-    parent = list(range(n))
-    def find(i):
-        if parent[i] == i: return i
-        parent[i] = find(parent[i])
-        return parent[i]
-    def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j: parent[root_j] = root_i
+    np.fill_diagonal(sim_matrix, 0)
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if sim_matrix[i, j] >= sim_threshold: union(i, j)
-    clusters_dict = {}
-    for i in range(n):
-        root = find(i)
-        if root not in clusters_dict: clusters_dict[root] = []
-        clusters_dict[root].append(i)
+    visited = set()
+    clusters = []
+    duplicate_count = 0
 
-    duplicate_clusters = []
-    redundant_frames_count = 0
-    for root, members in clusters_dict.items():
-        if len(members) > 1:
-            redundant_frames_count += (len(members) - 1)
-            cluster_items = []
-            for m in members:
-                score = float(sim_matrix[members[0], m]) if m != members[0] else 1.0
-                cluster_items.append({"id": m, "filename": image_database[m]["filename"], "score": score})
-            duplicate_clusters.append({"group_size": len(members), "items": cluster_items})
+    for i in range(total):
+        if i in visited:
+            continue
+        sim_indices = np.where(sim_matrix[i] >= sim_threshold)[0]
+        cluster_items = [ctx["metadata"][i]]
+        for idx in sim_indices:
+            if idx not in visited:
+                visited.add(idx)
+                cluster_items.append(ctx["metadata"][idx])
+                duplicate_count += 1
+        if len(cluster_items) > 1:
+            clusters.append({"items": cluster_items})
 
+    unique_images = total - duplicate_count
+    rate = f"{(duplicate_count / total * 100):.2f}%" if total > 0 else "0.0%"
     return {
-        "total_images": n, "unique_images": n - redundant_frames_count,
-        "duplicate_count": redundant_frames_count, 
-        "dedup_rate": f"{(redundant_frames_count / n) * 100:.2f}%" if n > 0 else "0.00%",
-        "clusters": duplicate_clusters
+        "total_images": total, "unique_images": unique_images,
+        "duplicate_count": duplicate_count, "dedup_rate": rate,
+        "clusters": clusters
     }
 
 @app.post("/api/delete_and_sync")
-async def delete_and_sync(image_ids: str = Form(...)):
-    global image_database, index, image_features_list
-    if not image_ids: return {"deleted_count": 0, "total_indexed": index.ntotal}
-    ids_to_delete = set(int(x) for x in image_ids.split(",") if x.strip().isdigit())
+def delete_and_sync(project: str = Form("default"), image_ids: str = Form(...)):
+    ctx = load_project_context(project)
+    del_ids = set([int(x) for x in image_ids.split(",") if x.strip().isdigit()])
+    if not del_ids:
+        return {"deleted_count": 0}
+
+    remaining_paths = []
     deleted_count = 0
-    new_db, new_feats = [], []
-    for i, item in enumerate(image_database):
-        if i in ids_to_delete:
-            if os.path.exists(item["path"]):
+
+    for m in ctx["metadata"]:
+        if m["id"] in del_ids:
+            if os.path.exists(m["path"]):
                 try:
-                    os.remove(item["path"])
-                    deleted_count += 1
-                except: pass
+                    os.remove(m["path"])
+                except Exception:
+                    pass
+            deleted_count += 1
         else:
-            new_db.append(item)
-            new_feats.append(image_features_list[i])
-    image_database = new_db
-    image_features_list = new_feats
-    index = faiss.IndexFlatIP(embedding_dim)
-    if len(new_feats) > 0: index.add(np.array(new_feats, dtype=np.float32))
-    save_persistence()
-    return {"deleted_count": deleted_count, "total_indexed": index.ntotal}
+            remaining_paths.append(m["path"])
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon(): return Response(content=b"", media_type="image/x-icon")
+    ctx["metadata"] = []
+    ctx["index"] = faiss.IndexFlatIP(FEAT_DIM)
+    extract_and_index_project(ctx, remaining_paths)
 
-# 托管前端静态图片资源（引导页背景、顶栏 Logo 等）
-@app.get("/landing-bg.jpg", include_in_schema=False)
-async def landing_bg(): return FileResponse("landing-bg.jpg", media_type="image/jpeg")
+    return {"code": 200, "deleted_count": deleted_count}
 
-@app.get("/TT.png", include_in_schema=False)
-async def logo_png(): return FileResponse("TT.png", media_type="image/png")
+# 本地测试占位
+@app.post("/api/ground_detect")
+def ground_detect(project: str = Form("default"), image_id: int = Form(...), text_prompt: str = Form(...)):
+    return {"scores": [], "labels": [], "boxes": [], "width": 1920, "height": 1080}
 
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "前端.html")
-    if os.path.exists(html_path):
-        with open(html_path, "r", encoding="utf-8") as f: return f.read()
-    return f"""<h3>前端.html 文件未找到！</h3>"""
+@app.post("/api/yolo_detect")
+def yolo_detect(project: str = Form("default"), image_id: int = Form(...)):
+    return {"scores": [], "labels": [], "boxes": [], "width": 1920, "height": 1080}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8009)
+    uvicorn.run(app, host="127.0.0.1", port=8009, access_log=False)

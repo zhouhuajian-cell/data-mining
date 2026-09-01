@@ -1,3 +1,4 @@
+# Maxieye 高配版 Scene Mining 依赖（对应 app.py：SigLIP-SO400M + Grounding DINO-Base + YOLOv8x，端口 8009）
 fastapi
 uvicorn
 python-multipart
@@ -5,5 +6,13 @@ torch
 torchvision
 transformers
 pillow
+numpy
 faiss-cpu
-git+https://github.com/IDEA-Research/GroundingDINO.git
+ultralytics
+# 说明：
+# - 高配版后端在 startup 依次装载 SigLIP、Grounding DINO-Base、YOLOv8x。
+# - Grounding DINO 通过 transformers 的 AutoModelForZeroShotObjectDetection 加载
+#   （IDEA-Research/grounding-dino-base），无需 GroundingDINO 源码编译安装。
+# - 首次运行会从 hf-mirror.com 镜像下载 SigLIP 与 DINO 权重（app.py 顶部已设 HF_ENDPOINT）。
+# - yolov8x.pt 需放置于项目根目录（ultralytics 自动加载）。
+# - faiss 用 faiss-cpu 即可；如需 GPU 加速向量检索可换 faiss-gpu。
