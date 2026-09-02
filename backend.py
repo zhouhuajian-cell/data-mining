@@ -9,14 +9,19 @@ import shutil
 import zipfile
 import re
 import secrets
+import time
+import gzip
+import glob
+import threading
 from typing import List, Optional
 import numpy as np
 from PIL import Image
 
-from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 
 # ===== 深度学习依赖（可选）：缺失时进入轻量模式，仅用于鉴权/界面测试 =====
 LITE_MODE = False
@@ -69,6 +74,60 @@ WORKSPACE = os.path.join(PROJECT_DIR, "workspace")
 PROJECTS_ROOT = os.path.join(WORKSPACE, "projects")
 os.makedirs(PROJECTS_ROOT, exist_ok=True)
 
+LOG_DIR = os.environ.get("AD_LOG_DIR", os.path.join(PROJECT_DIR, "logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_RETENTION_DAYS = 30
+
+# 交付打包时，伴生文件(.bin/.xml/_raw.jpg)的来源根目录（可多个，逗号/分号分隔）。
+# 图片入库时若记录了 src_dir 会优先精确查找；历史已入库数据用这里配置的根目录递归按同名匹配。
+SOURCE_ROOTS = [p.strip() for p in re.split(r"[,;，；]", os.environ.get("AD_SOURCE_ROOTS", "")) if p.strip()]
+
+
+def _today_log_path():
+    day = time.strftime("%Y%m%d")
+    return os.path.join(LOG_DIR, f"app_{day}.log")
+
+
+def _log(msg):
+    """把关键信息写入当天的日志文件 logs/app_YYYYMMDD.log"""
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open(_today_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _compress_old_logs(days: int = LOG_RETENTION_DAYS):
+    """把超过 days 天的 .log 压缩成 .log.gz 并删除原文件"""
+    try:
+        cutoff = time.time() - days * 86400
+        for path in glob.glob(os.path.join(LOG_DIR, "app_*.log")):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    gz = path + ".gz"
+                    with open(path, "rb") as f_in, gzip.open(gz, "wb") as f_out:
+                        f_out.write(f_in.read())
+                    os.remove(path)
+                    _log(f"已压缩过期日志: {os.path.basename(path)} -> {os.path.basename(gz)}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _compression_loop():
+    while True:
+        try:
+            _compress_old_logs()
+        except Exception:
+            pass
+        time.sleep(3600)  # 每小时检查一次
+
+
+def _start_compression():
+    threading.Thread(target=_compression_loop, daemon=True).start()
+
 DEVICE = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
 
 # ===== 简单登录鉴权（管理员 / 标注员）=====
@@ -96,10 +155,11 @@ def _save_passwords():
         json.dump({"admin": ADMIN_PASSWORD, "annotator": ANNOTATOR_PASSWORD}, f, ensure_ascii=False)
 
 # ===== 模型加载开关 =====
-# 默认策略（最稳健，部署零配置）：
-#   - 服务器（依赖齐全，非轻量模式）→ 自动加载模型，无需任何环境变量
-#   - 本地轻量模式（缺 torch 等依赖）→ 自动跳过，仅界面测试
-# 也可用环境变量 AD_LOAD_MODELS 强制指定：1=加载模型 0=不加载（快速测试用）
+# 默认策略（生产优先，兼顾本地测试）：
+#   - 依赖齐全（非轻量模式）→ 默认启用模型加载：本地有权重就加载；
+#     本地没有则联网下载（走 HF_ENDPOINT 镜像，适配生产模型不在本机的情况）；
+#     若下载也失败则自动跳过，不影响服务启动。
+#   - 纯轻量测试（完全不加载/不下载模型）时，设置环境变量 AD_LOAD_MODELS=0。
 LOAD_MODELS = (os.environ.get("AD_LOAD_MODELS", "1" if not LITE_MODE else "0")) == "1"
 
 # 旗舰高配模型设置
@@ -305,6 +365,9 @@ def save_project_context(ctx):
 def startup_event():
     global siglip_model, siglip_processor, dino_model, dino_processor, yolo_model
     print(f"[*] 启动 Maxieye 旗舰 AI 挖掘平台，运行设备: {DEVICE}")
+    _log(f"[*] 服务启动，日志目录: {LOG_DIR}")
+    _compress_old_logs()  # 启动时先压缩一次过期日志
+    _start_compression()  # 后台线程每小时压缩
 
     _load_passwords()  # 读取持久化密码（若有）
 
@@ -315,31 +378,60 @@ def startup_event():
         print("[i] 测试模式：已跳过模型加载 (AD_LOAD_MODELS=0)。部署时请将 AD_LOAD_MODELS 置为 1 再启用。")
         return
 
-    print(f"[*] [1/3] 正在装载 Google SigLIP 旗舰底模: {SIGLIP_MODEL_NAME} ...")
+    # ===== 模型加载：生产优先（本地有就加载，没有则联网下载），失败自动跳过 =====
+    print(f"[*] [1/3] 装载 Google SigLIP: {SIGLIP_MODEL_NAME} ...")
+    siglip_processor = siglip_model = None
     try:
         siglip_processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_NAME, local_files_only=True)
         siglip_model = AutoModel.from_pretrained(SIGLIP_MODEL_NAME, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32, local_files_only=True).to(DEVICE)
     except Exception:
-        siglip_processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_NAME)
-        siglip_model = AutoModel.from_pretrained(SIGLIP_MODEL_NAME, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32).to(DEVICE)
-    siglip_model.eval()
+        try:
+            print("[i] 本地无 SigLIP 权重，尝试联网下载...")
+            siglip_processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_NAME)
+            siglip_model = AutoModel.from_pretrained(SIGLIP_MODEL_NAME, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32).to(DEVICE)
+        except Exception:
+            siglip_processor = siglip_model = None
+            print("[!] SigLIP 加载/下载失败，已跳过。")
+    if siglip_model is not None:
+        siglip_model.eval()
+        print("[i] SigLIP 已就绪。")
 
-    print(f"[*] [2/3] 正在装载 Grounding DINO-Base: {DINO_MODEL_NAME} ...")
+    print(f"[*] [2/3] 装载 Grounding DINO-Base: {DINO_MODEL_NAME} ...")
+    dino_processor = dino_model = None
     try:
         dino_processor = AutoProcessor.from_pretrained(DINO_MODEL_NAME, local_files_only=True)
         dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_MODEL_NAME, local_files_only=True).to(DEVICE)
     except Exception:
-        dino_processor = AutoProcessor.from_pretrained(DINO_MODEL_NAME)
-        dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_MODEL_NAME).to(DEVICE)
-    dino_model.eval()
+        try:
+            print("[i] 本地无 DINO 权重，尝试联网下载...")
+            dino_processor = AutoProcessor.from_pretrained(DINO_MODEL_NAME)
+            dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_MODEL_NAME).to(DEVICE)
+        except Exception:
+            dino_processor = dino_model = None
+            print("[!] DINO 加载/下载失败，已跳过。")
+    if dino_model is not None:
+        dino_model.eval()
+        print("[i] Grounding DINO 已就绪。")
 
-    print(f"[*] [3/3] 正在装载 YOLOv8x 顶配模型: {YOLO_MODEL_NAME} ...")
-    try:
-        yolo_model = YOLO(YOLO_MODEL_NAME)
-    except Exception as e:
-        pass
+    print(f"[*] [3/3] 装载 YOLOv8x: {YOLO_MODEL_NAME} ...")
+    yolo_model = None
+    if os.path.exists(YOLO_MODEL_NAME):
+        try:
+            yolo_model = YOLO(YOLO_MODEL_NAME)
+            print("[i] YOLO 已就绪（本地权重）。")
+        except Exception:
+            yolo_model = None
+            print("[!] YOLO 本地权重加载失败，已跳过。")
+    else:
+        try:
+            print("[i] 本地无 YOLO 权重，尝试联网下载...")
+            yolo_model = YOLO(YOLO_MODEL_NAME)
+            print("[i] YOLO 已就绪（已下载）。")
+        except Exception:
+            yolo_model = None
+            print("[!] YOLO 下载失败，已跳过。")
 
-    print("🚀 RTX 4070 Ti 旗舰配置 已就绪！")
+    print("🚀 启动完成（生产模式：本地有则加载，没有则下载，失败自动跳过）")
 
 # ----------------- API 路由 -----------------
 @app.get("/")
@@ -355,13 +447,17 @@ def read_index():
 @app.get("/api/projects")
 def list_projects():
     if not os.path.exists(PROJECTS_ROOT):
-        return {"projects": ["default"]}
+        os.makedirs(PROJECTS_ROOT, exist_ok=True)
     items = [d for d in os.listdir(PROJECTS_ROOT) if os.path.isdir(os.path.join(PROJECTS_ROOT, d))]
-    return {"projects": sorted(items) if items else ["default"]}
+    # 永远保留 default 项目，避免下拉列表里消失
+    if "default" not in items:
+        items.insert(0, "default")
+    return {"projects": sorted(items)}
 
 @app.post("/api/projects/create")
 def create_project(project_name: str = Form(...)):
     clean_name = sanitize_project_name(project_name)
+    _log(f"[项目] 新建项目请求: {project_name} -> {clean_name}")
     if not clean_name:
         raise HTTPException(status_code=400, detail="项目名不合法")
     get_project_paths(clean_name)
@@ -370,6 +466,7 @@ def create_project(project_name: str = Form(...)):
 
 @app.post("/api/projects/rename")
 def rename_project(old_name: str = Form(...), new_name: str = Form(...)):
+    _log(f"[项目] 重命名请求: {old_name} -> {new_name}")
     clean_old = sanitize_project_name(old_name)
     clean_new = sanitize_project_name(new_name)
     if not clean_old or not clean_new:
@@ -396,6 +493,7 @@ def rename_project(old_name: str = Form(...), new_name: str = Form(...)):
 @app.post("/api/projects/delete")
 def delete_project(project_name: str = Form(...)):
     clean_name = sanitize_project_name(project_name)
+    _log(f"[项目] 删除项目请求: {clean_name}")
     if clean_name == "default":
         return {"code": 400, "msg": "default 是系统保留的默认项目，无法删除，您可以通过清理数据来清空它。"}
         
@@ -480,37 +578,465 @@ def extract_and_index_project(ctx, image_paths: List[str]):
     return len(extracted_records)
 
 # ----------------- 数据导入与上传路由 -----------------
+
+# 🌟 全局后台任务状态中心（用于前端实时查询进度）
+task_status = {
+    "is_running": False,
+    "current_path": "",
+    "processed_count": 0,
+    "total_count": 0,
+    "task_type": "",
+    "msg": "闲置中",
+}
+
+
+def background_full_pipeline_worker(project: str, source_path: str):
+    """后台线程：递归扫描目录（支持多路径逗号分隔）+ PIL 校验 + 登记入库 + 自动提取特征"""
+    global task_status
+    task_status["is_running"] = True
+    task_status["task_type"] = "import"
+    task_status["current_path"] = source_path
+    task_status["processed_count"] = 0
+    task_status["total_count"] = 0
+    task_status["msg"] = "正在扫描目录并登记文件..."
+    _log("▶ 直导任务开始: " + source_path)
+
+    try:
+        ctx = load_project_context(project)
+        existing_filenames = set([os.path.basename(m.get("path", "")) for m in ctx["metadata"] if "path" in m])
+        new_saved_paths = []
+
+        # 兼容处理单路径或多个逗号分隔的路径
+        paths = [p.strip() for p in source_path.split(',') if p.strip()]
+        src_map = {}   # 文件名 -> 原始源目录(伴生文件所在)
+
+        for p in paths:
+            if not os.path.exists(p):
+                task_status["msg"] = f"服务器端未找到路径: {p}"
+                continue
+
+            # 1. 自动递归扫描路径并登记到原始数据池（无后缀/时间戳后缀也强行用 PIL 试探）
+            for root, dirs, files in os.walk(p):
+                for f in files:
+                    file_path = os.path.join(root, f)
+                    ext = os.path.splitext(f)[1].lower()
+
+                    # 允许常规图片或数字时间戳后缀（如 .224, .225）
+                    if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp'] or ext.replace('.', '').isdigit():
+                        if f in existing_filenames:
+                            continue
+                        try:
+                            # 强行用 PIL 试探一下它到底是不是图，打得开就收编入库！
+                            with Image.open(file_path) as img:
+                                img.verify()
+
+                            # 登记到原始数据池：复制进项目图片目录（文件名即唯一标识）
+                            dst_file = os.path.join(ctx["img_dir"], f)
+                            shutil.copy2(file_path, dst_file)
+                            new_saved_paths.append(dst_file)
+                            src_map[f] = root   # 伴生文件与源 jpg 同目录
+                            existing_filenames.add(f)
+                        except Exception:
+                            # 打不开说明真不是图片，直接跳过
+                            continue
+
+        # 2. 扫描登记完成后，无缝自动触发特征提取（在线向量化，点燃 RTX 4070 Ti）
+        task_status["total_count"] = len(new_saved_paths)
+        task_status["msg"] = "目录扫描完毕，正在唤醒 RTX 4070 Ti 自动提取特征..."
+
+        processed_count = 0
+        if new_saved_paths:
+            processed_count = extract_and_index_project(ctx, new_saved_paths)
+        # 给这批新图记录 src_dir，供交付打包自动定位伴生文件
+        if processed_count:
+            for rec in ctx["metadata"][-processed_count:]:
+                fn = rec.get("filename")
+                if fn and fn in src_map:
+                    rec["src_dir"] = src_map[fn]
+            save_project_context(ctx)
+
+        task_status["processed_count"] = processed_count
+        task_status["msg"] = f"全自动导入与特征向量化已全部完成！本次向量化 {processed_count} 张新图，库内共 {ctx['index'].ntotal} 张"
+    except Exception as e:
+        task_status["msg"] = f"后台处理异常: {str(e)}"
+        _log("✖ 直导异常: " + str(e))
+    finally:
+        task_status["is_running"] = False
+        _log("✔ 直导结束: " + task_status["msg"])
+
+
+# 🌟 极速直导接口：秒回响应，绝不卡死前端
 @app.post("/api/import_from_path")
-async def import_from_path(project: str = Form("default"), source_path: str = Form(...)):
-    if not os.path.exists(source_path):
-        return {"code": 404, "msg": f"服务器端未找到路径: {source_path}"}
-    
-    ctx = load_project_context(project)
-    existing_filenames = set([os.path.basename(m.get("path", "")) for m in ctx["metadata"] if "path" in m])
-    new_saved_paths = []
-    
-    for root, dirs, files in os.walk(source_path):
-        for file in files:
-            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')) and not file.startswith('__MACOSX'):
-                if file not in existing_filenames:
-                    src_file = os.path.join(root, file)
-                    dst_file = os.path.join(ctx["img_dir"], file)
-                    try:
-                        shutil.copy2(src_file, dst_file)
-                        new_saved_paths.append(dst_file)
-                        existing_filenames.add(file)
-                    except Exception as e:
-                        pass
-                        
-    processed_count = 0
-    if new_saved_paths:
-        processed_count = extract_and_index_project(ctx, new_saved_paths)
-        
-    return {
-        "code": 200,
-        "msg": f"成功从挂载路径读取并向量化了 {processed_count} 张新图",
-        "processed_count": ctx["index"].ntotal
-    }
+async def import_from_path(
+    project: str = Form("default"),
+    source_path: str = Form(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
+    global task_status
+    if task_status["is_running"]:
+        return {"code": 400, "msg": "后台已有批量任务正在狂飙中，请稍候..."}
+
+    # 丢进后台线程，立刻给前端返回成功
+    background_tasks.add_task(background_full_pipeline_worker, project, source_path)
+    _log(f"[直导] 收到直导请求 project={project} path={source_path}")
+    return {"code": 200, "msg": "路径已接收，后台正在静默扫描并自动向量化！"}
+
+
+# 🌟 前端轮询状态查询接口
+@app.get("/api/import_status")
+async def get_import_status():
+    """前端随时打听后台导入进度"""
+    return task_status
+
+
+# ================= 日志查看接口（实时 / 历史 / 压缩） =================
+@app.get("/api/logs/live")
+def logs_live(lines: int = Query(300, ge=1, le=5000)):
+    """实时查看当天日志末尾 lines 行"""
+    path = _today_log_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            arr = f.read().splitlines()
+        tail = arr[-lines:]
+        return {"code": 200, "file": os.path.basename(path), "lines": tail}
+    except Exception as e:
+        return {"code": 500, "msg": str(e)}
+
+
+@app.get("/api/logs/list")
+def logs_list():
+    """列出所有历史日志文件（含已压缩 .gz）"""
+    files = []
+    for p in sorted(glob.glob(os.path.join(LOG_DIR, "app_*"))):
+        files.append({
+            "name": os.path.basename(p),
+            "size": os.path.getsize(p),
+            "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(p))),
+        })
+    return {"code": 200, "files": files}
+
+
+@app.get("/api/logs/read")
+def logs_read(file: str = Query(...), lines: int = Query(0, ge=0)):
+    """读取指定历史日志（支持 .gz 自动解压；lines>0 时只返回末尾 lines 行）"""
+    safe = os.path.basename(file)
+    path = os.path.join(LOG_DIR, safe)
+    if not os.path.exists(path):
+        return {"code": 404, "msg": "文件不存在"}
+    try:
+        open_fn = gzip.open if safe.endswith(".gz") else open
+        with open_fn(path, "rt", encoding="utf-8") as f:
+            arr = f.read().splitlines()
+        out = arr[-lines:] if lines > 0 else arr
+        return {"code": 200, "file": safe, "lines": out}
+    except Exception as e:
+        return {"code": 500, "msg": str(e)}
+
+
+# ================= 稀疏采样抽帧（后台任务） =================
+def _parse_ts(name):
+    """从文件名提取时间戳数值，如 '1782865441.424.jpg' -> 1782865441.424"""
+    base = os.path.splitext(name)[0]
+    m = re.match(r"^(\d+(?:\.\d+)?)", base)
+    return float(m.group(1)) if m else None
+
+
+def _to_nas_local(p):
+    """把 Windows UNC 路径（\\\\host\\\\share\\\\... 或 //host/share/...）转成服务器本地挂载路径（/mnt/<share>/...）。
+    服务器 10.2.248.34 把 NAS 的 Data_Platform 挂载在 /mnt/Data_Platform。"""
+    if not p:
+        return p
+    p = p.replace("\\", "/").strip()
+    if p.startswith("//"):
+        parts = p.strip("/").split("/", 1)
+        if len(parts) == 2 and parts[1]:
+            return "/mnt/" + parts[1].lstrip("/")
+    return p
+
+
+def _parse_extract_jobs(folder_path: str, default_project: str):
+    """folder_path 可含多条路径（换行 / 逗号 / 分号分隔）。
+    每条路径可写成  `项目名::/绝对路径`  来指定归属不同项目；未指定的归到 default_project。"""
+    jobs = []
+    for raw in re.split(r"[\r\n;,，；]+", folder_path or ""):
+        s = (raw or "").strip().strip('"')
+        if not s:
+            continue
+        if "::" in s:
+            proj, p = s.split("::", 1)
+            jobs.append((p.strip().strip('"'), proj.strip() or default_project))
+        else:
+            jobs.append((s, default_project))
+    return jobs
+
+
+def _run_extract_one(folder_path: str, frame_step: int, project: str, vectorize: bool, unit: str):
+    """执行单条路径的稀疏采样抽帧，返回结果字符串。不负责全局 is_running 开关。"""
+    global task_status
+    folder_path = _to_nas_local(folder_path)  # 自动把 UNC 路径转成服务器本地挂载路径
+    task_status["current_path"] = folder_path
+    task_status["processed_count"] = 0
+    task_status["total_count"] = 0
+    try:
+        if not os.path.isdir(folder_path):
+            return f"❌ 文件夹不存在: {folder_path}"
+
+        # 1) 递归收集所有 jpg（跳过输出目录 sampled_frames）
+        jpg_files = []
+        for root, dirs, files in os.walk(folder_path):
+            if os.path.basename(root).lower() == "sampled_frames":
+                continue
+            for f in files:
+                if f.lower().endswith((".jpg", ".jpeg")):
+                    jpg_files.append(os.path.join(root, f))
+        if not jpg_files:
+            return "❌ 未找到任何 jpg 文件"
+
+        # 2) 按时间戳排序（能解析时间戳的按时间戳，解析不了的按文件名）
+        def _sort_key(p):
+            ts = _parse_ts(os.path.basename(p))
+            return ts if ts is not None else float("inf")
+        jpg_files.sort(key=_sort_key)
+
+        # 3) 抽取：支持按帧数间隔(count) 或 按时间戳间隔(time)
+        if frame_step <= 0:
+            frame_step = 1
+        selected = []
+        if unit == "count":
+            # 按帧数间隔：从第 frame_step 个起，每隔 frame_step 抽 1 张
+            selected = [jpg_files[i] for i in range(frame_step, len(jpg_files), frame_step + 1)]
+        else:
+            # 按时间戳间隔（秒）
+            last_ts = None
+            for p in jpg_files:
+                ts = _parse_ts(os.path.basename(p))
+                if ts is None:
+                    continue  # 无法解析时间戳的帧不参与时间戳间隔抽取
+                if last_ts is None or (ts - last_ts) >= frame_step:
+                    selected.append(p)
+                    last_ts = ts
+        if not selected:
+            return "❌ 未能按间隔选出任何帧"
+
+        # 4) 复制到 sampled_frames
+        target_dir = os.path.join(folder_path, "sampled_frames")
+        os.makedirs(target_dir, exist_ok=True)
+        task_status["total_count"] = len(selected)
+        copied = 0
+        for i, p in enumerate(selected, 1):
+            dst = os.path.join(target_dir, os.path.basename(p))
+            try:
+                if not os.path.exists(dst):
+                    shutil.copy2(p, dst)
+                copied += 1
+            except Exception:
+                pass
+            task_status["processed_count"] = i
+
+        if unit == "count":
+            msg = f"✅ [{project}] 共 {len(jpg_files)} 帧，按每 {frame_step} 帧抽 1 帧，共抽 {copied} 帧至 sampled_frames/"
+        else:
+            msg = f"✅ [{project}] 共 {len(jpg_files)} 帧，按 {frame_step}s 时间戳间隔抽取 {copied} 帧至 sampled_frames/"
+
+        # 5) 自动入底库向量化
+        if vectorize:
+            ctx = load_project_context(project)
+            existing_filenames = set([os.path.basename(m.get("path", "")) for m in ctx["metadata"] if "path" in m])
+            new_saved_paths = []
+            src_map = {}   # 新图文件名 -> 其原始源目录(伴生 .bin/.xml/_raw 所在)
+            for p in selected:
+                fn = os.path.basename(p)
+                if fn in existing_filenames:
+                    continue
+                dst = os.path.join(ctx["img_dir"], fn)
+                try:
+                    shutil.copy2(p, dst)
+                    new_saved_paths.append(dst)
+                    src_map[fn] = os.path.dirname(p)   # 伴生文件与源 jpg 同目录
+                    existing_filenames.add(fn)
+                except Exception:
+                    pass
+            vec = 0
+            if new_saved_paths:
+                vec = extract_and_index_project(ctx, new_saved_paths)
+            # 给这批新图记录 src_dir，供交付打包自动定位伴生文件
+            if vec:
+                for rec in ctx["metadata"][-vec:]:
+                    fn = rec.get("filename")
+                    if fn and fn in src_map:
+                        rec["src_dir"] = src_map[fn]
+                save_project_context(ctx)
+            return f"{msg}；自动入底库 {vec} 张新图，库内共 {ctx['index'].ntotal} 张"
+        return msg
+    except Exception as e:
+        _log("✖ 抽帧异常: " + str(e))
+        return f"❌ 抽帧异常: {str(e)}"
+
+
+def background_extract_manager(jobs, frame_step: int, vectorize: bool, unit: str):
+    """后台抽帧总调度：顺序处理多条路径（可分别归属不同项目）。"""
+    global task_status
+    task_status["is_running"] = True
+    task_status["task_type"] = "extract"
+    task_status["processed_count"] = 0
+    task_status["total_count"] = len(jobs)
+    _log(f"▶ 抽帧任务开始: 共 {len(jobs)} 条路径 (间隔:{frame_step},{unit})")
+    results = []
+    for idx, (path, proj) in enumerate(jobs, 1):
+        task_status["msg"] = f"正在抽帧 第{idx}/{len(jobs)}条 [{proj}] {path}..."
+        _log(f"[抽帧] 批次 {idx}/{len(jobs)} 项目={proj} 路径={path}")
+        results.append(_run_extract_one(path, frame_step, proj, vectorize, unit))
+        task_status["processed_count"] = idx
+    task_status["msg"] = " | ".join(results)
+    task_status["is_running"] = False
+    _log("✔ 抽帧结束: " + task_status["msg"])
+
+
+# ================= 三件套交付打包（后台任务） =================
+class ExportDeliveryRequest(BaseModel):
+    project: str
+    selected_image_names: List[str]
+    extensions: List[str] = [".bin", ".xml"]
+    export_dir_name: str = "delivery_package"
+    output_dir: Optional[str] = None   # 用户指定的输出目录（可填服务器/NAS路径，支持 UNC）
+    source_roots: Optional[List[str]] = None   # 手动指定伴生文件源根目录(历史数据兜底)
+
+
+def background_delivery_package(req: ExportDeliveryRequest):
+    """把选中的图片及其同名伴生文件（JPG/BIN/XML 等）打包到指定输出目录。
+    伴生文件(.bin/.xml/_raw.jpg)查找顺序：
+      1) 该图入库时记录的原始源目录 src_dir（抽帧/直导自动记录，最快）；
+      2) 打包请求携带的 source_roots / 环境变量 AD_SOURCE_ROOTS 里的根目录（递归按同名匹配，适合历史已入库数据）；
+    全找不到才计缺失。"""
+    global task_status
+    task_status["is_running"] = True
+    task_status["task_type"] = "delivery"
+    task_status["current_path"] = req.project
+    task_status["processed_count"] = 0
+    task_status["total_count"] = 0
+    task_status["msg"] = "正在匹配并打包关联交付文件 (JPG + BIN + XML)..."
+    _log("▶ 打包任务开始: project=" + req.project)
+
+    try:
+        ctx = load_project_context(req.project)
+        img_dir = ctx["img_dir"]
+        # 输出目录：用户指定了就用用户指定的(UNC自动转服务器挂载)，否则默认放项目目录下
+        if req.output_dir and req.output_dir.strip():
+            output_dir = _to_nas_local(req.output_dir.strip())
+        else:
+            output_dir = os.path.join(ctx["dir"], req.export_dir_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        meta_by_fn = {}
+        for m in ctx["metadata"]:
+            meta_by_fn.setdefault(os.path.basename(m.get("path", "")), m)
+
+        # 1) 组装每条选中图片：jpg 名 + 需找的伴生文件名 + 该图原始源目录
+        items = []
+        needed = {}   # 伴生文件名 -> 找到的绝对路径(未找到为 None)
+        for img_name in req.selected_image_names:
+            base = os.path.splitext(img_name)[0]
+            rec = meta_by_fn.get(img_name) or {}
+            src_dir = rec.get("src_dir")
+            # 若文件名带 _raw，先去 _raw 再找关联文件（与挑图工具一致）
+            match_base = base.replace('_raw', '') if '_raw' in os.path.basename(base).lower() else base
+            ext_names = [f"{match_base}{ext}" for ext in req.extensions]
+            items.append({"img_name": img_name, "src_dir": src_dir, "ext_names": ext_names})
+            for n in ext_names:
+                needed.setdefault(n, None)
+
+        # 2) 先在每条图入库时记录的原始源目录里精确找
+        for it in items:
+            if it["src_dir"]:
+                for n in it["ext_names"]:
+                    p = os.path.join(it["src_dir"], n)
+                    if needed.get(n) is None and os.path.exists(p):
+                        needed[n] = p
+
+        # 3) 仍有缺失时，去 source_roots / AD_SOURCE_ROOTS 递归扫一遍（只按需要的文件名匹配，一次遍历）
+        roots = []
+        if req.source_roots:
+            roots += [r for r in req.source_roots if r and r.strip()]
+        roots += SOURCE_ROOTS
+        if roots and any(p is None for p in needed.values()):
+            needset = set(n for n, p in needed.items() if p is None)
+            for root in roots:
+                root = _to_nas_local(root)
+                if not os.path.isdir(root):
+                    continue
+                for dirpath, _, files in os.walk(root):
+                    for f in files:
+                        if f in needset and needed.get(f) is None:
+                            needed[f] = os.path.join(dirpath, f)
+                    if not any(p is None for p in needed.values()):
+                        break
+                if not any(p is None for p in needed.values()):
+                    break
+
+        # 4) 拷贝到输出目录
+        copied_count = 0
+        missing_count = 0
+        total = len(req.selected_image_names)
+        for idx, it in enumerate(items, 1):
+            src_jpg = os.path.join(img_dir, it["img_name"])
+            if os.path.exists(src_jpg):
+                shutil.copy2(src_jpg, os.path.join(output_dir, it["img_name"]))
+                copied_count += 1
+            else:
+                missing_count += 1
+            for n in it["ext_names"]:
+                p = needed.get(n)
+                if p:
+                    shutil.copy2(p, os.path.join(output_dir, os.path.basename(n)))
+                    copied_count += 1
+                else:
+                    missing_count += 1
+            task_status["processed_count"] = idx
+            task_status["total_count"] = total
+
+        task_status["msg"] = f"✅ 交付包打包完成！共拷贝 {copied_count} 个文件，缺失 {missing_count} 个，输出: {output_dir}"
+        _log("✔ 打包结束: " + task_status["msg"])
+    except Exception as e:
+        task_status["msg"] = f"打包异常: {str(e)}"
+        _log("✖ 打包异常: " + str(e))
+    finally:
+        task_status["is_running"] = False
+
+
+# ================= 稀疏抽帧接口 =================
+@app.post("/api/extract_frames")
+async def extract_frames(
+    folder_path: str = Form(...),
+    frame_step: int = Form(default=5),
+    project: str = Form(default="default"),
+    vectorize: int = Form(default=1),
+    unit: str = Form(default="time"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
+    global task_status
+    if task_status["is_running"]:
+        return {"code": 400, "msg": "后台正忙，请稍候..."}
+    jobs = _parse_extract_jobs(folder_path, project)
+    if not jobs:
+        return {"code": 400, "msg": "未解析到有效的抽帧路径"}
+    background_tasks.add_task(background_extract_manager, jobs, frame_step, bool(vectorize), unit)
+    _log(f"[抽帧] 收到抽帧请求 路径数={len(jobs)} step={frame_step} unit={unit} vectorize={vectorize} 默认项目={project}")
+    return {"code": 200, "msg": f"稀疏抽帧任务已启动：共 {len(jobs)} 条路径，间隔单位: {'时间戳(秒)' if unit == 'time' else '帧数'}"}
+
+
+# ================= 三件套交付打包接口 =================
+@app.post("/api/export_delivery")
+async def export_delivery(
+    req: ExportDeliveryRequest,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
+    global task_status
+    if task_status["is_running"]:
+        return {"code": 400, "msg": "后台正忙，请稍候..."}
+    background_tasks.add_task(background_delivery_package, req)
+    _log(f"[打包] 收到打包请求 project={req.project} frames={len(req.selected_image_names)} exts={req.extensions}")
+    return {"code": 200, "msg": f"正在后台自动打包 {len(req.selected_image_names)} 帧数据及其伴生文件！"}
+
 
 @app.post("/api/upload_batch")
 async def upload_batch(project: str = Form("default"), files: List[UploadFile] = File(...)):
@@ -557,6 +1083,7 @@ async def upload_batch(project: str = Form("default"), files: List[UploadFile] =
     processed_count = 0
     if new_saved_paths:
         processed_count = extract_and_index_project(ctx, new_saved_paths)
+    _log(f"[上传] 上传批次完成，新增并向量化 {processed_count} 张，库内 {ctx['index'].ntotal} 张")
 
     return {
         "code": 200,
@@ -566,6 +1093,7 @@ async def upload_batch(project: str = Form("default"), files: List[UploadFile] =
 
 @app.post("/api/build_index_online")
 async def build_index_online(project: str = Query("default")):
+    _log(f"[向量化] 触发在线向量化 project={project}")
     ctx = load_project_context(project)
     all_imgs = [os.path.join(ctx["img_dir"], f) for f in os.listdir(ctx["img_dir"]) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))]
     indexed_paths = set([m['path'] for m in ctx["metadata"] if 'path' in m])
@@ -580,6 +1108,7 @@ async def build_index_online(project: str = Query("default")):
 # ----------------- 检索路由 -----------------
 @app.get("/api/search")
 def search_text(project: str = Query("default"), query: str = Query(..., min_length=1), top_k: int = 500):
+    _log(f"[检索] 文本检索 project={project} query={query} top_k={top_k}")
     ctx = load_project_context(project)
     if ctx["index"] is None or ctx["index"].ntotal == 0:
         return {"code": 200, "results": [], "total": 0}
@@ -607,12 +1136,14 @@ def search_text(project: str = Query("default"), query: str = Query(..., min_len
 
 @app.post("/api/search_by_filename")
 def search_by_filename(project: str = Form("default"), filename_query: str = Form(...)):
+    _log(f"[检索] 文件名检索 project={project} query={filename_query}")
     ctx = load_project_context(project)
     results = [m for m in ctx["metadata"] if filename_query.lower() in m.get("filename", "").lower()]
     return {"code": 200, "results": results}
 
 @app.post("/api/search_by_external_image")
 async def search_by_external_image(project: str = Form("default"), files: List[UploadFile] = File(...), top_k: int = 500):
+    _log(f"[检索] 以图搜图 project={project} 参考图={len(files)} 张")
     ctx = load_project_context(project)
     if ctx["index"] is None or ctx["index"].ntotal == 0 or not files:
         return {"code": 200, "results": []}
@@ -670,6 +1201,7 @@ def list_all(project: str = Query("default"), page: int = 1, size: int = 30):
 # ----------------- 数据清洗与标注推理 -----------------
 @app.post("/api/dedup_stats")
 def dedup_stats(project: str = Form("default"), sim_threshold: float = Form(0.95)):
+    _log(f"[降重] 特征矩阵扫描 project={project} threshold={sim_threshold}")
     ctx = load_project_context(project)
     total = len(ctx["metadata"])
     if total < 2 or ctx["index"] is None or LITE_MODE:
@@ -706,6 +1238,7 @@ def dedup_stats(project: str = Form("default"), sim_threshold: float = Form(0.95
 
 @app.post("/api/delete_and_sync")
 def delete_and_sync(project: str = Form("default"), image_ids: str = Form(...)):
+    _log(f"[降重] 永久粉碎冗余 project={project} ids={image_ids}")
     ctx = load_project_context(project)
     del_ids = set([int(x) for x in image_ids.split(",") if x.strip().isdigit()])
     if not del_ids:
@@ -734,6 +1267,7 @@ def delete_and_sync(project: str = Form("default"), image_ids: str = Form(...)):
 @app.post("/api/ground_detect")
 def ground_detect(project: str = Form("default"), image_id: int = Form(...), text_prompt: str = Form(...)):
     """Grounding DINO 真实目标级开放词汇推理（支持中英文自动转译）"""
+    _log(f"[检测] DINO project={project} image_id={image_id} prompt={text_prompt}")
     global dino_model, dino_processor
     ctx = load_project_context(project)
     if not (0 <= image_id < len(ctx["metadata"])) or dino_model is None:
@@ -788,6 +1322,7 @@ def ground_detect(project: str = Form("default"), image_id: int = Form(...), tex
 
 @app.post("/api/yolo_detect")
 def yolo_detect(project: str = Form("default"), image_id: int = Form(...)):
+    _log(f"[检测] YOLO project={project} image_id={image_id}")
     global yolo_model
     ctx = load_project_context(project)
     if not (0 <= image_id < len(ctx["metadata"])) or yolo_model is None:
@@ -835,6 +1370,7 @@ def vlm_analyze_scene(project: str = Form("default"), image_id: int = Form(...))
     """
     第五层 VLM 综合场景判定：对指定图片进行多模态理解，并自动生成驾驶场景标签
     """
+    _log(f"[VLM] 场景判定 project={project} image_id={image_id}")
     global vlm_model, vlm_processor
     ctx = load_project_context(project)
     if not (0 <= image_id < len(ctx["metadata"])):
@@ -902,4 +1438,10 @@ def vlm_analyze_scene(project: str = Form("default"), image_id: int = Form(...))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8009, access_log=False)
+    # 生产部署：可用环境变量覆盖，默认监听 0.0.0.0:8009
+    # 注意：本应用有共享的内存态（task_status / 后台任务），必须单进程 workers=1
+    host = os.environ.get("AD_HOST", "0.0.0.0")
+    port = int(os.environ.get("AD_PORT", "8009"))
+    print(f"[i] 启动服务: http://{host}:{port}  (日志目录: {LOG_DIR})")
+    _log(f"服务启动 http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port, workers=1, access_log=False)
