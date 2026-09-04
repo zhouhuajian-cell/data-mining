@@ -40,7 +40,7 @@
             background-attachment: fixed;
             color: var(--text-main); 
             -webkit-font-smoothing: antialiased; 
-            overflow-x: hidden;
+            overflow-x: auto;
             min-height: 100vh;
             letter-spacing: 0.3px;
         }
@@ -107,17 +107,30 @@
 
         header { 
             background: rgba(2, 6, 23, 0.85); backdrop-filter: blur(16px);
-            border-bottom: 1px solid var(--border); padding: 14px 36px; position: sticky; top: 0; z-index: 100; 
+            border-bottom: 1px solid var(--border); padding: 12px 28px; position: sticky; top: 0; z-index: 100; 
             display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 20px rgba(0,0,0,0.4);
         }
         .header-title { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 12px; }
         .header-title-text { background: linear-gradient(to right, #00d4ff, #8a2be2); -webkit-background-clip: text; color: transparent; }
         
         .project-switch-box {
-            display: flex; align-items: center; gap: 10px; background: rgba(0, 212, 255, 0.08); 
-            padding: 6px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+            display: flex; align-items: center; gap: 8px; background: rgba(0, 212, 255, 0.08); 
+            padding: 6px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border);
         }
-        .header-actions { display: flex; align-items: center; gap: 12px; }
+        .header-actions { display: flex; align-items: center; gap: 8px; }
+        .more-menu { position: relative; }
+        .more-dropdown {
+            display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 300;
+            background: rgba(2, 6, 23, 0.97); border: 1px solid var(--border); border-radius: var(--radius-sm);
+            min-width: 210px; padding: 6px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            flex-direction: column; gap: 4px;
+        }
+        .more-dropdown.show { display: flex; }
+        .more-dropdown button {
+            width: 100%; text-align: left; padding: 8px 12px; font-size: 13px;
+            background: transparent; border: none; box-shadow: none;
+        }
+        .more-dropdown button:hover { background: rgba(0, 212, 255, 0.12); }
 
         .container { padding: 36px; max-width: 1440px; margin: 0 auto; display: flex; flex-direction: column; gap: 32px; }
         
@@ -244,6 +257,46 @@
         
         input[type="file"] { font-size: 13px; color: var(--text-muted); background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--radius-sm); padding: 4px 12px 4px 4px; cursor: pointer; }
         input[type="file"]::file-selector-button { margin-right: 12px; padding: 8px 16px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.08); color: var(--text-main); font-weight: 600; cursor: pointer; }
+
+        /* ===== 笔记本/小屏响应式适配（不影响大屏布局） ===== */
+        @media (max-width: 1600px) {
+            /* 顶部保持单行：收起“更多”下拉后仅收紧间距/留白即可 */
+            header { padding: 10px 18px; }
+            .project-switch-box { gap: 6px; }
+            .header-actions { gap: 6px; }
+        }
+        @media (max-width: 1400px) {
+            .container { padding: 28px; }
+            header { padding: 10px 18px; }
+            header button { padding: 8px 13px; font-size: 13px; }
+            header select { padding: 6px 8px; font-size: 13px; }
+        }
+        @media (max-width: 1200px) {
+            .container { padding: 22px 20px; gap: 24px; }
+            .panel { padding: 24px; }
+            header { padding: 10px 14px; }
+            .header-actions { gap: 6px; }
+            header button { padding: 7px 10px; font-size: 12px; }
+            header .header-title-text { font-size: 17px; }
+        }
+        @media (max-width: 992px) {
+            .panel-header { font-size: 17px; margin-bottom: 18px; }
+            .control-group { gap: 10px; }
+            input[type="text"] { min-width: 200px; }
+            .gallery { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+            .widget-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+        }
+        @media (max-width: 768px) {
+            .container { padding: 14px 12px; gap: 18px; }
+            .panel { padding: 18px 14px; }
+            .header-title { font-size: 17px; }
+            .control-group { gap: 8px; }
+            input[type="text"] { min-width: 0; flex-basis: 100%; }
+            .gallery { grid-template-columns: 1fr; }
+            .panel-header { font-size: 16px; }
+            .widget-value { font-size: 24px; }
+            .slider-container { flex-direction: column; align-items: flex-start; gap: 8px; }
+        }
     </style>
 </head>
 <body>
@@ -283,25 +336,44 @@
             <div class="header-actions">
                 <!-- 🌟 强制全局排序下拉菜单（右上角） 🌟 -->
                 <select id="sortSelect" onchange="changeSort(this.value)" style="cursor: pointer; background: rgba(0,0,0,0.6); color: var(--primary); font-weight: bold; border-color: var(--border); padding: 6px 10px; border-radius: 6px;">
-                    <option value="by_time">⏱️ 排序: 时间戳优先 (默认交付)</option>
-                    <option value="by_score">🎯 排序: AI 匹配度优先</option>
+                    <option value="by_time">按时间戳排序 (默认)</option>
+                    <option value="by_score">按AI匹配度排序</option>
                 </select>
 
-                <button class="secondary" onclick="exportSearchResults()">导出粗筛 (SigLIP-JSON)</button>
                 <button onclick="exportData(true)">导出已勾选 (DINO-JSON)</button>
-                <button class="secondary" onclick="exportData(false)">导出未勾选</button>
-                <button class="secondary" onclick="openExtractModal()">🎬 原始数据抽帧</button>
-                <button onclick="exportDeliveryPackage()">📦 打包交付</button>
-                <button class="secondary" onclick="openLogModal()">📜 查看日志</button>
+                <button class="secondary" onclick="openExtractionModal()">原始数据抽帧</button>
+                <button onclick="exportDeliveryPackage()">交付数据</button>
+                <!-- 更多下拉放到最右侧：把不常用的收起，保持顶部单行 -->
+                <div class="more-menu">
+                    <button class="secondary" onclick="toggleMoreMenu(event)">更多 ▾</button>
+                    <div id="moreMenu" class="more-dropdown">
+                        <button onclick="exportSearchResults()">导出粗筛 (SigLIP-JSON)</button>
+                        <button onclick="openLogModal()">查看日志</button>
+                    </div>
+                </div>
             </div>
         </header>
 
         <div class="container">
+            <!-- 👇 全局并发任务监控大盘 (常驻可见；点击标题手动展开/收起，不会自动弹出或隐藏) 👇 -->
+            <div class="panel" id="taskManagerPanel" style="display: block; border: 2px solid #ea580c;">
+                <div class="panel-header" id="taskManagerHeader" onclick="toggleTaskPanel()" style="color: #ea580c; display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none;" title="点击展开 / 收起任务大盘">
+                    <span>多任务监控<span id="taskCountBadge" style="margin-left:8px; color:#b45309; font-size:13px;"></span></span>
+                    <span style="display:flex; gap:8px; align-items:center;">
+                        <button onclick="event.stopPropagation(); clearFinishedTasks()" style="background: #f3f4f6; color: #4b5563; font-size: 12px; padding: 4px 8px;">清除已完成记录</button>
+                        <span id="taskToggleIcon" style="color:#b45309; font-weight:800;">▼</span>
+                    </span>
+                </div>
+                <!-- 这个容器用来动态注入不同项目的进度条 -->
+                <div id="taskListContainer" style="display: flex; flex-direction: column; gap: 12px;">
+                </div>
+            </div>
+
             <!-- 底库数据大盘 -->
             <div class="panel">
                 <div class="panel-header">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg></div>
-                    物理底库数据大盘 (<span id="currentProjectTitle" style="color:var(--primary);">default</span>)
+                数据仓库 (<span id="currentProjectTitle" style="color:var(--primary);">default</span>)
                 </div>
                 <div class="control-group">
                     <input type="file" id="fileInput" multiple accept="image/*,.zip" onchange="onFilesSelected(this.files)">
@@ -334,7 +406,7 @@
             <div class="panel">
                 <div class="panel-header">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></div>
-                    高维特征降重引擎
+                    数据降重
                 </div>
                 <div class="control-group">
                     <span style="font-size: 14px; font-weight: 600;">特征相似度阈值:</span>
@@ -356,10 +428,10 @@
             <div class="panel">
                 <div class="panel-header">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></div>
-                    智能挖掘与 AI 预标
+                    数据筛选与挖掘
                 </div>
                 
-                <div class="section-label">Phase 1: Google SigLIP 场景语义检索</div>
+                <div class="section-label">Phase 1: Google SigLIP 场景语义检索（初筛）</div>
                 <div class="control-group" style="background: rgba(0,0,0,0.25); padding: 20px; border-radius: var(--radius-md); border: 1px solid rgba(255,255,255,0.06);">
                     <input type="text" id="queryInput" placeholder="输入自然语言场景，如: rainy night highway, overturned truck..." onkeydown="if(event.key==='Enter') searchScenes()" style="border:none;">
                     <span style="font-size: 14px; margin-left: 8px; font-weight:600;">Top K:</span>
@@ -385,21 +457,27 @@
                 
                 <div class="divider"></div>
                 
-                <div class="section-label">Phase 2: 目标检索 (DINO / YOLO)</div>
+                <div class="section-label">Phase 2: DINO / YOLO 目标检索 (精筛)</div>
                 <div class="control-group" style="margin-bottom: 12px;">
                     <input type="text" id="dinoPrompt" placeholder="DINO 开放词汇提示词，支持中文输入 (如: 锥桶. 卡车.)" style="min-width: 260px;">
-                    <button id="btnDino" onclick="runBatchDetection('dino')" disabled>🔒 启动 DINO 检索 (需先执行 Phase 1)</button>
-                    <button id="btnYolo" class="yolo-btn" onclick="runBatchDetection('yolo')" disabled>🔒 启动 YOLO 检索</button>
+                    <button id="btnDino" onclick="runDinoBatch()" disabled>🔒 启动 DINO 检索 (需先执行 Phase 1)</button>
+                    <button id="btnYolo" class="yolo-btn" onclick="runYoloBatch()" disabled>🔒 启动 YOLO 检索</button>
                 </div>
                 
-                <div id="detectStatus" style="font-size: 14px; font-weight: 700; color: var(--primary); margin-bottom: 8px; display: none;">引擎准备就绪...</div>
-                <div id="detectProgressContainer" class="progress-container" style="margin-bottom: 24px;">
-                    <div id="detectProgressBar" class="progress-bar"></div>
+                <!-- 目标检测 / VLM 专用进度条（支持中途急停） -->
+                <div id="detectStatusWrapper" style="display: none; margin-bottom: 24px; background: rgba(0,0,0,0.25); padding: 10px 16px; border-radius: 8px; border: 1px solid rgba(245, 158, 11, 0.35);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <span id="detectStatus" style="font-size: 13px; font-weight: 700; color: var(--warning);">引擎准备就绪...</span>
+                        <button id="detectStopBtn" onclick="stopBatchDetection()" style="background: #ef4444; color: #fff; padding: 4px 12px; font-size: 12px; border-radius: 4px; border: none; cursor: pointer; display: none;">⏹️ 中止检测</button>
+                    </div>
+                    <div id="detectProgressContainer" class="progress-container" style="margin: 0; height: 8px; background: rgba(255,255,255,0.1);">
+                        <div id="detectProgressBar" class="progress-bar" style="width: 0%;"></div>
+                    </div>
                 </div>
 
                 <div class="divider"></div>
 
-                <div class="section-label" style="color: var(--accent);">Phase 3: VLM 场景综合判定 (Qwen2-VL)</div>
+                <div class="section-label" style="color: var(--accent);">Phase 3  Qwen2-VLM 场景综合判定 </div>
                 <div class="control-group" style="margin-bottom: 12px;">
                     <span style="font-size: 13px; color: var(--text-muted);">对 Phase 2 检出并<b>已勾选</b>的目标进行最终的高维语义判定，自动生成场景 Tag：</span>
                     <button id="btnVlm" class="vlm-btn" onclick="runBatchVLM()" disabled>🔒 启动 VLM 深度判定 (需先执行 Phase 2)</button>
@@ -419,8 +497,8 @@
                 <!-- 统计栏：点击切换筛选 -->
                 <div class="stats-bar">
                     <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
-                        <div id="filterAll" class="stat-clickable stat-active" onclick="setDisplayFilter('all')" style="color: #60a5fa;">👁️ 列表总计: <span id="dispCount" class="stats-number">0</span></div>
-                        <div style="padding: 6px 12px; color: var(--success); user-select: none;">🎯 检出目标: <span id="targetCount" class="stats-number">0</span></div>
+                        <div id="filterAll" class="stat-clickable stat-active" onclick="setDisplayFilter('all')" style="color: #60a5fa;">列表总计: <span id="dispCount" class="stats-number">0</span></div>
+                        <div style="padding: 6px 12px; color: var(--success); user-select: none;">检出目标: <span id="targetCount" class="stats-number">0</span></div>
                         <div id="filterChecked" class="stat-clickable" onclick="setDisplayFilter('checked')" style="color: var(--warning);">✅ 已勾选: <span id="checkedCount" class="stats-number">0</span></div>
                         <div id="filterUnchecked" class="stat-clickable" onclick="setDisplayFilter('unchecked')" style="color: var(--text-muted);">⬜ 未勾选: <span id="uncheckedCount" class="stats-number">0</span></div>
                     </div>
@@ -461,23 +539,64 @@
         </div>
     </div>
 
-    <!-- 稀疏抽帧弹窗 -->
-    <div id="extractModal" class="modal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; background:rgba(2,6,23,0.96); align-items:center; justify-content:center; backdrop-filter:blur(10px);">
-        <div style="background:#1e293b; padding:24px; border-radius:12px; width:460px; color:#fff; border:1px solid rgba(0,212,255,0.4);">
-            <h3 style="margin-top:0;">🎬 原始数据稀疏采样抽帧</h3>
-            <textarea id="extractPathInput" rows="3" placeholder="支持多条路径，每行一条（也可用逗号/分号分隔）。&#10;路径默认归入当前项目；如需归入其它项目，请写成：&#10;  项目名::/绝对路径&#10;例如：&#10;  /mnt/Data_Platform/雨天-白天&#10;  场景A::/mnt/Data_Platform/夜晚-雨天" style="width:100%; padding:8px; margin:10px 0; background:rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px; font-family:inherit; resize:vertical;"></textarea>
-            <input type="number" id="extractStepInput" value="5" placeholder="抽帧间隔" style="width:100%; padding:8px; margin:10px 0; background:rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px;">
-            <label style="display:block; margin-bottom:10px; color:#94a3b8;">间隔单位：
-                <select id="extractUnit" style="background:rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px; padding:4px 6px;">
-                    <option value="time">时间戳 (秒)</option>
-                    <option value="count">帧数 (每隔 N 帧抽 1)</option>
-                </select>
-            </label>
-            <label style="display:block; margin-bottom:10px; color:#94a3b8;"><input type="checkbox" id="extractVec" checked> 抽完自动入底库向量化</label>
-            <div id="extractErr" style="display:none; background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.5); color:#fca5a5; border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:13px; line-height:1.7; white-space:pre-wrap;"></div>
-            <div style="display:flex; justify-content:flex-end; gap:10px;">
-                <button class="secondary" onclick="document.getElementById('extractModal').style.display='none'">取消</button>
-                <button onclick="submitExtractFrames()">启动抽帧</button>
+    <!-- 原始数据抽帧 (数据预清洗与全自动入库) 弹窗 -->
+    <div id="extractionOverlay" style="position:fixed; inset:0; z-index:10005; background:rgba(2,6,23,0.92); display:none; align-items:center; justify-content:center; backdrop-filter: blur(10px);">
+        <div style="background:rgba(15, 23, 42, 0.95); border:1px solid var(--border); border-radius:14px; width: 850px; max-width: 95vw; box-shadow: 0 0 40px rgba(0,212,255,0.15); overflow:hidden;">
+
+            <!-- 弹窗 Header -->
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 28px; background: rgba(0,0,0,0.3); border-bottom: 1px solid rgba(255,255,255,0.08);">
+                <div style="font-size: 18px; font-weight: 800; color: var(--text-main); display: flex; align-items: center; gap: 10px;">
+                    <span style="font-size: 22px;">🎬</span> 数据预清洗与全自动入库
+                </div>
+                <div onclick="closeExtractionModal()" style="cursor: pointer; font-size: 26px; color: var(--text-muted); display: flex; align-items: center; justify-content: center; transition: color 0.2s;">&times;</div>
+            </div>
+
+            <!-- 弹窗 Body (左右两栏) -->
+            <div style="display: flex; gap: 0; padding: 28px;">
+                <!-- 左侧：图片抽帧（支持多路径） -->
+                <div style="flex: 1; padding-right: 28px; border-right: 1px dashed rgba(255,255,255,0.1);">
+                    <div style="font-weight: 600; margin-bottom: 16px; color: var(--primary); display: flex; align-items: center; gap: 8px;">
+                    图片稀疏抽帧
+                    </div>
+                    <textarea id="extractFolderPath" rows="4" placeholder="支持多条路径，每行一条（也可用逗号/分号分隔）。&#10;路径为目录，将递归扫描其内所有子文件夹的 jpg/jpeg；默认归入当前项目，归入其它项目写成：&#10;  项目名::/绝对路径&#10;例如：&#10;  /mnt/Data_Platform/雨天-白天&#10;  场景A::/mnt/Data_Platform/夜晚-雨天" style="width: 100%; box-sizing: border-box; margin-bottom: 16px; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px; font-family:inherit; resize:vertical;"></textarea>
+                    <div style="display: flex; gap: 10px; width: 100%; align-items: center; margin-bottom: 12px;">
+                        <span style="font-size: 13px; color: var(--text-muted);">间隔单位:</span>
+                        <select id="extractUnit" style="flex:1; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px;">
+                            <option value="count">帧数 (每隔 N 帧抽 1)</option>
+                            <option value="time">时间戳 (秒间隔)</option>
+                        </select>
+                    </div>
+                    <div style="display: flex; gap: 10px; width: 100%; align-items: center;">
+                        <span style="font-size: 13px; color: var(--text-muted);">步长:</span>
+                        <input type="number" id="frameStep" value="5" min="1" style="width: 80px; padding: 12px; background: rgba(0,0,0,0.5);">
+                        <button onclick="startFrameExtraction()" style="flex: 1; padding: 12px;">启动图片抽帧</button>
+                    </div>
+                </div>
+
+                <!-- 右侧：视频抽帧 -->
+                <div style="flex: 1; padding-left: 28px;">
+                    <div style="font-weight: 600; margin-bottom: 16px; color: var(--success); display: flex; align-items: center; gap: 8px;">
+                    视频稀疏抽帧
+                    </div>
+                    <textarea id="videoPathInput" rows="4" placeholder="支持多条路径，每行一条（也可用逗号/分号分隔）。&#10;路径可为目录(递归扫描其内 mp4/avi/mov 等)或单个视频文件；默认归入当前项目，归入其它项目写成：&#10;  项目名::/路径&#10;例如：&#10;  /mnt/Data_Platform/视频/雨天&#10;  场景A::/mnt/Data_Platform/单段.mp4" style="width: 100%; box-sizing: border-box; margin-bottom: 16px; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px; font-family:inherit; resize:vertical;"></textarea>
+                    <div style="display: flex; gap: 10px; width: 100%; align-items: center; margin-bottom: 12px;">
+                        <span style="font-size: 13px; color: var(--text-muted);">间隔单位:</span>
+                        <select id="videoUnit" style="flex:1; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px;">
+                            <option value="time" selected>时间 (每隔 N 秒抽 1 帧)</option>
+                            <option value="count">帧数 (每隔 N 帧抽 1 帧)</option>
+                        </select>
+                    </div>
+                    <div style="display: flex; gap: 10px; width: 100%; align-items: center;">
+                        <span style="font-size: 13px; color: var(--text-muted);">步长:</span>
+                        <input type="number" id="videoStepInput" value="1" min="1" style="width: 80px; padding: 12px; background: rgba(0,0,0,0.5);">
+                        <button onclick="startVideoProcessing()" class="yolo-btn" style="flex: 1; padding: 12px;">启动视频切帧</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 弹窗 Footer 提示 -->
+            <div style="padding: 14px 28px; background: rgba(0,212,255,0.03); font-size: 13px; color: var(--text-muted); text-align: center; border-top: 1px solid rgba(0,212,255,0.1);">
+                💡 提示：任务一旦下发，系统将自动在后台进行降维切片并调用 GPU 入库，请在页面顶部的【核心调度监控室】查看进度大盘。
             </div>
         </div>
     </div>
@@ -563,9 +682,17 @@
         let isImporting = false;
         let statusPollingTimer = null;
 
+        // 持久化目标检测缓存（翻页/重开/切项目后自动把已存盘的检测框补回来）
+        let cachedDetections = {};
+        let detectionsLoadedFor = '';
+        let detectionsDirty = true;
+        let isDetectCancelled = false;   // 目标检测急停手刹
+
         window.onload = async function() {
             await loadProjectList();
             resetPipelineStates();
+            applyTaskPanelUI();       // 初始即收起大盘为标题栏
+            startGlobalTaskPolling(); // 启动全局并发调度雷达
         };
 
         function enterApp() {
@@ -609,6 +736,17 @@
                 document.getElementById('statsSummary').style.display = 'none';
                 document.getElementById('dedupStatus').innerText = '';
                 resetPipelineStates();
+                // 切换项目后清掉上一项目遗留的任务状态行/进度条，避免串项目显示
+                const _idxSt = document.getElementById('indexStatus');
+                if (_idxSt) {
+                    _idxSt.innerText = `当前项目 [${currentProject}] 暂无进行中任务`;
+                    _idxSt.style.color = 'var(--text-muted)';
+                }
+                const _idxPg = document.getElementById('progressContainer');
+                if (_idxPg) _idxPg.style.display = 'none';
+                // 切换项目后需重新拉取该项目已持久化的检测结果
+                detectionsLoadedFor = '';
+                detectionsDirty = true;
                 fetchDbStats();
                 startBrowseAll();
             }
@@ -660,7 +798,7 @@
 
         async function promptRenameProject() {
             if (currentProject === 'default') return alert("默认项目 (default) 无法重命名，请新建项目。");
-            const newName = prompt(`将项目 [${currentProject}] 重命名为 (支持中英文):`, currentProject);
+            const newName = prompt(`将项目 [${currentProject}] 重命名为 (支持中英文)：\n\n⚠️ 若该项目当前有后台任务在运行（抽帧/直导/打包），重命名会被系统拦截，需先等待完成或点击大盘上的【⏹️ 强制中止】后再改。`, currentProject);
             if (!newName || !newName.trim() || newName.trim() === currentProject) return;
             
             const fd = new FormData();
@@ -675,7 +813,8 @@
                     await loadProjectList();
                     syncProjectSelection(data.project);
                 } else {
-                    alert(`重命名失败: ${data.msg}`);
+                    // 403 为"任务运行中被拦截"，单独标红提示更醒目
+                    alert((data.code === 403 ? "⛔ 拦截：" : "重命名失败: ") + (data.msg || ""));
                 }
             } catch(e) { alert("网络异常"); }
         }
@@ -766,7 +905,7 @@
                 processImportQueue();
             } else {
                 const statusSpan = document.getElementById('indexStatus');
-                statusSpan.innerText = `⏳ 路径已加入后台队列，当前排队剩余 ${importQueue.length} 个任务...`;
+                statusSpan.innerText = `路径已加入后台队列，当前排队剩余 ${importQueue.length} 个任务...`;
                 statusSpan.style.color = 'var(--warning)';
             }
         }
@@ -789,10 +928,10 @@
 
             const currentPath = importQueue.shift();
             const statusSpan = document.getElementById('indexStatus');
-            statusSpan.innerText = `🚀 正在提交导入: ${currentPath} (队列剩余 ${importQueue.length} 个)...`;
+            statusSpan.innerText = `正在提交导入: ${currentPath} (队列剩余 ${importQueue.length} 个)...`;
             statusSpan.style.color = 'var(--primary)';
 
-            // 提交当前路径，交给后台轮询跟进进度
+            // 提交当前路径，交给全局大盘轮询跟进进度（不再另起定时器）
             await startImportWithProgress(currentPath);
         }
 
@@ -806,12 +945,12 @@
             startBrowseAll();
         }
 
-        // 点击直导后调用这个（提交单个路径并开始轮询）
+        // 点击直导后调用这个（提交单个路径；进度统一由全局任务大盘轮询驱动）
         async function startImportWithProgress(path) {
             const fd = new FormData();
             fd.append('project', currentProject);
             fd.append('source_path', path);
-            
+
             let data;
             try {
                 const res = await fetch(`${API_BASE}/api/import_from_path`, { method: 'POST', body: fd });
@@ -819,56 +958,15 @@
             } catch (e) {
                 data = { code: 500, msg: '网络异常，提交失败' };
             }
-            
+
             if (data.code === 200) {
-                // 开启轮询雷达，每 2 秒查一次状态
-                if (statusPollingTimer) clearInterval(statusPollingTimer);
-                statusPollingTimer = setInterval(checkBackendProgress, 2000);
+                // 提交成功：isImporting 保持 true，由全局轮询检测本次导入完成后再推进队列
+                fetchAndRenderAllTasks();
             } else {
                 alert(data.msg);
                 // 提交失败（如后台忙/路径不存在），继续处理队列里的下一个
-                if (importQueue.length > 0) {
-                    processImportQueue();
-                } else {
-                    finishImportQueue();
-                }
-            }
-        }
-
-        // 轮询检查函数
-        async function checkBackendProgress() {
-            try {
-                const res = await fetch(`${API_BASE}/api/import_status`);
-                const status = await res.json();
-                
-                const statusSpan = document.getElementById('indexStatus');
-                
-                if (status.is_running) {
-                    statusSpan.innerText = `🚀 后台正在狂飙: ${status.current_path} (${status.msg})`;
-                    statusSpan.style.color = 'var(--primary)';
-                    // 同时可以顺便刷新大盘数字
-                    fetchDbStats();
-                } else {
-                    // 跑完了！清除定时器
-                    clearInterval(statusPollingTimer);
-                    statusPollingTimer = null;
-                    const type = status.task_type || '';
-                    // 非导入类任务（抽帧/打包）：直接显示后端真实结果，不改导入文案
-                    if (type === 'extract' || type === 'delivery') {
-                        statusSpan.innerText = status.msg || '处理完成';
-                        statusSpan.style.color = (status.msg || '').includes('✅') ? 'var(--success)' : 'var(--danger)';
-                        fetchDbStats();
-                        return;
-                    }
-                    // 导入类：继续队列或整体收尾
-                    if (importQueue.length > 0) {
-                        processImportQueue();
-                    } else {
-                        finishImportQueue();
-                    }
-                }
-            } catch (e) {
-                console.error("轮询状态异常", e);
+                if (importQueue.length > 0) processImportQueue();
+                else finishImportQueue();
             }
         }
 
@@ -1001,12 +1099,67 @@
                 document.getElementById('btnYolo').disabled = false;
                 document.getElementById('btnYolo').innerText = "启动 YOLO 检索";
             }
+            // 把后端已持久化的检测结果回填到这批数据上（重新展示框）
+            attachPersistedDetections(allFrontendData, true);
+        }
+
+        // ---- 持久化目标检测：拉取后端 /api/get_all_detections 并按当前项目缓存 ----
+        async function ensureDetectionsLoaded() {
+            if (!detectionsDirty && detectionsLoadedFor === currentProject) return;
+            try {
+                const res = await fetch(`${API_BASE}/api/get_all_detections?project=${encodeURIComponent(currentProject)}`);
+                const data = await res.json();
+                cachedDetections = (data && data.detections) || {};
+            } catch (e) { cachedDetections = {}; }
+            detectionsLoadedFor = currentProject;
+            detectionsDirty = false;
+        }
+        function applyCachedDetections(items) {
+            let changed = false;
+            (items || []).forEach(it => {
+                if (!it.detections) {
+                    const d = cachedDetections[String(it.id)];
+                    if (d) {
+                        it.detections = d;
+                        // 顺带按当前 DINO 阈值重建标签（与 updateBoxThreshold / 检测时逻辑一致，不自动勾选）
+                        if (d.scores && d.labels) {
+                            const counts = {};
+                            d.scores.forEach((score, idx) => {
+                                if (score >= currentBoxThreshold) counts[d.labels[idx]] = (counts[d.labels[idx]] || 0) + 1;
+                            });
+                            it.userTags = Object.keys(counts).map(k => `${k} ${counts[k]}`);
+                        }
+                        changed = true;
+                    }
+                }
+            });
+            return changed;
+        }
+        async function attachPersistedDetections(items, isAll) {
+            await ensureDetectionsLoaded();
+            if (applyCachedDetections(items)) {
+                if (isAll) updateFrontendPagination(false);
+                else renderGallery();
+            }
         }
 
         function changeSort(val) { 
             currentSort = val; 
             updateFrontendPagination(true); 
         }
+
+        // “更多”下拉：展开/收起；点击外部自动关闭
+        function toggleMoreMenu(e) {
+            if (e && e.stopPropagation) e.stopPropagation();
+            const m = document.getElementById('moreMenu');
+            if (m) m.classList.toggle('show');
+        }
+        document.addEventListener('click', function(ev) {
+            const m = document.getElementById('moreMenu');
+            if (m && m.classList.contains('show') && !ev.target.closest('.more-menu')) {
+                m.classList.remove('show');
+            }
+        });
 
         // 🌟 4. 全新精准绑定的排序逻辑 🌟
         function getSortedAndFilteredData() {
@@ -1129,6 +1282,7 @@
                         _selected: false 
                     }));
                     renderGallery();
+                    attachPersistedDetections(currentResults, false);  // 回填已持久化的检测框
                 }
             } catch (e) { console.error(e); }
             document.body.style.cursor = 'default';
@@ -1285,14 +1439,224 @@
             document.body.style.cursor = 'default';
         }
 
+        // ⏹️ 目标检测急停：点红色按钮置手刹，当前循环安全收工并保留已落盘结果
+        function stopBatchDetection() {
+            isDetectCancelled = true;
+            const st = document.getElementById('detectStatus');
+            if (st) { st.innerText = '⏹️ 正在安全中止… 已完成的帧结果均已落盘保留。'; st.style.color = 'var(--danger)'; }
+        }
+
+        // 统一按当前 DINO 阈值刷新某批卡片的标签 + 自动勾选
+        function refreshTags(items) {
+            (items || []).forEach(item => {
+                const data = item.detections;
+                let hasValid = false;
+                if (data && data.scores && data.labels) {
+                    const counts = {};
+                    data.scores.forEach((score, idx) => {
+                        if (score >= currentBoxThreshold) { counts[data.labels[idx]] = (counts[data.labels[idx]] || 0) + 1; hasValid = true; }
+                    });
+                    item.userTags = Object.keys(counts).map(k => `${k} ${counts[k]}`);
+                } else {
+                    item.userTags = [];
+                }
+                item._selected = hasValid;
+            });
+        }
+
+        // 🚀 YOLO 批量高速版：把新增帧一次性提交后端批量上 GPU（后端 /api/yolo_detect_batch）
+        async function runYoloBatch() {
+            let targetList = currentMode === 'browse' ? currentResults : allFrontendData;
+            if (currentMode === 'search') targetList = allFrontendData.filter(item => item.score >= currentClipThreshold);
+            if (!targetList.length) return alert('当前没有待检测图片。');
+
+            await ensureDetectionsLoaded();
+            const reuse = [], fresh = [];
+            targetList.forEach(it => {
+                const c = cachedDetections[String(it.id)] || it.detections;
+                // 仅同引擎(YOLO)的缓存才复用；换引擎/换 prompt 后旧框作废，需重新检测并覆盖
+                if (c && c.engine === 'yolo') { it.detections = c; reuse.push(it); }
+                else { if (it.detections) it.detections = null; fresh.push(it); }
+            });
+
+            if (!confirm(`当前队列共 ${targetList.length} 张：\n⚡ 复用历史缓存：${reuse.length} 张（秒回，不调 GPU）\n本次 YOLO 推理：${fresh.length} 张（分块上 GPU，可随时中止，已完成帧保留）\n\n确定开始吗？`)) return;
+
+            isDetectCancelled = false;
+            const wrapper = document.getElementById('detectStatusWrapper');
+            const stopBtn = document.getElementById('detectStopBtn');
+            const pContainer = document.getElementById('detectProgressContainer');
+            const pBar = document.getElementById('detectProgressBar');
+            const status = document.getElementById('detectStatus');
+            if (wrapper) wrapper.style.display = 'block';
+            if (stopBtn) stopBtn.style.display = 'inline-block';   // 分块执行，可随时中止
+            if (pContainer) pContainer.style.display = 'block';
+            pBar.style.width = '0%';
+            status.style.color = 'var(--warning)';
+            status.innerText = `准备 YOLO 推理（复用 ${reuse.length} / 新检 ${fresh.length}）...`;
+            document.body.style.cursor = 'wait';
+
+            let processed = 0;
+            const YOLO_CHUNK = 64;   // 每块几张，块间可中止；已出结果的帧保留（越大越快、中止粒度越粗）
+            if (fresh.length > 0) {
+                for (let c0 = 0; c0 < fresh.length; c0 += YOLO_CHUNK) {
+                    if (isDetectCancelled) break;
+                    const chunk = fresh.slice(c0, c0 + YOLO_CHUNK);
+                    const hi = Math.min(c0 + chunk.length, fresh.length);
+                    status.innerText = `🚀 YOLO 推理中… ${c0 + 1}-${hi}/${fresh.length} 张（可点⏹️中止，已完成的保留）`;
+                    pBar.style.width = `${Math.round((c0 / fresh.length) * 100)}%`;
+                    const fd = new FormData();
+                    fd.append('project', currentProject);
+                    fd.append('image_ids', chunk.map(i => i.id).join(','));
+                    try {
+                        const res = await fetch(`${API_BASE}/api/yolo_detect_batch`, { method: 'POST', body: fd });
+                        const data = await res.json();
+                        if (data && data.code !== 200) { alert(data.msg || 'YOLO 批量推理失败'); break; }
+                        else if (data && data.results) {
+                            Object.entries(data.results).forEach(([idStr, det]) => {
+                                const it = targetList.find(x => String(x.id) === idStr);
+                                if (it) it.detections = det;
+                            });
+                        }
+                    } catch (e) { console.error('YOLO 批量推理异常', e); alert('YOLO 批量推理请求失败'); break; }
+                    processed = hi;
+                }
+            }
+
+            refreshTags(targetList);
+            detectionsDirty = true;
+            updateSelectionStats();
+            renderGallery();
+            document.body.style.cursor = 'default';
+            if (stopBtn) stopBtn.style.display = 'none';
+
+            const doneCount = targetList.filter(i => i._selected).length;
+            const btnVlm = document.getElementById('btnVlm');
+            if (btnVlm) { btnVlm.disabled = doneCount === 0; btnVlm.innerText = "启动 VLM 深度判定 (" + doneCount + " 帧)"; }
+            pBar.style.width = '100%';
+
+            if (isDetectCancelled) {
+                status.innerText = `⏹️ YOLO 已中止：已处理 ${processed}/${fresh.length} 张，结果已保留`;
+                status.style.color = 'var(--danger)';
+                setTimeout(() => {
+                    if (wrapper) wrapper.style.display = 'none';
+                    if (pContainer) pContainer.style.display = 'none';
+                    alert(`⏹️ YOLO 已中止\n\n已完成并保留：${processed}/${fresh.length} 张\n检出目标：${doneCount}`);
+                }, 300);
+            } else {
+                status.innerText = `✅ YOLO 批量完成：总 ${targetList.length}（复用 ${reuse.length} / 新检 ${fresh.length}），检出 ${doneCount}`;
+                status.style.color = 'var(--success)';
+                setTimeout(() => {
+                    if (wrapper) wrapper.style.display = 'none';
+                    if (pContainer) pContainer.style.display = 'none';
+                    alert(`✅ YOLO 批量执行完毕\n\n总数：${targetList.length}\n复用历史缓存：${reuse.length}\n本次批量新检测：${fresh.length}\n检出目标：${doneCount}`);
+                }, 300);
+            }
+        }
+
+        // 🚀 DINO 批量高速版：把新增帧一次性提交后端批量上 GPU（后端 /api/dino_detect_batch，中英互译由后端完成）
+        async function runDinoBatch() {
+            let targetList = currentMode === 'browse' ? currentResults : allFrontendData;
+            if (currentMode === 'search') targetList = allFrontendData.filter(item => item.score >= currentClipThreshold);
+            if (!targetList.length) return alert('当前没有待检测图片。');
+            const prompt = document.getElementById('dinoPrompt').value;
+            if (!prompt || !prompt.trim()) return alert('请填写 DINO 提示词');
+            const promptTrim = (prompt || '').trim();
+
+            await ensureDetectionsLoaded();
+            const reuse = [], fresh = [];
+            targetList.forEach(it => {
+                const c = cachedDetections[String(it.id)] || it.detections;
+                // 仅“同引擎(DINO) + 同 prompt”的缓存才复用；换 prompt 后旧框作废，重新检测并覆盖
+                const usable = c && c.engine === 'dino' && (c.prompt || '') === promptTrim;
+                if (usable) { it.detections = c; reuse.push(it); }
+                else { if (it.detections) it.detections = null; fresh.push(it); }
+            });
+
+            if (!confirm(`当前队列共 ${targetList.length} 张：\n⚡ 复用历史缓存：${reuse.length} 张（秒回，不调 GPU）\n本次 DINO 推理：${fresh.length} 张（分块上 GPU，可随时中止，已完成帧保留）\n\n确定开始吗？`)) return;
+
+            isDetectCancelled = false;
+            const wrapper = document.getElementById('detectStatusWrapper');
+            const stopBtn = document.getElementById('detectStopBtn');
+            const pContainer = document.getElementById('detectProgressContainer');
+            const pBar = document.getElementById('detectProgressBar');
+            const status = document.getElementById('detectStatus');
+            if (wrapper) wrapper.style.display = 'block';
+            if (stopBtn) stopBtn.style.display = 'inline-block';   // 分块执行，可随时中止
+            if (pContainer) pContainer.style.display = 'block';
+            pBar.style.width = '0%';
+            status.style.color = 'var(--warning)';
+            status.innerText = `准备 DINO 推理（复用 ${reuse.length} / 新检 ${fresh.length}）...`;
+            document.body.style.cursor = 'wait';
+
+            let processed = 0;
+            const DINO_CHUNK = 32;   // 每块几张，块间可中止；已出结果的帧保留（越大越快、中止粒度越粗）
+            if (fresh.length > 0) {
+                for (let c0 = 0; c0 < fresh.length; c0 += DINO_CHUNK) {
+                    if (isDetectCancelled) break;
+                    const chunk = fresh.slice(c0, c0 + DINO_CHUNK);
+                    const hi = Math.min(c0 + chunk.length, fresh.length);
+                    status.innerText = `🚀 DINO 推理中… ${c0 + 1}-${hi}/${fresh.length} 张（可点⏹️中止，已完成的保留）`;
+                    pBar.style.width = `${Math.round((c0 / fresh.length) * 100)}%`;
+                    const fd = new FormData();
+                    fd.append('project', currentProject);
+                    fd.append('image_ids', chunk.map(i => i.id).join(','));
+                    fd.append('text_prompt', prompt.trim());
+                    try {
+                        const res = await fetch(`${API_BASE}/api/dino_detect_batch`, { method: 'POST', body: fd });
+                        const data = await res.json();
+                        if (data && data.code !== 200) { alert(data.msg || 'DINO 批量推理失败'); break; }
+                        else if (data && data.results) {
+                            Object.entries(data.results).forEach(([idStr, det]) => {
+                                const it = targetList.find(x => String(x.id) === idStr);
+                                if (it) it.detections = det;
+                            });
+                        }
+                    } catch (e) { console.error('DINO 批量推理异常', e); alert('DINO 批量推理请求失败'); break; }
+                    processed = hi;
+                }
+            }
+
+            refreshTags(targetList);
+            detectionsDirty = true;
+            updateSelectionStats();
+            renderGallery();
+            document.body.style.cursor = 'default';
+            if (stopBtn) stopBtn.style.display = 'none';
+
+            const doneCount = targetList.filter(i => i._selected).length;
+            const btnVlm = document.getElementById('btnVlm');
+            if (btnVlm) { btnVlm.disabled = doneCount === 0; btnVlm.innerText = "启动 VLM 深度判定 (" + doneCount + " 帧)"; }
+            pBar.style.width = '100%';
+
+            if (isDetectCancelled) {
+                status.innerText = `⏹️ DINO 已中止：已处理 ${processed}/${fresh.length} 张，结果已保留`;
+                status.style.color = 'var(--danger)';
+                setTimeout(() => {
+                    if (wrapper) wrapper.style.display = 'none';
+                    if (pContainer) pContainer.style.display = 'none';
+                    alert(`⏹️ DINO 已中止\n\n已完成并保留：${processed}/${fresh.length} 张\n检出目标：${doneCount}`);
+                }, 300);
+            } else {
+                status.innerText = `✅ DINO 批量完成：总 ${targetList.length}（复用 ${reuse.length} / 新检 ${fresh.length}），检出 ${doneCount}`;
+                status.style.color = 'var(--success)';
+                setTimeout(() => {
+                    if (wrapper) wrapper.style.display = 'none';
+                    if (pContainer) pContainer.style.display = 'none';
+                    alert(`✅ DINO 批量执行完毕\n\n总数：${targetList.length}\n复用历史缓存：${reuse.length}\n本次批量新检测：${fresh.length}\n检出目标：${doneCount}`);
+                }, 300);
+            }
+        }
+
+        // 🚀 增量断点续跑版：批量目标检测（已有历史记录的帧直接复用，不再调 GPU；支持中途急停）
         async function runBatchDetection(mode) {
             let targetList = currentMode === 'browse' ? currentResults : allFrontendData;
-            if (currentMode === 'search') targetList = allFrontendData.filter(i => i.score >= currentClipThreshold);
+            if (currentMode === 'search') targetList = allFrontendData.filter(item => item.score >= currentClipThreshold);
             if (targetList.length === 0) return alert('当前没有待检测图片。');
-            
+
             let prompt = document.getElementById('dinoPrompt').value;
             if (mode === 'dino' && !prompt) return alert('请填写 DINO 提示词');
 
+            // DINO 中英词典（中文提示词 → 英文喂给后端；返回后再把英文标签反查回中文显示）
             const dinoDict = {
                 "卡车": "truck", "货车": "truck", "大货车": "heavy truck",
                 "汽车": "car", "小车": "car", "越野车": "SUV",
@@ -1309,76 +1673,125 @@
             let processedPrompt = prompt;
             if (mode === 'dino') {
                 const sortedKeys = Object.keys(dinoDict).sort((a, b) => b.length - a.length);
-                sortedKeys.forEach(zh => {
-                    processedPrompt = processedPrompt.split(zh).join(dinoDict[zh]);
-                });
+                sortedKeys.forEach(zh => { processedPrompt = processedPrompt.split(zh).join(dinoDict[zh]); });
                 if (!processedPrompt.endsWith('.')) processedPrompt += '.';
             }
 
-            if (!confirm(`将后台处理 ${targetList.length} 张图片，确认开始？`)) return;
+            // 先把本项目已持久化的检测结果拉进前端缓存，供增量跳过判断
+            await ensureDetectionsLoaded();
 
-            const endpoint = mode === 'yolo' ? `${API_BASE}/api/yolo_detect` : `${API_BASE}/api/ground_detect`;
+            // 1) 增量分析：历史缓存（本地/后端落盘）里已有结果的帧直接复用
+            const alreadyProcessedCount = targetList.filter(item => cachedDetections[String(item.id)] || item.detections).length;
+            const remainingCount = targetList.length - alreadyProcessedCount;
+
+            let confirmMsg = `当前队列共 ${targetList.length} 张图片：\n`;
+            if (alreadyProcessedCount > 0) confirmMsg += `⚡ 发现 ${alreadyProcessedCount} 张已有历史检测记录，将直接秒级复用，不再调用 GPU！\n`;
+            confirmMsg += `本次实际需调用 GPU 推理：${remainingCount} 张。\n\n确定开始执行吗？`;
+            if (!confirm(confirmMsg)) return;
+
+            isDetectCancelled = false; // 复位急停手刹
+            const wrapper = document.getElementById('detectStatusWrapper');
+            const stopBtn = document.getElementById('detectStopBtn');
             const pContainer = document.getElementById('detectProgressContainer');
             const pBar = document.getElementById('detectProgressBar');
             const status = document.getElementById('detectStatus');
-            
-            status.style.display = 'block'; pContainer.style.display = 'block'; pBar.style.width = '0%';
+
+            if (wrapper) wrapper.style.display = 'block';
+            if (stopBtn) stopBtn.style.display = 'inline-block';   // 检测阶段显示急停按钮
+            if (pContainer) pContainer.style.display = 'block';
+            pBar.style.width = '0%';
+            status.style.color = 'var(--warning)';
             document.body.style.cursor = 'wait';
-            
+
+            const endpoint = mode === 'yolo' ? `${API_BASE}/api/yolo_detect` : `${API_BASE}/api/ground_detect`;
+
             for (let i = 0; i < targetList.length; i++) {
+                // 🛑 核心急停点：点了红色中止按钮就瞬间收工，已完成的帧都已落盘保留
+                if (isDetectCancelled) {
+                    status.innerText = `⏹️ 检测已中止！已完成 ${i} / ${targetList.length} 张，历史记录已安全保留。`;
+                    status.style.color = 'var(--danger)';
+                    break;
+                }
+
                 const item = targetList[i];
-                status.innerText = `检测中: ${i + 1} / ${targetList.length}...`;
                 pBar.style.width = `${Math.round(((i + 1) / targetList.length) * 100)}%`;
-                
-                const fd = new FormData(); 
+
+                // ⚡ 增量跳过：缓存里有 → 直接复用，不发网络请求、不占显存
+                const cached = cachedDetections[String(item.id)] || item.detections;
+                if (cached) {
+                    item.detections = cached;
+                    let hasValidTargets = false;
+                    if (cached.scores && cached.labels) {
+                        const counts = {};
+                        cached.scores.forEach((score, idx) => {
+                            if (score >= currentBoxThreshold) { counts[cached.labels[idx]] = (counts[cached.labels[idx]] || 0) + 1; hasValidTargets = true; }
+                        });
+                        item.userTags = Object.keys(counts).map(k => `${k} ${counts[k]}`);
+                    }
+                    item._selected = hasValidTargets;
+                    status.innerText = `⚡ 命中历史缓存直接复用: ${i + 1} / ${targetList.length} (ID: ${item.id})`;
+                    updateSelectionStats();
+                    if (currentResults.find(curr => curr.id === item.id)) renderGallery();
+                    continue; // 👈 直接跳过，不调后端
+                }
+
+                status.innerText = `正在智能检测: ${i + 1} / ${targetList.length} (ID: ${item.id})...`;
+                const fd = new FormData();
                 fd.append('project', currentProject);
-                fd.append('image_id', item.id); 
-                if (mode === 'dino') fd.append('text_prompt', processedPrompt); 
-                
+                fd.append('image_id', item.id);
+                if (mode === 'dino') fd.append('text_prompt', processedPrompt);
+
                 try {
                     const res = await fetch(endpoint, { method: 'POST', body: fd });
                     if (!res.ok) continue;
                     const data = await res.json();
-                    
+
                     if (mode === 'dino' && data.labels) {
                         data.labels = data.labels.map(lbl => dinoReverseDict[lbl] || lbl);
                     }
-
                     item.detections = data;
-                    
-                    let hasTargets = false;
+
+                    let hasValidTargets = false;
                     if (data.scores && data.labels) {
                         const counts = {};
-                        data.scores.forEach((s, idx) => {
-                            if (s >= currentBoxThreshold) { counts[data.labels[idx]] = (counts[data.labels[idx]] || 0) + 1; hasTargets = true; }
+                        data.scores.forEach((score, idx) => {
+                            if (score >= currentBoxThreshold) { counts[data.labels[idx]] = (counts[data.labels[idx]] || 0) + 1; hasValidTargets = true; }
                         });
                         item.userTags = Object.keys(counts).map(k => `${k} ${counts[k]}`);
                     }
-                    item._selected = hasTargets;
-                    updateSelectionStats(); 
-                    if (currentResults.find(curr => curr.id === item.id)) renderGallery(); 
-                    await new Promise(r => setTimeout(r, 10));
-                } catch (e) {}
+                    item._selected = hasValidTargets;
+                    updateSelectionStats();
+                    if (currentResults.find(curr => curr.id === item.id)) renderGallery();
+                    await new Promise(r => setTimeout(r, 10)); // 防止阻塞浏览器
+                } catch (e) { console.error("检测异常", e); }
             }
-            
-            status.innerText = `✅ 检测完成！`; status.style.color = 'var(--success)';
-            document.body.style.cursor = 'default';
-            updateSelectionStats(); 
-            
-            setTimeout(() => {
-                pContainer.style.display = 'none'; status.style.display = 'none'; status.style.color = 'var(--primary)';
-                let checked = targetList.filter(i => i._selected).length;
 
-                if (checked > 0) {
-                    const btnVlm = document.getElementById('btnVlm');
-                    if (btnVlm) {
-                        btnVlm.disabled = false;
-                        btnVlm.innerText = "⚡ 启动 VLM 深度判定 (" + checked + " 帧)";
-                    }
+            document.body.style.cursor = 'default';
+
+            if (!isDetectCancelled) {
+                status.innerText = `✅ 批量检测完毕！全量 ${targetList.length} 张处理完成。`;
+                status.style.color = 'var(--success)';
+                updateSelectionStats();
+                detectionsDirty = true; // 新检测结果已落盘，下次回填需重新拉取
+
+                const doneCount = targetList.filter(i => i._selected).length;
+                const btnVlm = document.getElementById('btnVlm');
+                if (btnVlm) {
+                    btnVlm.disabled = doneCount === 0;
+                    btnVlm.innerText = "启动 VLM 深度判定 (" + doneCount + " 帧)";
                 }
 
-                alert(`✅ 批量检测执行完毕\n\n总数：${targetList.length}\n检出目标：${checked}\n未检出：${targetList.length - checked}`);
-            }, 300);
+                setTimeout(() => {
+                    if (wrapper) wrapper.style.display = 'none';
+                    if (pContainer) pContainer.style.display = 'none';
+                    alert(`✅ 批量检测执行完毕\n\n总数：${targetList.length}\n复用历史缓存：${alreadyProcessedCount}\n本次新检测：${remainingCount}\n检出目标：${doneCount}`);
+                }, 300);
+            } else {
+                setTimeout(() => {
+                    if (wrapper) wrapper.style.display = 'none';
+                    if (pContainer) pContainer.style.display = 'none';
+                }, 1200);
+            }
         }
 
         async function runBatchVLM() {
@@ -1386,18 +1799,24 @@
             if (targetList.length === 0) return alert('当前没有已勾选的待判定图片，请先在 Phase 2 中检出目标。');
             if (!confirm(`将调用 VLM 对 ${targetList.length} 帧图像进行深度场景推理，耗时较长，确认启动？`)) return;
 
+            const wrapper = document.getElementById('detectStatusWrapper');
+            const stopBtn = document.getElementById('detectStopBtn');
             const pContainer = document.getElementById('detectProgressContainer');
             const pBar = document.getElementById('detectProgressBar');
             const status = document.getElementById('detectStatus');
-            
-            status.style.display = 'block'; pContainer.style.display = 'block'; pBar.style.width = '0%';
+
+            if (wrapper) wrapper.style.display = 'block';
+            if (stopBtn) stopBtn.style.display = 'none';   // VLM 阶段不显示中止按钮
+            if (pContainer) pContainer.style.display = 'block';
+            status.style.color = '#8a2be2';
+            pBar.style.width = '0%';
             document.body.style.cursor = 'wait';
 
             let successCount = 0;
             
             for (let i = 0; i < targetList.length; i++) {
                 const item = targetList[i];
-                status.innerText = `VLM 脑力全开深度推理中: ${i + 1} / ${targetList.length}...`;
+                status.innerText = `VLM 深度推理中: ${i + 1} / ${targetList.length}...`;
                 pBar.style.width = `${Math.round(((i + 1) / targetList.length) * 100)}%`;
                 pBar.style.background = "linear-gradient(90deg, #8a2be2, #00d4ff)"; 
                 
@@ -1428,21 +1847,39 @@
             pBar.style.background = "linear-gradient(90deg, var(--primary), var(--success))"; 
             
             setTimeout(() => {
-                pContainer.style.display = 'none'; status.style.display = 'none';
-                alert(`🎯 VLM 分析流水线结束\n\n成功为 ${successCount} 帧图像赋予了 AI 场景语义标签！\n您现在可以点击右上角【导出已勾选】生成最终发版的数据集。`);
+                if (wrapper) wrapper.style.display = 'none';
+                if (pContainer) pContainer.style.display = 'none';
+                alert(`VLM 分析流水线结束\n\n成功为 ${successCount} 帧图像赋予了 AI 场景语义标签！\n您现在可以点击右上角【导出已勾选】生成最终发版的数据集。`);
             }, 500);
         }
 
         function updateBoxThreshold(val) {
             currentBoxThreshold = parseFloat(val);
             document.getElementById('boxThresholdVal').innerText = currentBoxThreshold.toFixed(2);
+            
             let list = currentMode === 'browse' ? currentResults : allFrontendData;
+            
             list.forEach(item => {
-                let h = false;
-                if (item.detections && item.detections.scores) if (item.detections.scores.some(s => s >= currentBoxThreshold)) h = true;
-                if (item.userTags && item.userTags.length > 0) h = true;
-                item._selected = h;
+                let hasValidTargets = false;
+                
+                // 核心修复：拖动滑块时，根据新阈值动态重新计算有效目标和标签
+                if (item.detections && item.detections.scores) {
+                    const counts = {};
+                    item.detections.scores.forEach((score, idx) => {
+                        if (score >= currentBoxThreshold) {
+                            counts[item.detections.labels[idx]] = (counts[item.detections.labels[idx]] || 0) + 1;
+                            hasValidTargets = true;
+                        }
+                    });
+                    
+                    // 动态刷新当前图片的标签（框没了，标签自动消失）
+                    item.userTags = Object.keys(counts).map(k => `${k} ${counts[k]}`);
+                }
+                
+                // 自动联动复选框：有达标目标才勾选，否则自动取消
+                item._selected = hasValidTargets;
             });
+            
             renderGallery(); 
         }
 
@@ -1521,103 +1958,61 @@
             a.download = `AD_${currentProject}_${prefix}_${Date.now()}.json`; a.click();
         }
 
-        // --- 原始数据抽帧 ---
-        function openExtractModal() {
-            document.getElementById('extractModal').style.display = 'flex';
-            clearExtractErr();
+        // ===== 抽帧弹窗控制 =====
+        function openExtractionModal() {
+            document.getElementById('extractionOverlay').style.display = 'flex';
         }
-        function showExtractErr(msg) {
-            const e = document.getElementById('extractErr');
-            e.style.display = msg ? 'block' : 'none';
-            e.textContent = msg || '';
-        }
-        function clearExtractErr() { showExtractErr(''); }
-
-        // 校验并解析多路径（含 项目名::路径 可选项目前缀），返回 {ok, jobs, errs}
-        const EXTRACT_GUIDE =
-            '正确填写示例（路径必须是绝对路径，每行一条，或逗号/分号分隔）：\n' +
-            '  1) 归入当前项目：\n' +
-            '     /mnt/Data_Platform/雨天-白天\n' +
-            '  2) 指定归入某项目（用 项目名::路径）：\n' +
-            '     场景A::/mnt/Data_Platform/夜晚-雨天\n' +
-            '  3) 同时填多条，逐行写即可。';
-        function validateExtractPaths(raw) {
-            const lines = (raw || '').split(/\r?\n|[,;，；]/).map(s => s.trim()).filter(Boolean);
-            const jobs = [];
-            const errs = [];
-            lines.forEach((line, idx) => {
-                let proj = null, path = line;
-                if (line.includes('::')) {
-                    const parts = line.split('::');
-                    if (parts.length > 2) {
-                        errs.push(`第 ${idx + 1} 行：含多个 "::"，一行只能写一个 "项目名::路径"`);
-                        return;
-                    }
-                    proj = parts[0].trim();
-                    path = parts[1].trim();
-                    if (!proj) { errs.push(`第 ${idx + 1} 行："::" 前缺少项目名 → 写成 "项目名::/绝对路径"`); return; }
-                    if (!path) { errs.push(`第 ${idx + 1} 行："::" 后缺少路径 → 写成 "项目名::/绝对路径"`); return; }
-                }
-                path = path.replace(/^["']|["']$/g, '').trim();
-                if (!path) { errs.push(`第 ${idx + 1} 行：路径为空`); return; }
-                if (!(path.startsWith('/') || path.startsWith('\\\\') || path.startsWith('//'))) {
-                    errs.push(`第 ${idx + 1} 行：不是绝对路径，必须以 / 或 \\\\ 开头`);
-                    return;
-                }
-                jobs.push(proj ? `${proj}::${path}` : path);
-            });
-            return { ok: errs.length === 0, jobs, errs };
+        function closeExtractionModal() {
+            document.getElementById('extractionOverlay').style.display = 'none';
         }
 
-        async function submitExtractFrames() {
-            const raw = document.getElementById('extractPathInput').value || '';
-            const stepVal = document.getElementById('extractStepInput').value.trim();
-            const vec = document.getElementById('extractVec').checked ? 1 : 0;
-            const unit = document.getElementById('extractUnit').value;
+        // --- 图片/视频抽帧并自动入库（配合后端 extract_frames / process_video） ---
+        async function startFrameExtraction() {
+            // 支持多路径：每行一条(或逗号/分号分隔)，可用 项目名::/绝对路径 指定归属项目
+            const raw = document.getElementById('extractFolderPath').value.trim();
+            if (!raw) return alert('⚠️ 请输入至少一条服务器原始图片绝对路径');
+            const step = parseInt(document.getElementById('frameStep').value) || 5;
+            if (step < 1) return alert('⚠️ 抽帧间隔必须是大于 0 的整数');
+            const unit = document.getElementById('extractUnit').value;   // count=帧数 / time=秒
 
-            // 间隔必须是正整数
-            const step = parseInt(stepVal, 10);
-            if (!stepVal || isNaN(step) || step <= 0) {
-                showExtractErr('⚠️ 抽帧间隔必须是大于 0 的整数。\n' + EXTRACT_GUIDE);
-                return;
-            }
-
-            // 校验路径格式
-            const v = validateExtractPaths(raw);
-            if (v.jobs.length === 0) {
-                showExtractErr('⚠️ 请至少填写一条有效路径。\n' + EXTRACT_GUIDE);
-                return;
-            }
-            if (!v.ok) {
-                showExtractErr('⚠️ 路径格式有误，请修正后重试：\n' + v.errs.join('\n') + '\n\n' + EXTRACT_GUIDE);
-                return;
-            }
-
-            clearExtractErr();
-            const folderPath = v.jobs.join('\n');
             const fd = new FormData();
-            fd.append('folder_path', folderPath);
-            fd.append('frame_step', step);
             fd.append('project', currentProject);
-            fd.append('vectorize', vec);
+            fd.append('folder_path', raw);       // 多路径原样交给后端 _parse_extract_jobs 解析
+            fd.append('frame_step', step);
+            fd.append('vectorize', 1);           // 抽完自动向量化入库
             fd.append('unit', unit);
 
-            let data;
             try {
                 const res = await fetch(`${API_BASE}/api/extract_frames`, { method: 'POST', body: fd });
-                data = await res.json();
+                const data = await res.json();
+                alert(data.msg || '提交失败');
             } catch (e) {
-                data = { code: 500, msg: '网络异常，无法连接后端' };
+                alert('网络异常，提交失败');
             }
+            fetchAndRenderAllTasks();
+        }
 
-            if (data.code === 200) {
-                alert(data.msg);
-                document.getElementById('extractModal').style.display = 'none';
-                if (!statusPollingTimer) statusPollingTimer = setInterval(checkBackendProgress, 2000);
-            } else {
-                // 失败(如后台正忙)：弹窗内红字提示，保留输入便于稍后重试
-                showExtractErr('❌ ' + (data.msg || '提交失败'));
+        async function startVideoProcessing() {
+            const vp = document.getElementById('videoPathInput').value.trim();
+            if (!vp) return alert('⚠️ 请输入服务器上的视频目录(将递归扫描 mp4/avi/mov 等)或单个视频路径');
+            const step = parseInt(document.getElementById('videoStepInput').value) || 1;
+            if (step < 1) return alert('⚠️ 抽帧间隔必须是大于 0 的整数');
+            const unit = document.getElementById('videoUnit').value;   // count=帧数 / time=秒
+
+            const fd = new FormData();
+            fd.append('project', currentProject);
+            fd.append('video_path', vp);
+            fd.append('frame_step', step);
+            fd.append('unit', unit);
+
+            try {
+                const res = await fetch(`${API_BASE}/api/process_video`, { method: 'POST', body: fd });
+                const data = await res.json();
+                alert(data.msg || '提交失败');
+            } catch (e) {
+                alert('网络异常，提交失败');
             }
+            fetchAndRenderAllTasks();
         }
 
         // --- 日志查看 ---
@@ -1753,10 +2148,173 @@
             const data = await res.json();
             alert(data.msg);
             document.getElementById('deliveryModal').style.display = 'none';
-            if (data.code === 200 && !statusPollingTimer) {
-                statusPollingTimer = setInterval(checkBackendProgress, 2000);
+            if (data.code === 200) {
+                fetchAndRenderAllTasks();
             }
         }
+
+        // ================= 全局任务大盘逻辑 =================
+        let globalTaskPollingTimer = null;
+        let taskPanelCollapsed = true;    // 大盘默认收起(仅标题)，需要时点击标题展开
+
+        // 展开/收起大盘：只控制任务列表体是否显示，头部标题始终可点击
+        function toggleTaskPanel() {
+            taskPanelCollapsed = !taskPanelCollapsed;
+            applyTaskPanelUI();
+        }
+
+        // 根据收起状态同步 UI（头部箭头 + 任务列表显隐）
+        function applyTaskPanelUI() {
+            const list = document.getElementById('taskListContainer');
+            const icon = document.getElementById('taskToggleIcon');
+            if (list) list.style.display = taskPanelCollapsed ? 'none' : 'flex';
+            if (icon) icon.innerText = taskPanelCollapsed ? '▶' : '▼';
+        }
+
+        // 1. 启动全局轮询 (在网页加载时调用)
+        function startGlobalTaskPolling() {
+            if (!globalTaskPollingTimer) {
+                globalTaskPollingTimer = setInterval(fetchAndRenderAllTasks, 1500);
+            }
+        }
+
+        // 2. 全局轮询：拉取一次大盘数据 → 渲染大盘 + 更新旧状态行/推进导入队列（统一单一路径）
+        //    🔑 核心：请求带上 project 参数，后端直接过滤，只返回当前项目任务 → 真正项目隔离
+        async function fetchAndRenderAllTasks() {
+            let pool = {};
+            try {
+                const res = await fetch(`${API_BASE}/api/all_tasks_status?project=${encodeURIComponent(currentProject)}`);
+                pool = await res.json();
+            } catch (e) {
+                console.error("全局任务大盘同步失败:", e);
+                return;
+            }
+
+            const panel = document.getElementById('taskManagerPanel');
+            const container = document.getElementById('taskListContainer');
+            if (!panel || !container) return;
+
+            const taskKeys = Object.keys(pool);
+
+            // 头部标题：显示当前项目运行中的任务数
+            const runningCount = taskKeys.filter(k => !!pool[k].is_running).length;
+            const badge = document.getElementById('taskCountBadge');
+            if (badge) badge.innerText = runningCount > 0 ? `● ${runningCount} 个运行中` : '';
+
+            // 🔑 当前项目没有任何任务 → 整块大盘直接隐藏，避免空面板常驻占用版面
+            if (taskKeys.length === 0) {
+                panel.style.display = 'none';
+                container.innerHTML = '';
+                return;
+            }
+            // 有任务时才拉起展示（头部仍可点击手动折叠/展开任务列表体）
+            panel.style.display = 'block';
+
+            let renderHtml = '';
+            taskKeys.forEach(path => {
+                const task = pool[path];
+                const statusColor = task.is_running ? '#00d4ff' : '#10b981';
+                const icon = task.is_running ? '⏳' : '✅';
+                const bgStyle = task.is_running
+                    ? 'background: rgba(0,212,255,0.06); border: 1px solid rgba(0,212,255,0.2);'
+                    : 'background: rgba(16,185,129,0.06); border: 1px solid rgba(16,185,129,0.2);';
+
+                const cancelBtn = task.is_running
+                    ? `<button onclick="cancelTask('${encodeURIComponent(path)}')" class="danger-btn" style="padding: 4px 12px; font-size: 12px;">任务中止</button>`
+                    : '';
+
+                renderHtml += `
+                    <div style="padding: 12px 16px; border-radius: 8px; ${bgStyle}; margin-bottom: 8px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <span style="font-weight: 600; font-size: 13px; color: var(--text-main); word-break: break-all;">📂 路径: ${path}</span>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <span style="color: ${statusColor}; font-size: 13px; font-weight: 600;">${icon} ${task.is_running ? '任务处理中...' : (task.is_cancelled ? '已手动中止' : '已完成')}</span>
+                                ${cancelBtn}
+                            </div>
+                        </div>
+                        <div style="font-size: 12px; color: var(--text-muted); font-family: ui-monospace, monospace;">${task.msg}</div>
+                    </div>
+                `;
+            });
+            container.innerHTML = renderHtml;
+            applyTaskPanelUI();             // 尊重手动展开/收起
+            handleTaskProgressAndQueue(pool); // 驱动导入队列 / indexStatus 状态行
+        }
+
+        // 用同一份大盘数据驱动：旧状态行(indexStatus)反馈 + 导入队列推进
+        function handleTaskProgressAndQueue(pool) {
+            const entries = Object.values(pool);
+            const statusSpan = document.getElementById('indexStatus');
+            if (!statusSpan) return;
+
+            // 当前项目有正在运行的任务 → 反馈进度行，并刷新库数字
+            const runningHere = entries.filter(e => e.project === currentProject && e.is_running);
+            if (runningHere.length > 0) {
+                const t = runningHere[0];
+                statusSpan.innerText = `🚀 后台正在处理: ${t.current_path || ''} (${t.msg || ''})`;
+                statusSpan.style.color = 'var(--primary)';
+                fetchDbStats();
+                return;
+            }
+
+            // 无运行中任务：若是等待中的导入刚完成 → 推进队列/收尾（isImporting 防重复触发）
+            if (isImporting) {
+                const doneImport = entries.find(e =>
+                    e.project === currentProject && e.task_type === 'import' && !e.is_running && (e.msg || '') !== ''
+                );
+                if (doneImport) {
+                    isImporting = false;
+                    if (importQueue.length > 0) processImportQueue();
+                    else finishImportQueue();
+                    return;
+                }
+            }
+
+            // 抽帧/打包类：无运行中任务时，展示最近一条完成提示
+            const doneOther = entries.filter(e => !e.is_running && (e.msg || ''));
+            if (doneOther.length > 0) {
+                const last = doneOther[doneOther.length - 1];
+                if (last.task_type === 'extract' || last.task_type === 'delivery') {
+                    statusSpan.innerText = last.msg || '处理完成';
+                    statusSpan.style.color = ((last.msg || '').includes('✅')) ? 'var(--success)' : 'var(--danger)';
+                    fetchDbStats();
+                }
+            }
+        }
+
+        // ⏹️ 对运行中的后台任务发送急停命令（抽帧/直导/打包通用）
+        async function cancelTask(pathEncoded) {
+            const folderPath = decodeURIComponent(pathEncoded || '');
+            if (!confirm(`确定要强制中止对路径 [${folderPath}] 的后台任务吗？`)) return;
+
+            const fd = new FormData();
+            fd.append('folder_path', folderPath);
+
+            try {
+                const res = await fetch(`${API_BASE}/api/cancel_task`, { method: 'POST', body: fd });
+                const data = await res.json();
+                if (data.code !== 200) alert(data.msg);
+            } catch (e) {
+                console.error("发送中止命令失败", e);
+            }
+            // 成功发送信号后，前端轮询会在 ~1.5s 后把该任务刷新为"已手动中止"
+            fetchAndRenderAllTasks();
+        }
+
+        // 3. 辅助功能：手动清除大盘里已完成的历史记录
+        async function clearFinishedTasks() {
+            try {
+                await fetch(`${API_BASE}/api/all_tasks/clear`, { method: 'POST' });
+            } catch (e) {
+                console.error("清除已完成任务失败:", e);
+            }
+            // 立即刷新大盘（fetchAndRenderAllTasks 会按当前项目重新判断显隐）
+            await fetchAndRenderAllTasks();
+            const panel = document.getElementById('taskManagerPanel');
+            if (panel) panel.style.display = 'none';
+            alert("✅ 已清除所有已完成任务记录！");
+        }
+        // ====================================================
     </script>
 </body>
 </html>
