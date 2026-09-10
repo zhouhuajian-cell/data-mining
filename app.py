@@ -207,8 +207,10 @@ def save_detection_record(project: str, image_id: int, result: dict):
         _persist_detections()
 DEVICE = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
 # ===== 简单登录鉴权（管理员 / 标注员）=====
-ADMIN_PASSWORD = os.environ.get("AD_PASSWORD", "admin123")  # 管理员密码（部署前请修改）
-ANNOTATOR_PASSWORD = os.environ.get("ANNOTATOR_PASSWORD", "anno123")  # 标注员密码
+# 口令不再硬编码：只从环境变量 AD_PASSWORD / ANNOTATOR_PASSWORD 或 auth_config.json 读，
+# 未配置则为空（登录接口会直接拒绝，不会出现"空密码即可登录"）。鉴权中间件当前也是停用状态。
+ADMIN_PASSWORD = os.environ.get("AD_PASSWORD", "")  # 管理员密码
+ANNOTATOR_PASSWORD = os.environ.get("ANNOTATOR_PASSWORD", "")  # 标注员密码
 AUTH_TOKENS = {}  # token -> 角色 (admin / annotator)
 AUTH_CONFIG_PATH = os.path.join(PROJECT_DIR, "auth_config.json")  # 密码持久化文件
 def _load_passwords():
@@ -286,9 +288,15 @@ app.add_middleware(
 #     return await call_next(request)
 @app.post("/api/login")
 def login(password: str = Form(...)):
-    if password == ADMIN_PASSWORD:
+    # 未配置任何口令时直接拒绝：避免"把口令留空 -> 空密码即可登录"这种自伤
+    if not ADMIN_PASSWORD and not ANNOTATOR_PASSWORD:
+        return JSONResponse(
+            status_code=403,
+            content={"msg": "未配置登录口令（请设置 AD_PASSWORD / ANNOTATOR_PASSWORD，或调用 /api/reset_password）"},
+        )
+    if password and password == ADMIN_PASSWORD:
         role = "admin"
-    elif password == ANNOTATOR_PASSWORD:
+    elif password and password == ANNOTATOR_PASSWORD:
         role = "annotator"
     else:
         return JSONResponse(status_code=401, content={"msg": "密码错误"})
