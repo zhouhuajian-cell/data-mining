@@ -382,7 +382,7 @@
         </header>
         <div class="container"><!-- ===== 模块化顶部导航 ===== -->            <div class="module-tabs" id="moduleTabs">
                 <button data-mod="mod-dig" class="active">数据清洗与挖掘</button>
-                <button data-mod="mod-audit">AI 审核</button>
+                <button data-mod="mod-audit">数据审核与模型评测</button>
                 <button data-mod="mod-analytics">数据分析与管理</button>
             </div><!-- 各模块页面容器（panel 由 JS 自动归组注入） -->            <div class="module-page active" id="mod-dig"></div>
             <div class="module-page" id="mod-audit"></div>
@@ -412,8 +412,6 @@
                     <input type="file" id="fileInput" multiple accept="image/*,.zip" onchange="onFilesSelected(this.files)">
                     <input type="file" id="folderInput" webkitdirectory directory multiple style="display:none;" onchange="onFilesSelected(this.files)">
                     <button class="secondary" id="uploadBtn" onclick="handleDirectAction()">增量向量化</button>
-                    <button class="secondary" id="clipVlmBtn" onclick="runClipVlmChain()" title="扫描当前项目视频抽帧组成 Clip，并对第一个 Clip 跑 5 帧 VLM 分析（一键验证 clip 链路）">Clip VLM 链路</button>
-                    <span id="clipVlmStatus" style="color: var(--warning); font-size: 12px; margin-left: 8px;"></span>
                     <span id="indexStatus" style="color: var(--text-muted); font-size: 13px; margin-left: 8px;">(GPU将自动完成特征提取)</span>
                 </div>
                 <div id="progressContainer" class="progress-container">
@@ -436,7 +434,7 @@
             </div><!-- 👇 AI 场景审核中心（PRD 19-23）👇 -->            <div class="panel" id="auditPanel" style="border: 2px solid rgba(139,43,226,0.6);">
                 <div class="panel-header" style="color: var(--accent);">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg></div>
-                    AI 场景审核中心 <span id="auditProjectTag" style="color: var(--primary); font-size: 13px;"></span>
+                    数据审核 <span id="auditProjectTag" style="color: var(--primary); font-size: 13px;"></span>
                     <span style="flex:1;"></span>
                     <button class="secondary" onclick="auditRefresh()" style="padding:4px 12px; font-size:12px;">刷新队列</button>
                     <button class="secondary" onclick="auditRunBatch()" style="padding:4px 12px; font-size:12px;" title="一键跑完两段：① 全部已入库帧的 AI检测(融合YOLO/DINO)+场景分析+自动决策；② 帧组成 Clip 后逐片段 VLM 场景判定">AI场景分析</button><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiFuseDetect" checked> 融合YOLO检测</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiDinoEnhance"> 增强DINO开放词</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="② 段：每 N 帧组成一个 Clip 做 VLM 判定">Clip帧数 <input type="number" id="clipSizeInput" value="50" min="5" step="5" style="width:58px; padding:2px 4px;"></label>
@@ -528,6 +526,7 @@
                     <button onclick="fsSearch()" style="background:rgba(0,212,255,0.2); border:1px solid var(--primary); color:var(--primary);">融合搜索</button>
                 </div>
                 <div id="fsDims" style="display:flex; gap:10px; flex-wrap:wrap; margin-top:8px;"></div>
+                <div id="fsCandidates" style="margin-top:10px;"></div>
                 <div id="fsResult" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; margin-top:12px;">
                     <div class="audit-empty" style="grid-column:1/-1;">输入自然语言或选择维度标签进行检索</div>
                 </div>
@@ -581,7 +580,11 @@
                     <button class="secondary" onclick="atRefresh(1)" style="padding:4px 12px; font-size:12px;">刷新</button>
                 </div>
                 <style>
-                    .at-table { width:100%; border-collapse:collapse; font-size:12.5px; min-width:1020px; }
+                    /* 固定布局：th 上的 width 才是真宽度。auto 布局会按内容把列撑开
+                       (实测表宽 1551px > 容器 1372px，整表横向滚动)，标签列也因此忽宽忽窄 */
+                    .at-table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:12.5px; min-width:1120px; }
+                    /* border-box：th 上的 width 必须含左右各 10px 内边距，否则 12 列共多出 240px 撑破容器 */
+                    .at-table th, .at-table td { box-sizing:border-box; }
                     .at-table th { color:var(--text-muted); text-align:left; font-weight:700; font-size:12px;
                                    padding:9px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
                     .at-table td { padding:9px 10px; vertical-align:top; line-height:1.55;
@@ -591,24 +594,29 @@
                     .at-table td.tag { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
                     /* chip 必须收进文字行高(19.4px)内：去掉全局的上下外边距、line-height 15+边框2=17px，
                        并用负的 vertical-align 对齐，否则带标签的行会比纯文字行高(44 vs 38)，行高不齐 */
-                    .at-table td.tag .audit-chip { margin:0 3px 0 0; padding:0 6px; line-height:15px;
-                                                   font-size:11.5px; border-width:1px; vertical-align:middle; display:inline-block; }
+                    .at-table td.tag .audit-chip, .at-table td.src .audit-chip {
+                                                   margin:0 3px 0 0; padding:0 6px; line-height:15px;
+                                                   font-size:11.5px; border-width:1px; vertical-align:middle; display:inline-block;
+                                                   /* 单个标签限宽省略：脏长值(整串枚举等)不会再把整列撑开 */
+                                                   max-width:92px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                    .at-table td.src .audit-chip.src-name { max-width:150px; }   /* 文件名给宽些 */
+                    .at-table .audit-chip.muted { color:var(--text-muted); }
                     /* 标签格自身行高压到 chip 高度(17px)：行高由纯文字单元(19.4px)决定 -> 全表行高一致 */
                     .at-table td.tag { line-height:17px; }
                     .at-table td.nowrap { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-                    .at-table td.src > span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                    .at-table td.src { white-space:nowrap; overflow:hidden; }
                 </style>
                 <div style="overflow-x:auto;">
                 <table class="at-table">
                     <thead>
                         <tr>
-                            <th style="width:250px;">源数据</th><th style="width:64px;">车型</th><th style="width:70px;">分辨率</th>
-                            <th style="width:64px;">时间</th><th style="width:64px;">天气</th><th style="width:88px;">道路</th>
-                            <th style="width:170px;">目标</th><th style="width:150px;">事件</th><th style="width:150px;">场景</th>
-                            <th style="width:86px;">AI</th><th style="width:86px;">人工</th><th style="width:170px;">决策</th>
+                            <th style="width:252px;">源数据</th><th style="width:74px;">车型</th><th style="width:74px;">分辨率</th>
+                            <th style="width:90px;">时间</th><th style="width:90px;">天气</th><th style="width:156px;">道路</th>
+                            <th style="width:156px;">目标</th><th style="width:156px;">事件</th><th style="width:156px;">场景</th>
+                            <th style="width:84px;">AI</th><th style="width:84px;">人工</th>
                         </tr>
                     </thead>
-                    <tbody id="atBody"><tr><td colspan="12" style="text-align:center; color:var(--text-muted); padding:20px;">加载中…</td></tr></tbody>
+                    <tbody id="atBody"><tr><td colspan="11" style="text-align:center; color:var(--text-muted); padding:20px;">加载中…</td></tr></tbody>
                 </table>
                 </div>
                 <div style="display:flex; gap:10px; align-items:center; margin-top:8px; font-size:12px;">
@@ -755,16 +763,17 @@
                     视频稀疏抽帧
                     </div><textarea id="videoPathInput" rows="4" placeholder="支持多条路径，每行一条（也可用逗号/分号分隔）。&#10;路径可为目录(递归扫描其内 mp4/avi/mov 等)或单个视频文件；默认归入当前项目，归入其它项目写成：&#10;  项目名::/路径&#10;例如：&#10;  /mnt/Data_Platform/视频/雨天&#10;  场景A::/mnt/Data_Platform/单段.mp4" style="width: 100%; box-sizing: border-box; margin-bottom: 16px; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px; font-family:inherit; resize:vertical;"></textarea>                    <div style="display: flex; gap: 10px; width: 100%; align-items: center; margin-bottom: 12px;">
                         <span style="font-size: 13px; color: var(--text-muted);">间隔单位:</span>
-                        <select id="videoUnit" style="flex:1; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px;">
-                            <option value="time" selected>时间 (每隔 N 秒抽 1 帧)</option>
-                            <option value="count">帧数 (每隔 N 帧抽 1 帧)</option>
+                        <select id="videoUnit" onchange="updateVideoStepHint()" style="flex:1; padding: 12px; background: rgba(0,0,0,0.5); color:#fff; border:1px solid rgba(255,255,255,0.12); border-radius:6px;">
+                            <option value="count" selected>帧数 (每隔 N 帧抽 1 帧)</option>
+                            <option value="time">时间 (每隔 N 秒抽 1 帧)</option>
                         </select>
                     </div>
                     <div style="display: flex; gap: 10px; width: 100%; align-items: center;">
                         <span style="font-size: 13px; color: var(--text-muted);">步长:</span>
-                        <input type="number" id="videoStepInput" value="1" min="1" style="width: 80px; padding: 12px; background: rgba(0,0,0,0.5);">
+                        <input type="number" id="videoStepInput" value="5" min="1" oninput="updateVideoStepHint()" style="width: 80px; padding: 12px; background: rgba(0,0,0,0.5);">
                         <button onclick="startVideoProcessing()" class="yolo-btn" style="flex: 1; padding: 12px;">启动视频切帧</button>
                     </div>
+                    <div id="videoStepHint" style="margin-top:10px; font-size:12px; line-height:1.7; color: var(--text-muted); background: rgba(0,212,255,0.06); border-left:2px solid var(--primary); padding:8px 10px; border-radius:4px;"></div>
                 </div>
             </div><!-- 弹窗 Footer 提示 -->            <div style="padding: 14px 28px; background: rgba(0,212,255,0.03); font-size: 13px; color: var(--text-muted); text-align: center; border-top: 1px solid rgba(0,212,255,0.1);">
                 提示：任务一旦下发，系统将自动在后台进行降维切片并调用 GPU 入库，请在页面顶部的【核心调度监控室】查看进度大盘。
@@ -1249,106 +1258,6 @@
             if (importBtn) importBtn.disabled = disabled;
 
         }
-
-        // Clip VLM 链路（一键验证）：scan 分组 → 取第一个 clip → 5帧 VLM 分析
-        async function runClipVlmChain() {
-
-            const project = currentProject;
-
-            const btn = document.getElementById('clipVlmBtn');
-
-            const st = document.getElementById('clipVlmStatus');
-
-            const setSt = (t, color) => { if (st) { st.innerText = t; st.style.color = color || 'var(--warning)'; } };
-
-            if (btn) btn.disabled = true;
-
-            try {
-
-                setSt('① 扫描分组 clips ...');
-
-                const fd = new FormData();
-
-                fd.append('project', project);
-
-                const scan = await fetch(`${API_BASE}/api/clips/scan`, { method: 'POST', body: fd }).then(r => r.json());
-
-                if (!scan || scan.code !== 200) {
-
-                    alert('Clip scan 失败: ' + JSON.stringify(scan));
-
-                    setSt('scan 失败', 'var(--danger)');
-
-                    return;
-
-                }
-
-                const count = scan.count || 0;
-
-                if (count <= 0) {
-
-                    alert('该项目没有可组成 Clip 的视频抽帧（纯图片直导的帧会被跳过）。');
-
-                    setSt('无 clip 可分析', 'var(--text-muted)');
-
-                    return;
-
-                }
-
-                setSt(`② 已生成 ${count} 个 clip，获取首个 ...`);
-
-                const list = await fetch(`${API_BASE}/api/clips/list?project=${encodeURIComponent(project)}&page=1&size=1`).then(r => r.json());
-
-                const first = list && list.items && list.items[0];
-
-                if (!first) {
-
-                    alert('scan 后未取到 clip');
-
-                    setSt('未取到 clip', 'var(--danger)');
-
-                    return;
-
-                }
-
-                setSt(`③ 正在 VLM 分析 ${first.clip_id} (${first.frame_paths ? first.frame_paths.length : 0} 帧)... 可能需数分钟`, 'var(--warning)');
-
-                const fd2 = new FormData();
-
-                fd2.append('project', project);
-
-                fd2.append('clip_id', first.clip_id);
-
-                const an = await fetch(`${API_BASE}/api/clips/analyze_single`, { method: 'POST', body: fd2 }).then(r => r.json());
-
-                if (!an || an.code !== 200) {
-
-                    alert('VLM 分析失败:\n' + JSON.stringify(an));
-
-                    setSt('分析失败', 'var(--danger)');
-
-                } else {
-
-                    setSt(`④ 完成: ${an.clip_id} → ${an.decision}`, '#10b981');
-
-                    alert('Clip VLM 链路验证完成\n\nclip_id: ' + an.clip_id + '\ndecision: ' + an.decision + '\n\nresult:\n' + JSON.stringify(an.result, null, 2).slice(0, 3000));
-
-                }
-
-            } catch (e) {
-
-                alert('Clip VLM 链路异常: ' + e);
-
-                setSt('异常', 'var(--danger)');
-
-            } finally {
-
-                if (btn) btn.disabled = false;
-
-            }
-
-        }
-
 
 
         async function processImportQueue() {
@@ -3527,6 +3436,43 @@
 
             document.getElementById('extractionOverlay').style.display = 'flex';
 
+            updateVideoStepHint();
+
+        }
+
+        // 视频抽帧步长提示：说清「抽出的帧 = Clip 链路的输入」，以及每段 Clip 覆盖多长视频
+        function updateVideoStepHint() {
+
+            const box = document.getElementById('videoStepHint');
+
+            if (!box) return;
+
+            const unit = (document.getElementById('videoUnit') || {}).value || 'count';
+
+            const step = parseInt((document.getElementById('videoStepInput') || {}).value) || 1;
+
+            if (unit === 'count') {
+
+                const clipEl = document.getElementById('clipSizeInput');
+
+                const clipSize = parseInt((clipEl || {}).value) || 50;
+
+                // 每段 Clip 覆盖的原始视频时长 = (段内帧数-1) × 步长 ÷ 帧率
+                const secs = (((clipSize - 1) * step) / 30).toFixed(1);
+
+                const fpsEff = (30 / step).toFixed(1);
+
+                box.innerHTML = '每隔 <b>' + step + '</b> 帧抽 1 帧（' + step + ' 抽 1，30fps 视频约 <b>' + fpsEff + '</b> 帧/秒）'
+                    + '→ 抽出的帧自动按视频分段，每 <b>' + clipSize + '</b> 帧一段 Clip，交给「AI 场景分析」做 VLM 判定'
+                    + '（约覆盖 ' + secs + ' 秒原始视频，30fps 估算）；'
+                    + '图片抽帧走同一套步长语义（每隔 N 张抽 1 张）。';
+
+            } else {
+
+                box.innerHTML = '每隔 <b>' + step + '</b> 秒抽 1 帧（按视频真实帧率换算）→ 抽出的帧同样自动进入 Clip 链路。';
+
+            }
+
         }
 
         function closeExtractionModal() {
@@ -4310,14 +4256,17 @@ function buildDemandPanel() {
     <div class="panel" id="demandPanel" style="border:2px solid rgba(245,158,11,0.5);">
         <div class="panel-header" style="color:#f59e0b;">
             <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"></path><path d="M18 17V9M13 17V5M8 17v-3"></path></svg></div>
-            场景数据需求覆盖分析 <span style="color:var(--primary); font-size:13px;" id="demandProjectTag"></span>
+            数据场景分布 <span style="color:var(--primary); font-size:13px;" id="demandProjectTag"></span>
             <span style="flex:1;"></span>
             <button class="secondary" onclick="demandRefreshOverview()" style="padding:4px 12px; font-size:12px;">刷新</button>
         </div>
         <div class="widget-grid" id="demandKpi">
             <div class="widget"><div class="widget-title">加载中</div><div class="widget-value">-</div></div>
         </div>
-        <div style="font-size:13px; font-weight:700; margin:14px 0 8px;">场景覆盖看板 <span style="color:var(--text-muted); font-weight:400; font-size:12px;">（标签 × 判出片段数）</span></div>
+        <div style="font-size:13px; font-weight:700; margin:14px 0 8px;">场景覆盖看板
+            <span style="color:var(--text-muted); font-weight:400; font-size:12px;">
+                （<span style="color:#a78bfa;">Clip</span> 50 帧为一段、每段记 1 次 · <span style="color:var(--primary);">Image</span> 每帧记 1 次）
+            </span></div>
         <div id="demandCoverage" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px;">
             <div style="font-size:12px; color:var(--text-muted);">加载中…</div>
         </div>
@@ -4357,7 +4306,7 @@ async function demandRefreshOverview() {
         kpi.innerHTML =
             w('资产总量(帧)', ov.total_assets != null ? ov.total_assets : '-') +
             w('已通过', ov.approved_count != null ? ov.approved_count : '-', 'var(--success)') +
-            w('待审核', ov.review_count != null ? ov.review_count : '-', 'var(--warning)') +
+            w('待审核', ov.pending_count != null ? ov.pending_count : (ov.review_count != null ? ov.review_count : '-'), 'var(--warning)') +
             w('Clip 总数', st.total != null ? st.total : '-') +
             w('Clip 已判定', st.total != null ? (st.total - (dec.undecided || 0)) : '-', 'var(--primary)') +
             w('Clip 待审核', dec.REVIEW || 0, 'var(--warning)') +
@@ -4384,8 +4333,10 @@ async function demandRefreshOverview() {
                     '<b style="font-size:13px;">' + (DIM[dim] || dim) + '</b>' +
                     '<span style="font-size:11px; color:var(--text-muted);">覆盖 ' + kinds + ' 种</span>' +
                 '</div>' +
-                '<div style="margin-top:6px;">' + (fmt(merged, 'ai') || '<span style="font-size:12px; color:var(--text-muted);">暂无</span>') + '</div>' +
-                (Object.keys(f).length ? '<div style="margin-top:5px; padding-top:5px; border-top:1px dashed rgba(255,255,255,0.1); font-size:11px; color:var(--text-muted);">帧: ' + fmt(f) + '</div>' : '') +
+                '<div style="margin-top:6px;"><span style="font-size:11px; color:#a78bfa; margin-right:4px;">Clip</span>' +
+                    (fmt(merged, 'ai') || '<span style="font-size:12px; color:var(--text-muted);">暂无</span>') + '</div>' +
+                (Object.keys(f).length ? '<div style="margin-top:5px; padding-top:5px; border-top:1px dashed rgba(255,255,255,0.1);">' +
+                    '<span style="font-size:11px; color:var(--primary); margin-right:4px;">Image</span>' + fmt(f) + '</div>' : '') +
             '</div>';
         }).join('');
         covBox.innerHTML = cards || '<div style="font-size:12px; color:var(--text-muted);">暂无标签数据（先跑一次 AI 场景分析）</div>';
@@ -4801,13 +4752,14 @@ async function fsLoadOntology() {
     const tag = document.getElementById('fsProjectTag');
     if (tag) tag.textContent = ' · 项目: ' + ((window.projDisplay && window.projDisplay[proj]) || proj);
     try {
-        const o = await auditFetch('/api/ontology');
+        const o = await auditFetch('/api/ontology?project=' + encodeURIComponent(proj));
         fsOntology = (o && o.ontology) || {};
     } catch (e) { fsOntology = {}; }
     const box = document.getElementById('fsDims');
     if (!box) return;
     box.innerHTML = '';
-    const order = ['time', 'weather', 'road', 'road_surface', 'objects', 'events', 'risk', 'scene'];
+    // 字段与明细表一致：车型 分辨率 时间 天气 道路 目标 事件 场景（顺序即接口返回顺序）
+    const order = ['vehicle', 'resolution', 'time', 'weather', 'road', 'objects', 'events', 'scene'];
     order.forEach(function(dim) {
         const def = fsOntology[dim];
         if (!def) return;
@@ -4821,6 +4773,104 @@ async function fsLoadOntology() {
         wrap.appendChild(sel);
         box.appendChild(wrap);
     });
+    fsLoadCandidates();
+}
+
+// 标签维护（归口）：模型识别到、但本体词表里还没有的词，在这里决定升为正式标签还是归并到已有标签。
+// 升为正式标签后，提示词枚举 / 明细表筛选 / 融合搜索会立刻都带上它（后端清缓存，不用重启）。
+async function fsLoadCandidates() {
+    const box = document.getElementById('fsCandidates');
+    if (!box) return;
+    box.innerHTML = '<div style="font-size:12px; color:var(--text-muted);">候选标签加载中…</div>';
+    let d = null;
+    try { d = await auditFetch('/api/ontology/candidates?project=' + encodeURIComponent(currentProject || 'default')); } catch (e) {}
+    const cs = (d && d.candidates) || [];
+    window._fsCands = cs;
+    const head = '<div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">'
+        + '<b style="color:var(--warning);">标签维护</b>';
+    if (!cs.length) {
+        // 候选池空也要显示"已放弃"那行，否则放弃过的词就找不回来了
+        box.innerHTML = head + ' · 候选池为空：当前数据里的标签都在本体词表内</div>'
+            + fsDismissedLine(d && d.dismissed);
+        return;
+    }
+    box.innerHTML = head + ' · 模型识别到 ' + cs.length + ' 个本体还没有的词（事件/场景优先），'
+        + '可升为正式标签、归并到已有标签，或放弃使用：</div>'
+        + '<div style="display:flex; flex-direction:column; gap:4px; max-height:180px; overflow-y:auto;">'
+        + cs.map(function(c, i) {
+            const cn = c.cn || ((fsOntology[c.dim] || {}).name) || c.dim;
+            return '<div style="display:flex; align-items:center; gap:8px; font-size:12px;'
+                 + ' background:rgba(0,0,0,0.25); padding:3px 8px; border-radius:4px;">'
+                 + '<span style="color:var(--text-muted); min-width:40px;">' + cn + '</span>'
+                 + '<span class="audit-chip">' + c.tag + '</span>'
+                 + '<span style="color:var(--text-muted);">×' + c.count + '</span>'
+                 + '<span style="flex:1;"></span>'
+                 + '<button class="secondary" style="font-size:11px; padding:2px 8px;" onclick="fsPromote(' + i + ',\'new\')">加入本体</button>'
+                 + '<button class="secondary" style="font-size:11px; padding:2px 8px;" onclick="fsPromote(' + i + ',\'alias\')">归并…</button>'
+                 + '<button class="secondary" style="font-size:11px; padding:2px 8px;" onclick="fsDismiss(' + i + ')">放弃使用</button>'
+                 + '</div>';
+        }).join('') + '</div>'
+        + fsDismissedLine(d && d.dismissed);
+}
+
+// 已放弃的词：不占主区，折叠成一行，点标签即可放回候选池
+function fsDismissedLine(list) {
+    window._fsGaveUp = list || [];
+    if (!window._fsGaveUp.length) return '';
+    return '<div style="font-size:11px; color:var(--text-muted); margin-top:6px;">已放弃 '
+        + window._fsGaveUp.length + ' 个（点击放回）：'
+        + window._fsGaveUp.map(function(g, i) {
+            return '<span class="audit-chip muted" style="cursor:pointer; font-size:11px;"'
+                 + ' title="点一下放回候选池" onclick="fsDismiss(null,' + i + ')">' + g.tag + '</span>';
+        }).join('') + '</div>';
+}
+
+// 放弃使用 / 放回候选池（i 为候选下标；gi 为已放弃列表下标）
+async function fsDismiss(i, gi) {
+    let dim, tag, mode = 'dismiss';
+    if (gi != null) {
+        const g = (window._fsGaveUp || [])[gi];
+        if (!g) return;
+        dim = g.dim; tag = g.tag; mode = 'restore';
+    } else {
+        const c = (window._fsCands || [])[i];
+        if (!c) return;
+        dim = c.dim; tag = c.tag;
+        if (!confirm('放弃使用「' + tag + '」？\n\n它不会进入本体，也不再出现在候选池（数据里已出现过的原词保留）。\n之后想反悔，点下方"已放弃"里的标签即可放回。')) return;
+    }
+    const fd = new FormData();
+    fd.append('project', currentProject);
+    fd.append('dim', dim);
+    fd.append('tag', tag);
+    fd.append('mode', mode);
+    let r = null;
+    try { r = await auditFetch('/api/ontology/dismiss', fd); } catch (e) {}
+    if (!r || r.code !== 200) return alert((r && r.msg) || '操作失败');
+    fsLoadCandidates();
+}
+
+async function fsPromote(idx, mode) {
+    const c = (window._fsCands || [])[idx];
+    if (!c) return;
+    const cn = ((fsOntology[c.dim] || {}).name) || c.dim;
+    let target = '';
+    if (mode === 'alias') {
+        const cur = ((fsOntology[c.dim] || {}).values) || [];
+        target = prompt('把「' + c.tag + '」归并到哪个正式标签？\n可用（可复制其中一个）：\n' + cur.join(' / '), cur[0] || '');
+        if (!target) return;
+    } else if (!confirm('把「' + c.tag + '」加入「' + cn + '」正式取值？\n\n之后提示词枚举、明细表筛选、融合搜索都会带上它。')) {
+        return;
+    }
+    const fd = new FormData();
+    fd.append('project', currentProject);
+    fd.append('dim', c.dim);
+    fd.append('tag', c.tag);
+    fd.append('mode', mode);
+    if (target) fd.append('target', target);
+    let r = null;
+    try { r = await auditFetch('/api/ontology/promote', fd); } catch (e) {}
+    if (!r || r.code !== 200) return alert((r && r.msg) || '维护失败');
+    await fsLoadOntology();     // 词表已变：重建筛选下拉 + 刷新候选池
 }
 function fsSelectedDims() {
     const out = {};
@@ -4836,7 +4886,9 @@ async function fsSearch() {
     const fd = new FormData();
     fd.append('project', currentProject);
     fd.append('query', q ? q.value : '');
-    Object.keys(dims).forEach(function(k) { fd.append(k, dims[k]); });
+    // time 维度后端参数名是 time_dim（直传 time 会被忽略 -> 时间筛选静默失效）
+    const paramName = { time: 'time_dim' };
+    Object.keys(dims).forEach(function(k) { fd.append(paramName[k] || k, dims[k]); });
     const box = document.getElementById('fsResult');
     if (box) box.innerHTML = '<div class="audit-empty" style="grid-column:1/-1;">检索中…</div>';
     try {
@@ -5143,7 +5195,7 @@ async function atRefresh(page) {
 
     if (!body) return;
 
-    body.innerHTML = '<tr><td colspan="12" style="text-align:center; color:var(--text-muted); padding:16px;">加载中…</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" style="text-align:center; color:var(--text-muted); padding:16px;">加载中…</td></tr>';
 
     try {
 
@@ -5153,7 +5205,7 @@ async function atRefresh(page) {
 
         const d = await auditFetch(url);
 
-        if (!d || d.code !== 200) { body.innerHTML = '<tr><td colspan="12">' + ((d && d.msg) || '加载失败') + '</td></tr>'; return; }
+        if (!d || d.code !== 200) { body.innerHTML = '<tr><td colspan="11">' + ((d && d.msg) || '加载失败') + '</td></tr>'; return; }
 
         const rows = d.rows || [];
 
@@ -5167,41 +5219,65 @@ async function atRefresh(page) {
 
         document.getElementById('atNext').disabled = atPage >= Math.max(1, Math.ceil(total / AT_SIZE));
 
-        if (!rows.length) { body.innerHTML = '<tr><td colspan="12" style="text-align:center; color:var(--text-muted); padding:16px;">暂无数据（入库图片将自动登记）</td></tr>'; return; }
+        if (!rows.length) { body.innerHTML = '<tr><td colspan="11" style="text-align:center; color:var(--text-muted); padding:16px;">暂无数据（入库图片将自动登记）</td></tr>'; return; }
 
         body.innerHTML = '';
 
         rows.forEach(function(x) {
-
-            const stColor = x.status === 'APPROVED' ? '#10b981' : (x.status === 'FILTERED' ? '#ef4444' : (x.status === 'REVIEW' ? '#f59e0b' : '#94a3b8'));
 
             const tr = document.createElement('tr');
 
             tr.style.cssText = 'border-bottom:1px solid rgba(148,163,184,0.15);';
 
             tr.innerHTML = `
-                <td class="src nowrap" title="${x.video_path || ((x.source_chain || []).join('/') + '/' + x.source_file)}"><span>${(x.video_path ? x.video_path.split('/').pop() : (x.source_file || '')) + (x.group_frames ? ' · ' + x.group_frames + '帧' : '')}</span></td>
-                <td class="nowrap">${x.vehicle || '-'}</td><td class="nowrap">${x.resolution || '-'}</td>
-                <td class="nowrap">${(x.time || []).join('/') || '-'}</td><td class="nowrap">${(x.weather || []).join('/') || '-'}</td><td class="nowrap">${(x.road || []).join('/') || '-'}</td>
-                <td class="tag" title="${(x.objects || []).join('、')}">${atTags(x.objects, 'ai')}</td>
-                <td class="tag" title="${(x.events || []).join('、')}">${atTags(x.events, 'human')}</td>
-                <td class="tag" title="${(x.scene || []).join('、')}">${atTags(x.scene)}</td>
-                <td class="nowrap">${x.ai_status}</td><td class="nowrap">${x.human_status}</td>
-                <td class="tag nowrap" style="color:${stColor}; font-weight:700;" title="${(x.decision_status || '').split('\u3000').join('  ')}">${(x.decision_status || '').split('\u3000').join(' · ')}</td>`;
+                <td class="src nowrap" title="${x.video_path || ((x.source_chain || []).join('/') + '/' + x.source_file)}"><span class="audit-chip src-name">${x.video_path ? x.video_path.split('/').pop() : (x.source_file || '')}</span>${x.group_frames ? '<span class="audit-chip muted">' + x.group_frames + '帧</span>' : ''}</td>
+                <td class="tag" data-chip="" title="${(x.vehicle || '').split('/').filter(Boolean).join('、')}">${atTags((x.vehicle || '').split('/').filter(Boolean))}</td>
+                <td class="tag" data-chip="" title="${(x.resolution || '').split('/').filter(Boolean).join('、')}">${atTags((x.resolution || '').split('/').filter(Boolean))}</td>
+                <td class="tag" data-chip="" title="${(x.time || []).join('、')}">${atTags(x.time)}</td>
+                <td class="tag" data-chip="" title="${(x.weather || []).join('、')}">${atTags(x.weather)}</td>
+                <td class="tag" data-chip="" title="${(x.road || []).join('、')}">${atTags(x.road)}</td>
+                <td class="tag" data-chip="ai" title="${(x.objects || []).join('、')}">${atTags(x.objects, 'ai', 2)}</td>
+                <td class="tag" data-chip="human" title="${(x.events || []).join('、')}">${atTags(x.events, 'human', 2)}</td>
+                <td class="tag" data-chip="" title="${(x.scene || []).join('、')}">${atTags(x.scene, '', 2)}</td>
+                <td class="nowrap">${x.ai_status}</td><td class="nowrap">${x.human_status}</td>`;
 
             body.appendChild(tr);
 
         });
 
+        atFoldTags(body);   // 量完列宽再折叠，保证 +N 不被裁
+
     } catch (e) {
 
-        body.innerHTML = '<tr><td colspan="12" style="color:var(--danger);">加载异常: ' + e.message + '</td></tr>';
+        body.innerHTML = '<tr><td colspan="11" style="color:var(--danger);">加载异常: ' + e.message + '</td></tr>';
 
     }
 
 }
 
-// 标签列折叠：最多 3 个 + "+N"，完整列表由调用方的 title 提供(悬停可见)
+// 标签列自适应折叠：按列【实际渲染宽度】决定显示几个 chip，其余收成 +N。
+// 固定列宽下没法预先算准(标签长短不一)，只能先把标签写进 title、量完宽度再回填，
+// 这样任何窗口宽度下都不会出现尾巴被裁掉、看不到 "+N" 的情况。
+function atFoldTags(root) {
+    (root || document).querySelectorAll('td.tag[data-chip]').forEach(function(td) {
+        if (!td.clientWidth) return;   // 面板隐藏时量不到宽度：保留上面已渲染好的静态折叠，别清空
+        const tags = (td.getAttribute('title') || '').split('、').filter(function(v) { return v; });
+        if (!tags.length) { td.innerHTML = '<span style="color:var(--text-muted);">-</span>'; return; }
+        const cls = td.getAttribute('data-chip') || '';
+        const paint = function(k) {
+            const rest = tags.length - k;
+            td.innerHTML = tags.slice(0, k).map(function(t) {
+                return '<span class="audit-chip ' + cls + '">' + t + '</span>';
+            }).join('') + (rest > 0 ? '<span class="audit-chip muted">+' + rest + '</span>' : '');
+        };
+        for (let k = tags.length; k >= 1; k--) {
+            paint(k);
+            if (td.scrollWidth <= td.clientWidth) return;
+        }
+        paint(1);
+    });
+}
+// 标签列折叠：最多 maxN 个 + "+N"，完整列表由调用方的 title 提供(悬停可见)
 function atTags(arr, cls, maxN) {
     const a = (arr || []).filter(function(v) { return v; });
     if (!a.length) return '<span style="color:var(--text-muted);">-</span>';
@@ -5242,9 +5318,14 @@ async function auditRefresh() {
         const cnt = { AUTO_PASS: 0, APPROVED: 0, FILTERED: 0 };
         clips.forEach(c => { const k = clipDecisionKey(c); if (cnt[k] != null) cnt[k]++; });
         const putNum = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
-        putNum('auditStatReview', auditQueueData.length);
-        putNum('auditStatPass', ((ov && ov.approved_count) || 0) + cnt.AUTO_PASS);
-        putNum('auditStatApproved', cnt.APPROVED);
+        // 四个数字都用后端给的真口径（帧 + Clip 合并）：
+        //   待审核   = 后端待审总数(data.total)，不是当前页条数——分页取 100 条时它会被钉死在 100+Clip，审多少都不动
+        //   AI自动通过 = 纯 AI 通过的帧(approved_auto_count) + AI 通过的 Clip
+        //   已人工通过 = 人工审过的帧(approved_human_count) + 人工通过的 Clip
+        const framePending = (data && data.total) || 0;
+        putNum('auditStatReview', framePending + pendingClips.length);
+        putNum('auditStatPass', ((ov && (ov.approved_auto_count != null ? ov.approved_auto_count : ov.approved_count)) || 0) + cnt.AUTO_PASS);
+        putNum('auditStatApproved', ((ov && ov.approved_human_count) || 0) + cnt.APPROVED);
         putNum('auditStatFilter', ((ov && ov.filtered_count) || 0) + cnt.FILTERED);
         renderAuditQueue();
         if (auditQueueData.length > 0) {

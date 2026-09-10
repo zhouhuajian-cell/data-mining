@@ -1421,10 +1421,9 @@ def _run_extract_one(
             frame_step = 1
         selected = []
         if unit == "count":
-            # 按帧数间隔：从第 frame_step 个起，每隔 frame_step 抽 1 张
-            selected = [
-                jpg_files[i] for i in range(frame_step, len(jpg_files), frame_step + 1)
-            ]
+            # 按帧数间隔：每隔 frame_step 抽 1 张（第 0 张起），
+            # 与视频抽帧 frame_interval=step 的语义保持一致（旧实现是 step+1，比标签说的稀一档）
+            selected = jpg_files[::frame_step]
         else:
             # 按时间戳间隔（秒）
             last_ts = None
@@ -1440,6 +1439,14 @@ def _run_extract_one(
         # 4) 已抽帧直接入底库向量化（不再在源目录建 sampled_frames 预览文件夹）
         entry["total_count"] = len(selected)
         # 5) 自动入底库向量化（已抽帧拷贝进项目库 images/ 入库/交付）
+        if not vectorize:
+            # 仅返回抽取统计（不建预览目录、不落库）
+            if entry.get("is_cancelled"):
+                entry["msg"] = "⚠️ 任务已手动中止"
+                return "⚠️ 任务已手动中止"
+            if unit == "count":
+                return f"✅ [{project}] 共 {len(jpg_files)} 帧，按每 {frame_step} 帧抽 1 帧，共抽 {len(selected)} 帧（未入库）"
+            return f"✅ [{project}] 共 {len(jpg_files)} 帧，按 {frame_step}s 时间戳间隔抽取 {len(selected)} 帧（未入库）"
         if vectorize:
             if entry.get("is_cancelled"):
                 entry["msg"] = "⚠️ 任务已手动中止！已入底库的图片保留。"
@@ -1485,13 +1492,6 @@ def _run_extract_one(
                                 project, ctx["metadata"], new_saved_paths
                             )
         return f"✅ [{project}] 已抽 {len(selected)} 帧并入库向量化 {vec} 张（库内共 {ctx['index'].ntotal} 张）"
-        # 非 vectorize：仅返回抽取统计（不建预览目录、不落库）
-        if entry.get("is_cancelled"):
-            entry["msg"] = "⚠️ 任务已手动中止"
-            return "⚠️ 任务已手动中止"
-        if unit == "count":
-            return f"✅ [{project}] 共 {len(jpg_files)} 帧，按每 {frame_step} 帧抽 1 帧，共抽 {len(selected)} 帧（未入库，未生成预览）"
-        return f"✅ [{project}] 共 {len(jpg_files)} 帧，按 {frame_step}s 时间戳间隔抽取 {len(selected)} 帧（未入库，未生成预览）"
     except Exception as e:
         _log("✖ 抽帧异常: " + str(e))
         return f"❌ 抽帧异常: {str(e)}"
@@ -3344,27 +3344,38 @@ def _scene_prompt_enum():
 def _vlm_structured_prompt() -> str:
     """帧级结构化提示词：枚举全部取自统一本体(scene.json)，维度名与 Clip 链路一致。
     road = 道路形态(直路/弯道/十字路口…)，scene = 地点场景(城市道路/高速道路/隧道…)——
-    原实现把地点塞进了 road，导致帧级与 Clip 级无法合并统计。"""
+    原实现把地点塞进了 road，导致帧级与 Clip 级无法合并统计。
+    枚举值必须列在值位置之外：早期把枚举写进 ["…"] 里，模型会把整串枚举原样抄回来当标签。"""
     from ontology import dimensions as _dim_defs
     _D = _dim_defs()
 
     def _v(dim):
-        return "|".join((_D.get(dim) or {}).get("values") or [])
+        return "/".join((_D.get(dim) or {}).get("values") or [])
 
     return (
         "你是一名专业的自动驾驶场景分析专家。请仔细观察这张车载前视摄像头画面，"
         "严格按照下面的 JSON Schema 输出，不要输出任何其他文字、解释或代码块标记。\n"
         "{\n"
-        '  "time": ["' + _v("time") + '"],\n'
-        '  "weather": ["' + _v("weather") + '"],\n'
-        '  "road": ["' + _v("road") + '"],\n'
-        '  "road_surface": ["' + _v("road_surface") + '"],\n'
-        '  "objects": ["' + _v("objects") + '"],\n'
-        '  "events": ["' + _v("events") + '"],\n'
-        '  "risk": ["' + _v("risk") + '"],\n'
-        '  "scene": ["' + _v("scene") + '"]\n'
+        '  "time": ["<从枚举选>"],\n'
+        '  "weather": ["<从枚举选>"],\n'
+        '  "road": ["<从枚举选>"],\n'
+        '  "road_surface": ["<从枚举选>"],\n'
+        '  "objects": ["<从枚举选>"],\n'
+        '  "events": ["<从枚举选>"],\n'
+        '  "risk": ["<从枚举选>"],\n'
+        '  "scene": ["<从枚举选>"]\n'
         "}\n"
-        "每个维度只输出最匹配的 1 个值（objects/events 可为空数组，events 最多 2 个），必须使用中文，输出合法的 JSON 对象。\n"
+        "可用枚举值：\n"
+        "time: " + _v("time") + "\n"
+        "weather: " + _v("weather") + "\n"
+        "road: " + _v("road") + "\n"
+        "road_surface: " + _v("road_surface") + "\n"
+        "objects: " + _v("objects") + "\n"
+        "events: " + _v("events") + "\n"
+        "risk: " + _v("risk") + "\n"
+        "scene: " + _v("scene") + "\n"
+        "每个维度只输出最匹配的 1 个值（objects/events 可为空数组，events 最多 2 个），必须使用中文，"
+        "尖括号 <> 内是占位说明，必须替换为你实际判断出的枚举值，禁止原样照抄枚举清单。\n"
         "⚠️ 必须完整输出全部 8 个字段。注意区分：road 是道路形态(直路/弯道/十字路口…)，"
         "scene 是地点场景(城市道路/高速道路/隧道…)，两者含义不同，都要填。"
     )
@@ -3453,6 +3464,57 @@ _VLM_KEYWORD_MAP = [
     ("中风险", "risk", "中风险"),
     ("高风险", "risk", "高风险"),
 ]
+_VLM_VOCAB = None
+def _vlm_vocab():
+    """统一本体词表（懒加载缓存）：解析 VLM 输出时用来丢弃词表外的值。"""
+    global _VLM_VOCAB
+    if _VLM_VOCAB is None:
+        try:
+            from ontology import valid_tags
+            _VLM_VOCAB = valid_tags()
+        except Exception:
+            _VLM_VOCAB = set()
+    return _VLM_VOCAB
+_TAG_SEP = re.compile(r"[|/、,，;；\s]+")
+_NEG_PREFIX = ("无", "没有", "未见", "未发现", "不存在")
+def _looks_like_tag(v: str) -> bool:
+    """判断一个词表外的取值像不像"一个标签"（而不是一句描述或否定回答）。
+    像标签的保留下来当候选（如 公交车切出）；描述句、以及"无车辆切入"这类
+    回答"没有发生"的否定词直接丢弃（events 为空数组才是表达"无事件"的方式）。"""
+    if v.startswith(_NEG_PREFIX):
+        return False
+    return 2 <= len(v) <= 10 and not re.search(r"[。！？，,.、；;：:（）()【】\[\]\"'']", v)
+def _clean_vlm_tags(dim: str, vals) -> list:
+    """清洗 VLM 某维度的原始取值（字符串或数组）为标签列表。
+
+    模型偶尔会把提示词里的枚举清单整串抄回来（"A|B|C|…|unknown"）——
+    单个取值拆开后能命中 3 个以上枚举值即判定为枚举回声，整条丢弃，
+    否则一帧会挂上十几个标签、明细表整列被撑开。
+    其余值按分隔符拆开，再做三件事：
+      1) 命中取值别名 -> 归一到正式值（公交车切出 若已归并到 车辆切出）；
+      2) 在本体词表内 -> 保留；
+      3) 词表外但像个标签 -> 也保留（它是模型真实看到的东西，会进候选池，
+         由「融合语义搜索 → 标签维护」决定升为正式标签还是归并到已有标签）。"""
+    if isinstance(vals, str):
+        vals = [vals]
+    if not isinstance(vals, list):
+        return []
+    from ontology import canonical_tag
+    vocab = _vlm_vocab()
+    out = []
+    for v in vals:
+        parts = [p.strip() for p in _TAG_SEP.split(str(v or "").strip()) if p.strip()]
+        valid = [p for p in parts if p in vocab]
+        if len(valid) >= 3 and len(parts) >= 4:
+            continue        # 枚举清单回声：不是对画面的判断，整条丢弃
+        for p in parts:
+            p = canonical_tag(dim, p)
+            if p not in vocab and not _looks_like_tag(p):
+                continue    # 是句子/描述，不是标签
+            if p not in out:
+                out.append(p)
+    cap = 2 if dim == "events" else (4 if dim == "objects" else 3)
+    return out[:cap]
 def _parse_vlm_structured(text: str) -> dict:
     """解析 VLM 输出为结构化维度标签 {dim: [tag,...]}。
 
@@ -3479,17 +3541,9 @@ def _parse_vlm_structured(text: str) -> dict:
                     "risk",
                     "scene",
                 ):
-                    vals = obj.get(dim)
-                    if isinstance(vals, str):
-                        vals = [vals]
-                    if isinstance(vals, list):
-                        tags = []
-                        for v in vals:
-                            v = str(v or "").strip()
-                            if v and v != "无":
-                                tags.append(v)
-                        if tags:
-                            result[dim] = tags
+                    tags = _clean_vlm_tags(dim, obj.get(dim))
+                    if tags:
+                        result[dim] = tags
                 if result:
                     return result
         except Exception:
@@ -4785,6 +4839,7 @@ def analytics_overview(project: str = Query("default")):
     """仪表盘概览：总量/已通过/待审核/已过滤/AI覆盖 + 各维度分布（Final Tags）"""
     from db_service import get_project, get_analytics_overview
     from models import Asset, AssetStatus
+    from models import DecisionStatus as _DecisionStatus
     db = get_db_session()
     try:
         proj = _ensure_db_project(db, project)
@@ -4810,6 +4865,29 @@ def analytics_overview(project: str = Query("default")):
             .count()
         )
         base["ai_tagged_assets"] = tagged
+        # 口径分桶：以前 only 有 approved_count，前端把"人工审过的帧"也算进了「AI自动通过」，
+        # 而「已人工通过」只统计 Clip -> 人工审帧后那个数字永远不动，看着像没生效。
+        base["pending_count"] = (
+            db.query(Asset)
+            .filter(
+                Asset.project_id == proj.id,
+                (Asset.status == AssetStatus.REVIEW)
+                | (Asset.decision_status == _DecisionStatus.REVIEW),
+            )
+            .count()
+        )
+        base["approved_human_count"] = (
+            db.query(Asset)
+            .filter(
+                Asset.project_id == proj.id,
+                Asset.status == AssetStatus.APPROVED,
+                Asset.final_result.like("%human%"),
+            )
+            .count()
+        )
+        base["approved_auto_count"] = max(
+            0, (base.get("approved_count") or 0) - base["approved_human_count"]
+        )
         base["code"] = 200
         return base
     finally:
@@ -5394,17 +5472,201 @@ def _parse_query_tags(query: str) -> Dict[str, List[str]]:
             cond.setdefault(dim, set()).add(tag)
     return {k: sorted(v) for k, v in cond.items()}
 @app.get("/api/ontology")
-def ontology_list():
-    """返回可用标签维度与取值（供前端筛选面板渲染）"""
-    from tag_system import ONTOLOGY, TagDimension
+def ontology_list(project: str = Query("default")):
+    """融合语义搜索的筛选字段与取值：与明细表同一套字段
+    (车型/分辨率/时间/天气/道路/目标/事件/场景)。
+
+    字段取值统一取自本体 ontology/scene.json —— 以前读的是 tag_system.ONTOLOGY 那套旧词表，
+    给出的值(道路=城市道路/高速/高架…)与库里实际打的标准标签(道路=直路/弯道/十字路口…)对不上，
+    勾了筛不到任何东西。车型/分辨率则来自资产元数据（动态）。"""
+    from ontology import dimensions as _dims
+    D = _dims()
+    order = [
+        ("vehicle", "车型"),
+        ("resolution", "分辨率"),
+        ("time", "时间"),
+        ("weather", "天气"),
+        ("road", "道路"),
+        ("objects", "目标"),
+        ("events", "事件"),
+        ("scene", "场景"),
+    ]
     out = {}
-    for dim, tags in ONTOLOGY.items():
-        if isinstance(dim, TagDimension):
-            out[dim.value] = {
-                "name": _ONTO_DIM_NAMES.get(dim.value, dim.value),
-                "values": tags,
-            }
+    for dim, cn in order:
+        vals = [
+            str(v)
+            for v in ((D.get(dim) or {}).get("values") or [])
+            if str(v) and str(v) != "unknown"
+        ]
+        out[dim] = {"name": cn, "values": vals}
+    try:
+        veh, res = _asset_facets(project)
+        if veh:
+            out["vehicle"]["values"] = veh
+        if res:
+            out["resolution"]["values"] = res
+    except Exception as e:
+        _log(f"[本体] 车型/分辨率取值读取失败: {e}")
     return {"code": 200, "ontology": out}
+def _fresh_vocab():
+    """词表被维护后清各处缓存：提示词枚举与解析校验下次调用即用新词表（无需重启）"""
+    global _VLM_VOCAB
+    _VLM_VOCAB = None
+    try:
+        import vlm_clip
+        from ontology import valid_tags as _vt
+        vlm_clip.VALID = _vt()   # Clip 链路在 import 时缓存过一份词表
+    except Exception:
+        pass
+def _project_tag_values(project: str) -> list:
+    """项目里实际出现过的标签取值（帧级 DB 标签 + Clip 结果），含出现次数与样例帧号。
+
+    这是候选池的数据面：VLM 真看到、但本体里还没有的词，先在这里露出来，
+    由人工在「融合语义搜索 → 标签维护」决定升为正式标签还是归并到已有标签。"""
+    from models import Asset
+    seen = {}
+
+    def _bump(dim, tag, vid=None):
+        if not isinstance(dim, str) or not isinstance(tag, str):
+            return
+        tag = tag.strip()
+        if not tag or "|" in tag:     # 枚举回声这类脏值不进候选池
+            return
+        it = seen.setdefault((dim, tag), {"dim": dim, "tag": tag, "count": 0, "samples": []})
+        it["count"] += 1
+        if vid is not None and len(it["samples"]) < 5 and vid not in it["samples"]:
+            it["samples"].append(vid)
+
+    db = get_db_session()
+    try:
+        proj = _ensure_db_project(db, project)
+        if proj is not None:
+            for a in db.query(Asset).filter(Asset.project_id == proj.id).all():
+                for col in (a.final_tags, a.ai_tags, a.human_tags):
+                    for dim, vals in (col or {}).items():
+                        for v in (vals if isinstance(vals, list) else [vals]):
+                            _bump(dim, v.get("tag") if isinstance(v, dict) else v, a.vector_id)
+    finally:
+        db.close()
+    # Clip 级 VLM 结果（clips.json）里的标签同样纳入候选
+    try:
+        from clip_service import load_clips
+        ctx = load_project_context(project)
+        for c in (load_clips(ctx) or []):
+            res = c.get("vlm_result") or {}
+            for dim in ("events", "objects", "scene", "road", "road_surface", "weather", "time"):
+                if isinstance(res.get(dim), list):
+                    for v in res[dim]:
+                        _bump(dim, v.get("tag") if isinstance(v, dict) else v)
+    except Exception as e:
+        _log(f"[本体] Clip 标签收集跳过: {e}")
+    return list(seen.values())
+@app.get("/api/ontology/candidates")
+def ontology_candidates(project: str = Query("default"), dim: str = Query(None)):
+    """标签候选池：项目里出现过、但不在本体词表里的取值（事件/场景排最前）。
+
+    常态化维护的入口数据 —— 看到新词就「加入本体」或「归并到已有标签」。"""
+    from ontology import (
+        valid_tags as _vt, canonical_tag, dimensions as _dims, dim_cn, dismissed_map,
+    )
+    vocab = _vt()
+    dims = _dims()
+    dismissed = dismissed_map()      # 已"放弃使用"的词不再提示
+    # 排序优先级：事件/场景最高（平台首要关注），其次是明细表那 8 个字段，其余维度最后
+    show = ["vehicle", "resolution", "time", "weather", "road", "objects", "events", "scene"]
+    def _prio(dim):
+        if dim == "events":
+            return 0
+        if dim == "scene":
+            return 1
+        return 2 if dim in show else 3
+    out = []
+    for it in _project_tag_values(project):
+        if dim and it["dim"] != dim:
+            continue
+        if it["dim"] not in dims:
+            continue                     # 旧维度名(road_type/surface 等)不参与维护
+        if canonical_tag(it["dim"], it["tag"]) in vocab:
+            continue                     # 已是正式值，或已归并到正式值
+        if not _looks_like_tag(it["tag"]):
+            continue
+        if it["tag"] in (dismissed.get(it["dim"]) or []):
+            continue                     # 已放弃使用
+        out.append(dict(it, cn=dim_cn(it["dim"]), priority=_prio(it["dim"])))
+    out.sort(key=lambda x: (x["priority"], -x["count"], x["dim"], x["tag"]))
+    gave_up = [
+        {"dim": d, "cn": dim_cn(d), "tag": t}
+        for d, tags in sorted(dismissed.items())
+        for t in tags
+    ]
+    return {"code": 200, "total": len(out), "candidates": out[:300], "dismissed": gave_up}
+@app.post("/api/ontology/dismiss")
+def ontology_dismiss(
+    project: str = Form("default"),
+    dim: str = Form(...),
+    tag: str = Form(...),
+    mode: str = Form("dismiss"),      # dismiss=放弃使用 / restore=放回候选池
+):
+    """放弃使用某个候选标签：不进本体、不再出现在候选池（可恢复）。
+
+    与"归并"的区别：归并把它当成某个正式值的别名（写入端会归一、检索端会展开）；
+    放弃只是不再提示，数据里已经出现的原词原样保留。"""
+    from ontology import dismiss_value, restore_value, dimensions as _dims
+    if dim not in _dims():
+        return {"code": 400, "msg": f"未知维度: {dim}"}
+    tag = (tag or "").strip()
+    if not tag:
+        return {"code": 400, "msg": "标签为空"}
+    try:
+        if (mode or "dismiss").lower() == "restore":
+            changed, lst = restore_value(dim, tag)
+            msg = f"已把「{tag}」放回候选池"
+        else:
+            changed, lst = dismiss_value(dim, tag)
+            msg = f"已放弃使用「{tag}」（不再提示，可恢复）"
+    except Exception as e:
+        return {"code": 400, "msg": f"操作失败: {e}"}
+    _log(f"[本体] {msg}（项目={project}）")
+    return {"code": 200, "msg": msg, "changed": changed, "dismissed": lst}
+@app.post("/api/ontology/promote")
+def ontology_promote(
+    project: str = Form("default"),
+    dim: str = Form(...),
+    tag: str = Form(...),
+    mode: str = Form("new"),
+    target: str = Form(None),
+):
+    """把候选标签沉淀进本体（标签维护的归口）。
+
+    new   -> 升为该维度正式取值：提示词枚举、明细表筛选、融合搜索随后都带上它
+    alias -> 记为 target 的取值别名：写入端自动归一(公交车切出->车辆切出)，
+             检索端自动展开(按 target 筛也能搜到带别名的老数据)
+    """
+    from ontology import add_value, add_value_alias, dimensions as _dims
+    dims = _dims()
+    if dim not in dims:
+        return {"code": 400, "msg": f"未知维度: {dim}"}
+    tag = (tag or "").strip()
+    if not tag:
+        return {"code": 400, "msg": "标签为空"}
+    mode = (mode or "new").lower()
+    try:
+        if mode == "alias":
+            tgt = (target or "").strip()
+            if not tgt:
+                return {"code": 400, "msg": "归并模式必须指定目标标签"}
+            changed, values = add_value_alias(dim, tag, tgt)
+            msg = f"已把「{tag}」归并到「{tgt}」"
+        elif mode == "new":
+            changed, values = add_value(dim, tag)
+            msg = f"已把「{tag}」加入「{dims[dim].get('cn') or dim}」正式取值"
+        else:
+            return {"code": 400, "msg": f"未知模式: {mode}（可选 new/alias）"}
+    except Exception as e:
+        return {"code": 400, "msg": f"维护失败: {e}"}
+    _fresh_vocab()
+    _log(f"[本体] {msg}（项目={project} 变更={changed}）")
+    return {"code": 200, "msg": msg, "changed": changed, "dim": dim, "values": values}
 @app.post("/api/search/fusion")
 def search_fusion(
     project: str = Form("default"),
@@ -5414,8 +5676,11 @@ def search_fusion(
     time_dim: str = Form(None),
     objects: str = Form(None),
     events: str = Form(None),
+    scene: str = Form(None),
     risk: str = Form(None),
     road_surface: str = Form(None),
+    vehicle: str = Form(None),
+    resolution: str = Form(None),
     top_k: int = Form(200),
     min_score: float = Form(0.0),
 ):
@@ -5438,6 +5703,7 @@ def search_fusion(
         "time": time_dim,
         "objects": objects,
         "events": events,
+        "scene": scene,          # 场景是首要关注维度之一，早期漏了这个参数导致场景筛选被静默忽略
         "risk": risk,
         "road_surface": road_surface,
     }
@@ -5451,6 +5717,18 @@ def search_fusion(
             tag_conditions.setdefault(dim, []).extend(
                 v for v in vals if v not in tag_conditions.get(dim, [])
             )
+    # 取值别名展开：按正式值筛时，历史数据里被归并的别名也要能搜到
+    try:
+        from ontology import value_alias_map as _vam
+        for dim, want in list(tag_conditions.items()):
+            al = _vam(dim)
+            if not al:
+                continue
+            extra = [a for a, canon in al.items() if canon in want and a not in want]
+            if extra:
+                tag_conditions[dim] = want + extra
+    except Exception as e:
+        _log(f"[本体] 别名展开跳过: {e}")
     # ---- 1) 语义检索（SigLIP 可用时；否则该路返回空）----
     sem_scores = {}  # vector_id -> float
     sem_ok = False
@@ -5492,8 +5770,52 @@ def search_fusion(
             tag_hits = {a.vector_id for a in assets}
     finally:
         db.close()
+    # ---- 2.5) 车型/分辨率过滤（来自资产元数据，不是标签）----
+    meta_conds = {}
+    for _k, _val in (("vehicle", vehicle), ("resolution", resolution)):
+        if isinstance(_val, str) and _val.strip():
+            _vals = [x.strip() for x in _val.split(",") if x.strip()]
+            if _vals:
+                meta_conds[_k] = _vals
+    meta_hits = set()
+    if meta_conds:
+        from models import Asset as _AssetM
+        dbm = get_db_session()
+        try:
+            projm = _ensure_db_project(dbm, project)
+            if projm is not None:
+                for a in dbm.query(_AssetM).filter(_AssetM.project_id == projm.id).all():
+                    got = {
+                        "vehicle": str((a.asset_metadata or {}).get("vehicle") or "").strip(),
+                        "resolution": _asset_resolution(a),
+                    }
+                    if all(got.get(k) in want for k, want in meta_conds.items()):
+                        meta_hits.add(a.vector_id)
+        finally:
+            dbm.close()
+    # ---- 2.8) 事件/场景命中集合（平台里这两个维度的优先级最高，命中加权）----
+    prio_hits = set()
+    prio_dims = [d for d in ("events", "scene") if tag_conditions.get(d)]
+    if prio_dims:
+        dbp = get_db_session()
+        try:
+            projp = _ensure_db_project(dbp, project)
+            if projp is not None:
+                assets_p, _ = search_assets_by_tags(
+                    dbp, projp.id,
+                    {d: tag_conditions[d] for d in prio_dims},
+                    page=1, size=100000,
+                )
+                prio_hits = {a.vector_id for a in assets_p}
+        except Exception as e:
+            _log(f"[搜索] 事件/场景加权集合计算失败: {e}")
+        finally:
+            dbp.close()
     # ---- 3) 融合打分 ----
     union = set(sem_scores.keys()) | tag_hits
+    if meta_conds:
+        # 与其它条件取交集；只选了车型/分辨率时则以它为准
+        union = (union & meta_hits) if (tag_conditions or sem_scores) else set(meta_hits)
     matched_dims = len(tag_conditions)
     results = []
     for vid in union:
@@ -5501,8 +5823,10 @@ def search_fusion(
         sem = sem_scores.get(vid, 0.0)
         if sem_ok:
             score += sem * 0.7
-        if vid in tag_hits and tag_conditions:
-            score += 0.3  # 标签命中基础分（无逐帧命中计数时全命中近似）
+        if (vid in tag_hits and tag_conditions) or (vid in meta_hits and meta_conds):
+            score += 0.3  # 标签/元数据命中基础分（无逐帧命中计数时全命中近似）
+        if vid in prio_hits:
+            score += 0.1  # 事件/场景命中加权（这两个维度是平台的首要关注）
         if score < min_score:
             continue
         results.append(
@@ -5541,6 +5865,7 @@ def search_fusion(
         "code": 200,
         "query": query,
         "tag_conditions": tag_conditions,
+        "meta_conditions": meta_conds,
         "semantic_engine": sem_ok,
         "semantic_total": len(sem_scores),
         "tag_hit_total": len(tag_hits),
@@ -5605,6 +5930,38 @@ def api_endpoints():
 # ============================================================
 # ===== 数据管理明细表（PRD 59）与任务中心辅助 =====
 # ============================================================
+def _asset_resolution(a):
+    """资产分辨率档位：元数据优先，否则按宽高推断。
+    明细表与融合搜索筛选用同一口径，避免两处算出不同的值。"""
+    r = (a.asset_metadata or {}).get("resolution")
+    if r:
+        return r
+    if not a.width:
+        return ""
+    px = (a.width or 0) * (a.height or 0)
+    return "8M" if px >= 8e6 else ("2M" if px >= 1.8e6 else "其他")
+def _asset_facets(project: str):
+    """车型/分辨率的可选取值（来自资产元数据，按出现次数排序）"""
+    from models import Asset
+    db = get_db_session()
+    try:
+        proj = _ensure_db_project(db, project)
+        if proj is None:
+            return [], []
+        veh, res = {}, {}
+        for a in db.query(Asset).filter(Asset.project_id == proj.id).all():
+            v = str((a.asset_metadata or {}).get("vehicle") or "").strip()
+            if v:
+                veh[v] = veh.get(v, 0) + 1
+            r = _asset_resolution(a)
+            if r:
+                res[r] = res.get(r, 0) + 1
+        return (
+            sorted(veh, key=lambda k: (-veh[k], k)),
+            sorted(res, key=lambda k: (-res[k], k)),
+        )
+    finally:
+        db.close()
 @app.get("/api/assets/table")
 def assets_table(
     project: str = Query("default"),
@@ -5678,22 +6035,7 @@ def assets_table(
                     "scene": _names(a.final_tags, "scene") or _names(a.ai_tags, "scene"),
                     "risk": _names(a.final_tags, "risk") or _names(a.ai_tags, "risk"),
                     "vehicle": meta.get("vehicle", ""),
-                    "resolution": meta.get(
-                        "resolution",
-                        (
-                            (
-                                "8M"
-                                if (a.width or 0) * (a.height or 0) >= 8e6
-                                else (
-                                    "2M"
-                                    if (a.width or 0) * (a.height or 0) >= 1.8e6
-                                    else "其他"
-                                )
-                            )
-                            if a.width
-                            else ""
-                        ),
-                    ),
+                    "resolution": _asset_resolution(a),
                     "source_file": a.source.file_name if a.source else "",
                     "source_chain": (
                         (a.source.directory_chain or []) if a.source else []
