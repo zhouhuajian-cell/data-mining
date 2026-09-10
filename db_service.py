@@ -77,15 +77,17 @@ def list_projects(db: Session) -> List[Project]:
 
 
 def rename_project(db: Session, old_name: str, new_name: str) -> Optional[Project]:
-    """重命名项目"""
+    """重命名项目 = 只改显示名 display_name。name(=物理目录名)不动，数据路径不断。
+    网盘 CIFS 无移动/改名权限，物理目录由用户自行管理；平台只改 DB 显示名。"""
     project = get_project(db, old_name)
     if not project:
         return None
-    if get_project(db, new_name):
-        raise ValueError(f"项目名已存在: {new_name}")
-    project.name = new_name
+    for p in list_projects(db):
+        if p.id != project.id and (p.display_name or p.name) == new_name:
+            raise ValueError(f"项目名已存在: {new_name}")
+    project.display_name = new_name
     project.updated_at = datetime.utcnow()
-    db.flush()
+    db.commit()
     return project
 
 
@@ -936,15 +938,23 @@ def get_analytics_overview(db: Session, project_id: int) -> Dict[str, Any]:
     
     # 维度分布
     def get_distribution(dim: str, tag_source: str = "final_tags") -> Dict[str, int]:
+        # 含 REVIEW：AI 已判定但转人工的资产也应计入分布，
+        # 否则看板上"已通过"有数、各维度却是空的（大部分帧会被判 REVIEW）
         assets = db.query(Asset).filter(
             Asset.project_id == project_id,
-            Asset.status == AssetStatus.APPROVED,
+            Asset.status.in_([AssetStatus.APPROVED, AssetStatus.REVIEW]),
         ).all()
         dist = {}
         for a in assets:
             tags = getattr(a, tag_source) or {}
+            # AI 判定通过的资产只有 ai_tags（流水线不写 final_tags）。不回退的话
+            # “已通过”有数字、各维度分布却全空，看起来像分析中心没联动。
+            if not tags:
+                tags = a.ai_tags or {}
             for t in tags.get(dim, []):
                 tag_name = t.get("tag") if isinstance(t, dict) else t
+                if not tag_name:
+                    continue
                 dist[tag_name] = dist.get(tag_name, 0) + 1
         return dist
     
@@ -960,6 +970,8 @@ def get_analytics_overview(db: Session, project_id: int) -> Dict[str, Any]:
             "objects": get_distribution("objects"),
             "events": get_distribution("events"),
             "risk": get_distribution("risk"),
+            "road_surface": get_distribution("road_surface"),
+            "scene": get_distribution("scene"),
         },
     }
 
@@ -1030,8 +1042,9 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
                 continue
             filename = rec.get("filename") or os.path.basename(image_path)
 
-            # 源登记：同目录同文件名视为同一源（幂等）
-            source_root = os.path.dirname(image_path) or (img_root or ".")
+            # 源登记：优先用原始导入目录(src_dir, 直导时记录)；无则退化为副本目录(幂等)
+            _src_dir = (rec.get("src_dir") or "").strip()
+            source_root = _src_dir if (_src_dir and os.path.isabs(_src_dir)) else (os.path.dirname(image_path) or (img_root or "."))
             src = db.query(Source).filter(
                 Source.project_id == proj.id,
                 Source.relative_path == os.path.basename(image_path),
@@ -1043,7 +1056,7 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
                     source_type=SourceType.IMAGE,
                     source_root=source_root,
                     relative_path=os.path.basename(image_path),
-                    directory_chain=[],
+                    directory_chain=[c for c in (rec.get("directory_chain") or []) if isinstance(c, str)] or [],
                     file_name=filename,
                     extension=os.path.splitext(filename)[1].lower(),
                     file_size=os.path.getsize(image_path) if os.path.exists(image_path) else 0,
@@ -1062,16 +1075,33 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
                         w, h = im.size
                 except Exception:
                     pass
+            # 血缘元数据: 记录可能携带抽帧来源(frame_index/timestamp/video_source)
+            try:
+                frame_index = int(rec.get("frame_index") or 0)
+            except Exception:
+                frame_index = 0
+            try:
+                timestamp = float(rec.get("timestamp") or 0.0)
+            except Exception:
+                timestamp = 0.0
+            vinfo = rec.get("video_source") or (rec.get("extra") or {}).get("video_source")
+            meta_extra = {}
+            if vinfo and isinstance(vinfo, dict):
+                meta_extra["video_source"] = vinfo
+                src.meta = dict(src.meta or {})
+                src.meta.setdefault("video_source", vinfo)
             asset = Asset(
                 asset_id=str(uuid.uuid4())[:16],
                 project_id=proj.id,
                 source_id=src.id,
                 source_type=SourceType.IMAGE,
                 image_path=image_path,
-                frame_index=0,
+                frame_index=frame_index,
+                timestamp=timestamp,
                 vector_id=vid,
                 width=w, height=h,
                 status=AssetStatus.EXTRACTED,
+                asset_metadata=meta_extra or None,
             )
             db.add(asset)
             new_assets += 1
@@ -1121,3 +1151,94 @@ def run_migration():
 
 if __name__ == "__main__":
     run_migration()
+
+
+def delete_assets_by_filenames(db, project_id: int, basenames) -> dict:
+    """文件已被删除(粉碎/手动删)的资产连带清理：级联删 帧记录/检测缓存/推理缓存/HardCase/审核记录 及孤儿 Source。
+    红线：本函数只清数据库记录，绝不删除磁盘/网盘任何文件。"""
+    from sqlalchemy import or_
+    from models import (Asset, Source, Frame, DetectionCache, InferenceCache,
+                        HardCase, ReviewRecord)
+    if not basenames:
+        return {"assets": 0, "sources": 0}
+    basenames = [b for b in basenames if b]
+    conds = []
+    for b in basenames:
+        conds.append(Asset.image_path == b)
+        conds.append(Asset.image_path.like("%/" + b))
+    assets = db.query(Asset).filter(Asset.project_id == project_id, or_(*conds)).all()
+    if not assets:
+        return {"assets": 0, "sources": 0}
+    asset_ids = [a.id for a in assets]
+    src_ids = {a.source_id for a in assets if a.source_id}
+    for cls in (Frame, DetectionCache, InferenceCache, HardCase, ReviewRecord):
+        if hasattr(cls, "asset_id"):
+            db.query(cls).filter(cls.asset_id.in_(asset_ids)).delete(synchronize_session=False)
+    db.query(Asset).filter(Asset.id.in_(asset_ids)).delete(synchronize_session=False)
+    rm_src = 0
+    for sid in src_ids:
+        if not db.query(Asset).filter(Asset.source_id == sid).first():
+            db.query(Source).filter(Source.id == sid).delete(synchronize_session=False)
+            rm_src += 1
+    db.commit()
+    return {"assets": len(asset_ids), "sources": rm_src}
+
+
+def resync_asset_vector_ids(db, project, metadata_paths) -> dict:
+    """metadata/faiss 索引重建后重排 DB 资产 vector_id 并连带删除失效资产：
+    - 仍存在的文件: vector_id 更新为新 metadata 序号(保序对齐)
+    - 文件已不在 metadata(被删/手动删): 级联删除 DB 全部关联记录(红线: 不碰文件)
+    """
+    import os as _os
+    from models import (Asset, Source, Frame, DetectionCache, InferenceCache,
+                        HardCase, ReviewRecord)
+    proj = get_project(db, project)
+    if not proj:
+        return {"updated": 0, "removed": 0}
+    pid = proj.id
+    newmap = {}
+    for idx, path in enumerate(metadata_paths):
+        newmap.setdefault(_os.path.basename(str(path)), idx)
+    assets = db.query(Asset).filter(Asset.project_id == pid).all()
+    upd = rem = 0
+    for a in assets:
+        bn = _os.path.basename(a.image_path or "")
+        if bn in newmap:
+            if a.vector_id != newmap[bn]:
+                a.vector_id = newmap[bn]
+                upd += 1
+        else:
+            aid = a.id
+            src_ids = {a.source_id} if a.source_id else set()
+            for cls in (Frame, DetectionCache, InferenceCache, HardCase, ReviewRecord):
+                if hasattr(cls, "asset_id"):
+                    db.query(cls).filter(cls.asset_id == aid).delete(synchronize_session=False)
+            for sid in src_ids:
+                db.query(Source).filter(Source.id == sid, ~db.query(Asset).filter(
+                    Asset.source_id == sid).exists()).delete(synchronize_session=False)
+            db.delete(a)
+            rem += 1
+    db.commit()
+    return {"updated": upd, "removed": rem}
+
+
+def sync_metadata_paths(project_name: str, metadata_records, paths) -> Dict[str, int]:
+    """精确同步：只同步 paths 这批文件对应的 metadata 记录(按 basename 匹配)。
+    替代靠 extract 返回值切片(ctx["metadata"][-N:])的旧法——切片错位会漏 sync 导致
+    DB 缺资产(导出无血缘)。幂等：已存在 vector_id 跳过。"""
+    import os as _os
+    if not paths:
+        return {"assets": 0, "sources": 0, "skipped": 0}
+    pmap = {}
+    for rec in (metadata_records or []):
+        _p = rec.get("path")
+        if _p:
+            pmap.setdefault(_os.path.basename(str(_p)), rec)
+    recs = []
+    for _pp in paths:
+        _r = pmap.get(_os.path.basename(str(_pp)))
+        if _r is not None:
+            recs.append(_r)
+    if not recs:
+        return {"assets": 0, "sources": 0, "skipped": 0}
+    return sync_asset_records_to_db(project_name, recs)

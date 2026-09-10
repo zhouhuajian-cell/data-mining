@@ -167,15 +167,25 @@ def free_siglip():
 
 
 def ensure_yolo():
-    """替代原 _ensure_yolo - 返回 model 或 None"""
+    """替代原 _ensure_yolo - 返回 model 或 None。
+    ultralytics 偶发 'Both events must be recorded' 计时 bug -> 失败重试多次(清显存后重新加载)。"""
+    import torch, time as _t
     mgr = get_gpu_manager()
-    try:
-        model, _ = mgr.acquire(ModelName.YOLO.value, required_gb=2.0)
-        return model
-    except Exception as e:
-        print(f"[!] YOLO 加载失败: {e}")
-        return None
-
+    for attempt in range(1, 4):
+        try:
+            model, _ = mgr.acquire(ModelName.YOLO.value)
+            return model
+        except Exception as e:
+            print(f"[!] YOLO 加载失败(第{attempt}次): {e}")
+            try:
+                mgr.release(ModelName.YOLO.value)
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            _t.sleep(2)
+    import traceback
+    traceback.print_exc()
+    return None
 
 def free_yolo():
     """替代原 _free_yolo"""
