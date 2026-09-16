@@ -94,6 +94,21 @@ def events_need():
     return dict(load_ontology().get("events_need") or {})
 
 
+def event_hints_text(indent: str = "") -> str:
+    """易混事件的判据文本（帧级 / 联合段级 / Clip 链路三处提示词共用，口径不会跑偏）。
+
+    本体里没写就返回空串：提示词退化成原来的样子，不会硬塞空话。"""
+    o = load_ontology()
+    hints = o.get("event_hints") or {}
+    rule = o.get("event_rule") or ""
+    if not isinstance(hints, dict) or not hints:
+        return ""
+    lines = ["%s- %s：%s" % (indent, k, v) for k, v in hints.items()]
+    if rule:
+        lines.append("%s%s" % (indent, rule))
+    return "\n".join(lines)
+
+
 def scene_categories():
     """场景关注分类：优先本体；本体没有则回退旧的 scene_categories.json（兼容旧部署）"""
     cats = load_ontology().get("scene_categories")

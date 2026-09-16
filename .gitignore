@@ -50,3 +50,22 @@ _cmp/
 Thumbs.db
 .idea/
 .vscode/
+
+# 运行时数据 / 服务端产物（业务数据不入库）
+logs/
+*.db
+*.db-wal
+*.db-shm
+_frame_cache/
+_db_backups/
+_bak_*/
+*.bak
+*.bak_*
+auth_config.json
+
+# 旧快照与本机临时文件
+*_latest.py
+*_latest.html
+_cmp/
+TT.jpg
+TT.png

@@ -8,6 +8,7 @@ import shutil
 import zipfile
 import re
 import secrets
+import contextlib
 import time
 import gzip
 import glob
@@ -449,6 +450,25 @@ def _free_dino():
             pass
 # 12G 卡上大模型无法共存：加载/推理串行化，避免 A 请求正在卸载 VLM 时 B 请求又在加载 SigLIP 而 OOM
 _GPU_MODEL_LOCK = threading.RLock()
+# GPU 串行闸门：同一时刻只允许一路 AI 推理用卡，后来者排队等待（不并发、不拒绝）。
+# 两路负载并发（如批量任务的帧级 VLM 撞上审核中心的 Clip 判定）会触发
+# "CUDA error: device-side assert triggered" 并污染整个 CUDA 上下文，
+# 之后所有推理都失败、只能重启进程。等待超时（默认 30 分钟）才放弃。
+_GPU_WAIT_TIMEOUT = float(os.environ.get("AD_GPU_WAIT_TIMEOUT", "1800"))
+@contextlib.contextmanager
+def _gpu_slot(what: str):
+    got = _GPU_MODEL_LOCK.acquire(blocking=False)
+    if not got:
+        _log(f"[GPU] {what} 排队等待中（另一路 AI 任务正在用卡）…")
+        got = _GPU_MODEL_LOCK.acquire(timeout=_GPU_WAIT_TIMEOUT)
+        if got:
+            _log(f"[GPU] {what} 已排到，开始执行")
+    if not got:
+        raise RuntimeError(f"GPU 排队等待超时（{int(_GPU_WAIT_TIMEOUT)}s）：{what}")
+    try:
+        yield
+    finally:
+        _GPU_MODEL_LOCK.release()
 def _vram_free_gb():
     """当前可用显存(GB)；非 CUDA 返回 None"""
     if DEVICE != "cuda" or torch is None:
@@ -633,6 +653,16 @@ def get_project_paths(project_name: str):
     # 注意：这里【不再】自动创建目录。只有显式新建项目(create_project)/启动初始化才建目录，
     # 否则读取旧项目名的请求会把“已改名/已删除”的项目重新建出来(空项目复活)。
     return p_name, p_dir, img_dir, idx_path, meta_path
+def _project_exists_on_disk(project_name: str) -> bool:
+    """项目是否真实存在——只认磁盘/网盘上的目录（default 除外：系统保留，永远算存在）。
+
+    项目列表接口也是扫目录得来的，所以目录就是"项目存不存在"的唯一事实来源。
+    已删除的项目在任何读路径上都不能再被建出来，否则前端 localStorage 里残留的项目名
+    会在每次轮询时把 DB 记录 + 网盘目录一起复活（现象：网盘里删掉的项目又自己跳出来）。"""
+    p_name, p_dir, _img, _idx, _meta = get_project_paths(project_name)
+    if p_name == "default":
+        return True
+    return bool(p_name) and os.path.isdir(p_dir)
 def _find_file_by_name(root: str, filename: str) -> str:
     """在 root 目录下递归查找 basename 等于 filename 的文件（兼容 images 下子目录结构）。
 
@@ -768,12 +798,19 @@ def startup_event():
 def read_index():
     # 前端唯一入口：front.html（改前端只改这一个文件，无需再同步副本）
     index_html = os.path.join(PROJECT_DIR, "front.html")
+    # 禁缓存：前端是热替换的（改了不用重启），但浏览器一旦缓存住旧页面，用户点了半天
+    # 还是旧交互（"改了怎么没生效"多半是这个）。这里显式告诉浏览器每次都回源取。
+    _nocache = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
     if os.path.exists(index_html):
-        return FileResponse(index_html)
+        return FileResponse(index_html, headers=_nocache)
     # 兼容旧部署：历史上服务器上的文件名是 前端.html
     legacy = os.path.join(PROJECT_DIR, "前端.html")
     if os.path.exists(legacy):
-        return FileResponse(legacy)
+        return FileResponse(legacy, headers=_nocache)
     return {"msg": "front.html 不存在"}
 @app.get("/api/projects")
 def list_projects():
@@ -895,6 +932,17 @@ def get_image(project: str, image_id: int):
 @app.get("/api/db_stats")
 def get_db_stats(project: str = Query("default")):
     ctx = load_project_context(project)
+    if not _project_exists_on_disk(ctx["name"]):
+        # 网盘目录已被删除的项目：绝不能顺手 makedirs 把目录建回来——这个接口是前端
+        # 进入工作台/切换项目时必调的，一建就会把删掉的项目在网盘里重新"跳出来"。
+        project_cache.pop(ctx["name"], None)  # 顺带丢掉残留缓存，避免显示旧统计
+        return {
+            "project": ctx["name"],
+            "raw_count": 0,
+            "processed_count": 0,
+            "pending_count": 0,
+            "missing": True,
+        }
     os.makedirs(ctx["img_dir"], exist_ok=True)  # 防网盘根缺目录 FileNotFoundError(500)
     raw_images = [
         f
@@ -909,9 +957,12 @@ def get_db_stats(project: str = Query("default")):
         "processed_count": processed_count,
         "pending_count": max(0, raw_count - processed_count),
     }
+_vectorize_state = {"status": ""}  # "": 正常；unavailable: 取不到 SigLIP；evicted: 中途被卸载
 def extract_and_index_project(ctx, image_paths: List[str], frame_meta: dict = None):
     # SigLIP 可能被 VLM 卸载(显存互斥)，向量化前按需重载；加载失败则跳过本批
+    _vectorize_state["status"] = ""
     if _ensure_siglip()[0] is None:
+        _vectorize_state["status"] = "unavailable"
         print("[SigLIP] 模型不可用, 跳过本批向量化(仅入库不建索引)", flush=True)
         return 0
     """带项目级写锁的向量化入库：同一项目并发写底库时串行化，避免 metadata/faiss 竞争；跨项目并行。"""
@@ -942,11 +993,19 @@ def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = 
             if not mask.any():
                 continue
             valid_tensors = tensors[mask].to(DEVICE, non_blocking=True)
-            if DEVICE == "cuda":
-                with torch.cuda.amp.autocast():
+            with _gpu_slot("SigLIP 特征提取"):
+                if siglip_model is None:
+                    # 锁在批与批之间是放开的：别的 AI 任务（如检测加载 YOLO 时）会趁隙把
+                    # SigLIP 卸掉腾显存。这里拿到 None 再硬跑就是 500，所以本轮提前收尾；
+                    # 已完成的批次在函数末尾照常入库，重跑即可续做。
+                    _vectorize_state["status"] = "evicted"
+                    _log("[向量化] SigLIP 中途被其它 AI 任务卸载，本轮提前结束（已完成批次已入库，可重跑续做）")
+                    break
+                if DEVICE == "cuda":
+                    with torch.cuda.amp.autocast():
+                        feats = siglip_model.get_image_features(pixel_values=valid_tensors)
+                else:
                     feats = siglip_model.get_image_features(pixel_values=valid_tensors)
-            else:
-                feats = siglip_model.get_image_features(pixel_values=valid_tensors)
             feats = feats / feats.norm(dim=-1, keepdim=True)
             extracted_feats.append(feats.cpu().numpy().astype(np.float32))
             valid_paths = [paths[i] for i in range(len(paths)) if valids[i] == 1]
@@ -2460,6 +2519,11 @@ async def upload_batch(
 async def build_index_online(project: str = Query("default")):
     _log(f"[向量化] 触发在线向量化 project={project}")
     ctx = load_project_context(project)
+    if not _project_exists_on_disk(ctx["name"]):
+        return {
+            "code": 404,
+            "msg": f"项目 [{ctx['name']}] 的目录不存在（已删除的项目不会被重建），无法向量化",
+        }
     all_imgs = [
         os.path.join(ctx["img_dir"], f)
         for f in os.listdir(ctx["img_dir"])
@@ -2473,6 +2537,17 @@ async def build_index_online(project: str = Query("default")):
     if processed_count and DB_PATCH_AVAILABLE:
         from db_service import ensure_sync_hook, sync_metadata_paths
         sync_metadata_paths(project, ctx["metadata"], unprocessed_paths)
+    if _vectorize_state["status"] == "unavailable":
+        return {
+            "code": 503,
+            "msg": "向量化未执行：SigLIP 取不到（显存被 AI 任务占用或模型缺失），请等任务跑完再试",
+        }
+    if _vectorize_state["status"] == "evicted":
+        return {
+            "code": 200,
+            "msg": f"已向量化 {processed_count} 张；中途 SigLIP 被其它 AI 任务卸载腾显存，"
+                   f"本轮提前结束（已完成部分已入库），稍后再点一次即可续做",
+        }
     return {"code": 200, "msg": f"成功向量化 {processed_count} 张图片！"}
 # ----------------- 检索路由 -----------------
 @app.get("/api/search")
@@ -2485,12 +2560,18 @@ def search_text(
     ctx = load_project_context(project)
     if ctx["index"] is None or ctx["index"].ntotal == 0:
         return {"code": 200, "results": [], "total": 0}
+    if siglip_model is None and _running_tag_jobs(project):
+        # AI 任务在跑：重载 SigLIP 会腾显存把正在用的 VLM 挤掉，任务反复重载 -> 明确提示而不是硬抢
+        return {"code": 503, "msg": "语义检索暂不可用：AI 分析任务正在运行（避免抢显存中断任务），请稍后重试或用文件名检索"}
     if _ensure_siglip()[0] is None:   # VLM 可能占着显存把 SigLIP 卸了，这里按需重载
         return {"code": 500, "msg": "SigLIP 未就绪（显存不足或模型缺失），无法做文本检索"}
-    inputs = siglip_processor(
-        text=[query], return_tensors="pt", padding="max_length", max_length=64
-    ).to(DEVICE)
-    with torch.no_grad():
+    with _gpu_slot("SigLIP 文本检索"), torch.no_grad():
+        if siglip_model is None or siglip_processor is None:
+            # 排队期间被别的 AI 任务卸掉了：降级返回，不能硬用 None 前向（会 500）
+            return {"code": 503, "msg": "语义检索暂不可用：显存被 AI 任务占用（SigLIP 刚被卸载），请稍后重试"}
+        inputs = siglip_processor(
+            text=[query], return_tensors="pt", padding="max_length", max_length=64
+        ).to(DEVICE)
         if DEVICE == "cuda":
             with torch.cuda.amp.autocast():
                 text_feat = siglip_model.get_text_features(**inputs)
@@ -2527,6 +2608,8 @@ async def search_by_external_image(
     ctx = load_project_context(project)
     if ctx["index"] is None or ctx["index"].ntotal == 0 or not files:
         return {"code": 200, "results": []}
+    if siglip_model is None and _running_tag_jobs(project):
+        return {"code": 503, "msg": "以图搜图暂不可用：AI 分析任务正在运行（避免抢显存中断任务），请稍后重试"}
     if _ensure_siglip()[0] is None:   # 同上：VLM 占显存时按需重载 SigLIP
         return {"code": 500, "msg": "SigLIP 未就绪（显存不足或模型缺失），无法以图搜图"}
     pil_imgs = []
@@ -2537,8 +2620,10 @@ async def search_by_external_image(
             continue
     if not pil_imgs:
         return {"code": 200, "results": []}
-    inputs = siglip_processor(images=pil_imgs, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
+    with _gpu_slot("SigLIP 以图搜图"), torch.no_grad():
+        if siglip_model is None or siglip_processor is None:
+            return {"code": 503, "msg": "以图搜图暂不可用：显存被 AI 任务占用（SigLIP 刚被卸载），请稍后重试"}
+        inputs = siglip_processor(images=pil_imgs, return_tensors="pt").to(DEVICE)
         if DEVICE == "cuda":
             with torch.cuda.amp.autocast():
                 img_feats = siglip_model.get_image_features(**inputs)
@@ -2986,6 +3071,14 @@ def dino_detect_batch(
     image_ids: str = Form(...),
     text_prompt: str = Form(...),
 ):
+    """加锁包装：整个 DINO 批量检测期间与 VLM/Clip 推理排队互斥（12G 卡不能并发用卡）"""
+    with _gpu_slot("DINO 开放词检测"):
+        return _dino_detect_batch_locked(project, image_ids, text_prompt)
+def _dino_detect_batch_locked(
+    project: str,
+    image_ids: str,
+    text_prompt: str,
+):
     """Grounding DINO 满载批处理：一次喂多张图 + 单条提示词，FP16 加速，中英自动互译并回译。
 
     单张单发极慢，批量后可显著提升 GPU 占用与吞吐。按项目隔离并逐帧落盘。"""
@@ -3234,6 +3327,10 @@ def init_vlm_local():
         print(f"[✓] VLM 场景判定引擎就绪 ({used})")
 @app.post("/api/vlm_analyze")
 def vlm_analyze_scene(project: str = Form("default"), image_id: int = Form(...)):
+    """加锁包装：单帧 VLM 判定与批量任务/Clip 判定排队互斥"""
+    with _gpu_slot("单帧 VLM 判定"):
+        return _vlm_analyze_scene_locked(project, image_id)
+def _vlm_analyze_scene_locked(project: str, image_id: int):
     """
 
     第五层 VLM 综合场景判定：对指定图片进行多模态理解，并自动生成驾驶场景标签
@@ -3371,6 +3468,7 @@ def _vlm_structured_prompt() -> str:
         '  "objects": ["<从枚举选>"],\n'
         '  "events": ["<从枚举选>"],\n'
         '  "risk": ["<从枚举选>"],\n'
+        '  "traffic_sign": ["<从枚举选>"],\n'
         '  "scene": ["<从枚举选>"]\n'
         "}\n"
         "可用枚举值：\n"
@@ -3381,11 +3479,13 @@ def _vlm_structured_prompt() -> str:
         "objects: " + _v("objects") + "\n"
         "events: " + _v("events") + "\n"
         "risk: " + _v("risk") + "\n"
+        "traffic_sign: " + _v("traffic_sign") + "\n"
         "scene: " + _v("scene") + "\n"
         "每个维度只输出最匹配的 1 个值（objects/events 可为空数组，events 最多 2 个），必须使用中文，"
         "尖括号 <> 内是占位说明，必须替换为你实际判断出的枚举值，禁止原样照抄枚举清单。\n"
-        "⚠️ 必须完整输出全部 8 个字段。注意区分：road 是道路形态(直路/弯道/十字路口…)，"
-        "scene 是地点场景(城市道路/高速道路/隧道…)，两者含义不同，都要填。"
+        "⚠️ 必须完整输出全部 9 个字段。注意区分：road 是道路形态(直路/弯道/十字路口…)，"
+        "scene 是地点场景(城市道路/高速道路/隧道…)，两者含义不同，都要填。\n"
+        + _event_hint_block()
     )
 # 自由文本兜底词典：关键词 -> (维度, 标准Tag)
 _VLM_KEYWORD_MAP = [
@@ -3492,7 +3592,7 @@ def _looks_like_tag(v: str) -> bool:
     if v.startswith(_NEG_PREFIX):
         return False
     return 2 <= len(v) <= 10 and not re.search(r"[。！？，,.、；;：:（）()【】\[\]\"'']", v)
-def _clean_vlm_tags(dim: str, vals) -> list:
+def _clean_vlm_tags(dim: str, vals, meta_out: dict = None) -> list:
     """清洗 VLM 某维度的原始取值（字符串或数组）为标签列表。
 
     模型偶尔会把提示词里的枚举清单整串抄回来（"A|B|C|…|unknown"）——
@@ -3507,8 +3607,37 @@ def _clean_vlm_tags(dim: str, vals) -> list:
         vals = [vals]
     if not isinstance(vals, list):
         return []
-    from ontology import canonical_tag
+    # 事件允许输出成对象（{"type":..., "evidence":[...]}）：取出 type，其余字段不参与打标
+    _flat = []
+    for _v0 in vals:
+        if isinstance(_v0, dict):
+            _flat.append(_v0.get("type") or _v0.get("tag") or "")
+            # 证据/置信度必须留下：这是"标签凭什么判出来"的唯一依据（提示词本来就要求
+            # events 给出 F1→FN 的跨帧证据）。以前只取 type，证据全丢，前端只能看到结论。
+            if meta_out is not None:
+                _raw = str(_v0.get("type") or _v0.get("tag") or "").strip()
+                _rec = {}
+                if _v0.get("confidence") is not None:
+                    _rec["confidence"] = _v0.get("confidence")
+                if _v0.get("evidence"):
+                    _rec["evidence"] = _v0.get("evidence")
+                if _raw and _rec:
+                    try:
+                        from ontology import canonical_tag as _ct0
+                        _raw = _ct0(dim, _raw)
+                    except Exception:
+                        pass
+                    meta_out.setdefault(dim, {})[_raw] = _rec
+        else:
+            _flat.append(_v0)
+    vals = _flat
+    from ontology import canonical_tag, values_of
     vocab = _vlm_vocab()
+    # 按【维度】校验，而不是用全量词表：否则"高速道路"(场景维的值)会被塞进"道路"维。
+    try:
+        _dim_vals = set(values_of(dim)) | {"unknown"}
+    except Exception:
+        _dim_vals = set(vocab)
     out = []
     for v in vals:
         parts = [p.strip() for p in _TAG_SEP.split(str(v or "").strip()) if p.strip()]
@@ -3516,14 +3645,28 @@ def _clean_vlm_tags(dim: str, vals) -> list:
         if len(valid) >= 3 and len(parts) >= 4:
             continue        # 枚举清单回声：不是对画面的判断，整条丢弃
         for p in parts:
+            # 模型常把"无法判断"写成中文的"未知/不确定"，枚举里是 unknown：统一归一，
+            # 否则会被当成新词收进标签（实测交通标识维度 91 帧全变成"未知"这种非枚举值）
+            if p in ("未知", "不确定", "无法判断", "不详", "无", "N/A", "n/a"):
+                p = "unknown"
             p = canonical_tag(dim, p)
+            if p in vocab and p not in _dim_vals:
+                continue    # 本体里别的维度的合法值，放错维度了 -> 丢弃
             if p not in vocab and not _looks_like_tag(p):
                 continue    # 是句子/描述，不是标签
             if p not in out:
                 out.append(p)
     cap = 2 if dim == "events" else (4 if dim == "objects" else 3)
-    return out[:cap]
-def _parse_vlm_structured(text: str) -> dict:
+    out = out[:cap]
+    # 只保留最终留下的标签对应的证据（被清洗掉的标签不留证据，避免脏数据）
+    if meta_out is not None and meta_out.get(dim):
+        _keep = {k: v for k, v in meta_out[dim].items() if k in out}
+        if _keep:
+            meta_out[dim] = _keep
+        else:
+            meta_out.pop(dim, None)
+    return out
+def _parse_vlm_structured(text: str, meta_out: dict = None) -> dict:
     """解析 VLM 输出为结构化维度标签 {dim: [tag,...]}。
 
     优先解析 JSON；失败则用关键词词典兜底归类。"""
@@ -3547,9 +3690,10 @@ def _parse_vlm_structured(text: str) -> dict:
                     "objects",
                     "events",
                     "risk",
+                    "traffic_sign",
                     "scene",
                 ):
-                    tags = _clean_vlm_tags(dim, obj.get(dim))
+                    tags = _clean_vlm_tags(dim, obj.get(dim), meta_out)
                     if tags:
                         result[dim] = tags
                 if result:
@@ -3602,12 +3746,17 @@ def _find_db_asset(project: str, image_id: int):
             pass
         return None, None, None
 def _ensure_db_project(db, project_name: str):
-    """DB 层项目兜底：同名项目目录存在/或全新时，自动建 DB Project 记录（避免双轨 404）。
+    """DB 层项目兜底：同名项目目录存在时，自动补建 DB Project 记录（避免双轨 404）。
 
-    返回 Project 对象或 None（db 不可用）。"""
+    目录不存在的项目名【不】补建：那是已删除（或从未存在）的项目，补建会把它在
+    任何带 project 参数的轮询里凭空复活。返回 None 表示项目不存在，调用方按
+    "数据库未就绪/项目不存在"处理（各调用点已判空）。"""
     from db_service import get_project, create_project
     proj = get_project(db, project_name)
     if proj is None:
+        if not _project_exists_on_disk(project_name):
+            _log(f"[DB] 项目 [{project_name}] 目录不存在，不补建记录（已删除项目不复活）")
+            return None
         proj = create_project(db, project_name)
         db.commit()  # 持久化, 避免轮询每 3s 重复补建
         _log(f"[DB] 自动补建项目记录: {project_name}")
@@ -3648,7 +3797,227 @@ def _vlm_vram(tag: str):
         )
     except Exception:
         pass
+def _seg_chunks(ordered_ids, seg_size: int) -> list:
+    """把某个视频里按时间排好序的帧号切成 seg_size 一段；末尾不足半段的零头并进前一段。
+
+    否则 61 帧会切成 30+30+1 —— 那个 1 帧的"段"会单独出一份标签，
+    搜索里也会冒出一条"单帧结果"（用户实测反馈过）。"""
+    ids = list(ordered_ids)
+    if not ids:
+        return []
+    chunks = [ids[i:i + seg_size] for i in range(0, len(ids), seg_size)]
+    if len(chunks) >= 2 and len(chunks[-1]) < max(1, seg_size // 2):
+        _tail = chunks.pop()          # 先弹出，再并到新的最后一段（反过来会索引越界）
+        chunks[-1] = chunks[-1] + _tail
+    return chunks
+def _clip_name_parts(path_or_name: str):
+    """Clip 链路抽帧的文件名 → 分段线索：v<N>_<毫秒>_<序号>.jpg。
+
+    返回 (段标识 v<N>, 毫秒, 序号)；认不出来返回 None。"""
+    _fn = os.path.basename((path_or_name or "").replace("\\", "/"))
+    _m = re.match(r"^(v\d+)_(\d+)_(\d+)\.jpg$", _fn, re.I)
+    if not _m:
+        return None
+    return _m.group(1), int(_m.group(2)), int(_m.group(3))
+def _split_clip_runs(rows):
+    """rows: [(段标识, 毫秒, 序号, 载荷)] → [((段标识, 第几段), [载荷, ...]), ...]
+
+    同一 v<N> 内按 (毫秒, 序号) 排序，序号一旦回退就切开成新的一段视频 —— v<N> 是每个
+    抽帧任务内部各自从 v1 编的，跨任务会重名，混在一起会把两段不同视频拼成一个 Clip。
+    片段联合打标与融合语义搜索共用这里，两处的分段口径不会再跑偏。"""
+    buckets = {}
+    for tag, ms, seq, payload in rows:
+        buckets.setdefault(tag, []).append((ms, seq, payload))
+    out = []
+    for tag in sorted(buckets.keys()):
+        run, prev = [], None
+        for ms, seq, payload in sorted(buckets[tag]):
+            if prev is not None and seq <= prev and run:
+                out.append(((tag, len(out)), run))
+                run = []
+            prev = seq
+            run.append(payload)
+        if run:
+            out.append(((tag, len(out)), run))
+    return out
+def _group_frames_joint(db, project_id: int, image_ids, seg_size: int = 30, pick: int = 6) -> list:
+    """按视频把帧切成 seg_size 帧的"片段"，每片段均匀挑 pick 帧送去 VLM 联合推理。
+
+    返回 [{"sample_ids": 送模型的 pick 帧, "member_ids": 整段 seg_size 帧}, ...]
+    —— 一份标签覆盖整个片段，并写回该片段的全部帧（这就是"这一片段发生了什么"）。
+    分段/抽样口径与 Clip 链路统一：30 帧为一段（默认），段内 np.linspace 均匀取 pick 帧。
+    没有 video_source 的帧（Clip 链路抽出的图）按 v<N>_<毫秒>_<序号>.jpg 恢复成段，
+    实在认不出来的才各自成段走单帧判定。"""
+    from models import Asset
+    amap = {a.vector_id: a for a in db.query(Asset).filter(Asset.project_id == project_id).all()}
+    by_video, order = {}, []
+    _clip_pending = []  # [(v<N>, 毫秒, 序号, (毫秒, 序号, 帧id))]，没有 video_source 的帧先攒着
+    for iid in image_ids:
+        a = amap.get(iid)
+        vs = ((a.asset_metadata or {}).get("video_source") or {}) if a is not None else {}
+        vp = vs.get("video_path") if isinstance(vs, dict) else None
+        if vp:
+            key = vp
+            sort_key = (vs.get("timestamp") or 0, vs.get("frame_index") or 0)
+        else:
+            # Clip 链路抽的帧没有 video_source。若一帧一段就等于退化成逐帧 VLM
+            # （实测 CLIP测试：8455 帧 -> 8455 次单帧调用，整个任务从约 10 分钟涨到两小时）。
+            _parts = _clip_name_parts((a.image_path if a is not None else "") or "")
+            if _parts:
+                _clip_pending.append(
+                    (_parts[0], _parts[1], _parts[2], (_parts[1], _parts[2], iid)))
+                continue
+            key = "__single__%s" % iid
+            sort_key = (0, 0)
+        if key not in by_video:
+            by_video[key] = []
+            order.append(key)
+        by_video[key].append((sort_key[0], sort_key[1], iid))
+    # Clip 帧按文件名恢复成段（与融合语义搜索共用同一套口径，避免两边跑偏）
+    for _ck, _run in _split_clip_runs(_clip_pending):
+        _key = "__clip__%s_%d" % _ck
+        by_video[_key] = list(_run)
+        order.append(_key)
+    groups = []
+    for key in order:
+        items = by_video[key]
+        items.sort(key=lambda x: (x[0], x[1]))
+        ids = [x[2] for x in items]
+        if key.startswith("__single__"):
+            groups.extend([{"sample_ids": [x], "member_ids": [x]} for x in ids])
+            continue
+        for seg in _seg_chunks(ids, seg_size):
+            s0 = 0
+            if len(seg) <= pick:
+                picks = list(seg)
+            else:
+                idx = np.linspace(0, len(seg) - 1, pick).round().astype(int).tolist()
+                seen, picks = set(), []
+                for k in idx:
+                    if k not in seen:
+                        seen.add(k)
+                        picks.append(seg[k])
+            groups.append({"sample_ids": picks, "member_ids": list(seg)})
+    return groups
+
+def _event_hint_block() -> str:
+    """易混事件判据（真源在本体 scene.json 的 event_hints；帧级与联合提示词共用）。"""
+    try:
+        from ontology import event_hints_text
+        t = event_hints_text()
+    except Exception:
+        t = ""
+    return ("易混事件判据（必须按此区分，禁止凭习惯用词）：\n" + t + "\n") if t else ""
+
+
+def _vlm_prompt_multi(n: int) -> str:
+    """多帧联合提示词：帧逐编号 + 强制跨帧证据，让模型真的按序列推理。
+
+    与帧级单图提示词的区别不只是"多给几张图"：这里明确要求
+      · 按时间顺序编号（Frame 1…N），模型据此判断变化；
+      · events 必须给出 F1→中间帧→FN 的三帧证据；
+      · 6 帧间位置没变化的静止目标，禁止报横穿/切入等动态事件；
+    否则模型容易退化成"分别看每帧、再各报一遍"。"""
+    from ontology import dimensions as _dim_defs
+    dims = _dim_defs()
+
+    def _v(dim):
+        return "/".join((dims.get(dim) or {}).get("values") or [])
+
+    seq = " → ".join("Frame %d" % k for k in range(1, n + 1))
+    return (
+        f"你是自动驾驶场景分析专家。以下 {n} 张图片是同一段车载前视视频按时间顺序抽取的帧，"
+        f"依次为 {seq}（注意：不是相邻帧，相邻两帧之间隔了若干原始帧）。\n"
+        f"请把这 {n} 帧当成一段连续过程来整体判断，只输出【一份】JSON，"
+        "不要分帧输出、不要逐帧重复字段、不要任何解释或代码块标记：\n"
+        "{\n"
+        '  "time": ["<从枚举选>"],\n'
+        '  "weather": ["<从枚举选>"],\n'
+        '  "road": ["<从枚举选>"],\n'
+        '  "road_surface": ["<从枚举选>"],\n'
+        '  "objects": [{"type": "<从枚举选>", "state": ["<从枚举选>"], "confidence": <0.0~1.0真实数值>}],\n'
+        '  "events": [{"type": "<从枚举选>", "confidence": <0.0~1.0真实数值>, '
+        '"evidence": ["F1: <初始位置>", "F4: <中间变化>", "F6: <最终状态>"]}],\n'
+        '  "risk": ["<从枚举选>"],\n'
+        '  "traffic_sign": ["<从枚举选>"],\n'
+        '  "scene": ["<从枚举选>"]\n'
+        "}\n"
+        "可用枚举值：\n"
+        f"time: {_v('time')}\n"
+        f"weather: {_v('weather')}\n"
+        f"road: {_v('road')}\n"
+        f"road_surface: {_v('road_surface')}\n"
+        f"objects.type: {_v('objects')}\n"
+        f"events.type: {_v('events')}\n"
+        f"risk: {_v('risk')}\n"
+        f"traffic_sign: {_v('traffic_sign')}\n"
+        f"scene: {_v('scene')}\n"
+        "强制规则：\n"
+        "1. 判断依据是【帧间的变化】，不是某一帧的孤立画面；scene/road/weather 等全段一致的维度按整体判断；\n"
+        "2. 静态目标不要报动态事件：某个行人/车辆虽然出现，但多帧间位置没有明显变化，"
+        "不要报行人横穿/车辆切入等动态事件；\n"
+        "3. events 的 evidence 必须写出三帧证据（F1 初始位置 → 中间帧变化 → 最后一帧最终状态），"
+        "格式如 \"F1: 行人位于画面左侧路缘\"；\n"
+        "4. 每个维度只输出最匹配的 1 个值（objects/events 可为空数组，events 最多 2 个）；"
+        "确实无法确认的维度填 [\"unknown\"]，禁止臆测；\n"
+        "5. 注意区分：road 是道路形态(直路/弯道/十字路口…)，scene 是地点场景(城市道路/高速道路/隧道…)，两者都要填；\n"
+        "6. 必须完整输出全部 9 个字段；禁止输出枚举之外的泛化词（如「复杂城市交通」）；"
+        "尖括号 <> 内只是占位说明，必须替换为你实际判断出的枚举值，禁止原样照抄枚举清单；\n"
+        "8. confidence 必须是 0.0~1.0 的真实数值，反映确信程度，不得统一填 0.0 或照抄示例；\n"
+        "9. 同一段里的用词要一致，事件判据见下：\n"
+        + _event_hint_block()
+    )
+def _vlm_predict_text_multi(images) -> str:
+    """多帧联合 VLM 判定：N 张图一次送入，综合推理出一份标签。
+
+    与逐帧判定的区别：逐帧各自打标、再在视频层面做并集，会把整段视频打成"什么标签都有"；
+    这里一组帧只产出一份总结标签，组内共享。"""
+    global vlm_model, vlm_processor
+    with _gpu_slot("多帧联合 VLM 判定"):
+        _vlm_vram("before_load")
+        _free_dino()
+        _free_yolo()
+        if vlm_model is None:
+            try:
+                init_vlm_local()
+            except Exception as e:
+                _log(f"[VLM] 多帧联合: 模型加载失败 {e}")
+                return ""
+        if vlm_model is None:
+            return ""
+        try:
+            # 必须先缩图：多图一次送进去，原图(1920x1080)的视觉 token 会把 12G 显存撑爆
+            # （实测 5 张原图 -> CUDA OOM: Tried to allocate 6.18 GiB）。Clip 链路也是这么做的。
+            _thumb = int(os.environ.get("AD_VLM_JOINT_THUMB", "512"))
+            _small = []
+            for _im in images:
+                _im2 = _im.copy()
+                _im2.thumbnail((_thumb, _thumb))
+                _small.append(_im2)
+            content = [{"type": "image"} for _ in _small]
+            content.append({"type": "text", "text": _vlm_prompt_multi(len(_small))})
+            text_prompt = vlm_processor.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False, add_generation_prompt=True,
+            )
+            inputs = vlm_processor(text=[text_prompt], images=_small, return_tensors="pt").to(DEVICE)
+            with torch.inference_mode():
+                generated_ids = vlm_model.generate(**inputs, max_new_tokens=220, do_sample=False)
+            trimmed = [
+                out_ids[len(in_ids):]
+                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            return vlm_processor.batch_decode(
+                trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0] or ""
+        except Exception as e:
+            _log(f"[VLM] 多帧联合推理异常: {e}")
+            return ""
 def _vlm_predict_text(image) -> str:
+    """帧级 VLM 单图判定（GPU 串行闸门：忙时排队等待，不与 Clip/YOLO/DINO 并发）"""
+    with _gpu_slot("帧级 VLM 判定"):
+        return _vlm_predict_text_locked(image)
+def _vlm_predict_text_locked(image) -> str:
     """确保 VLM 已加载并返回单图结构化预测文本。返回 "" 表示失败。"""
     global vlm_model, vlm_processor
     _vlm_vram("before_load")
@@ -3736,25 +4105,31 @@ def _build_decision_evidence(asset) -> dict:
     return evidence
 # ---- 将解析出的维度标签合并进 asset.ai_tags（带来源追踪）----
 def _merge_dim_tags_into_asset(
-    asset, dim_tags: dict, model_name: str, confidence: float = None
+    asset, dim_tags: dict, model_name: str, confidence: float = None, tag_meta: dict = None
 ):
     ai_tags = dict(asset.ai_tags or {})
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     for dim, tags in (dim_tags or {}).items():
-        existing = [t for t in (ai_tags.get(dim) or []) if isinstance(t, dict)]
+        # 重跑要点：VLM 判出来的维必须"以本次为准"。原来是纯并集，旧标签只增不减——
+        # 于是重跑后每帧仍带着上一轮的旧标签，"段内 30 帧共享一份标签"看着就永远不生效。
+        # 人工复核(source=HUMAN)与其它来源的标签保留，只替换 VLM 自己判出来的。
+        existing = [t for t in (ai_tags.get(dim) or [])
+                    if isinstance(t, dict) and (t.get("source") or "") != "VLM"]
         names = {t.get("tag") for t in existing}
         for tag_name in tags:
             if tag_name not in names:
-                existing.append(
-                    {
-                        "tag": tag_name,
-                        "source": "VLM",
-                        "confidence": confidence,
-                        "model": model_name,
-                        "version": "v1",
-                        "created_at": ts,
-                    }
-                )
+                _rec = ((tag_meta or {}).get(dim) or {}).get(tag_name) or {}
+                _item = {
+                    "tag": tag_name,
+                    "source": "VLM",
+                    "confidence": _rec.get("confidence", confidence),
+                    "model": model_name,
+                    "version": "v1",
+                    "created_at": ts,
+                }
+                if _rec.get("evidence"):
+                    _item["evidence"] = _rec["evidence"]   # 模型给的帧级证据，前端可核对
+                existing.append(_item)
                 names.add(tag_name)
         ai_tags[dim] = existing
     asset.ai_tags = ai_tags
@@ -3782,11 +4157,12 @@ def asset_analyze_full(project: str = Form("default"), image_id: int = Form(...)
         output_text = _vlm_predict_text(Image.open(img_path).convert("RGB"))
         if not output_text:
             return {"code": 500, "msg": "VLM 推理失败或模型不可用"}
-        # 2) 解析结构化输出
-        dim_tags = _parse_vlm_structured(output_text)
+        # 2) 解析结构化输出（顺带收下 evidence/confidence，便于事后核对标签真实性）
+        _tag_meta = {}
+        dim_tags = _parse_vlm_structured(output_text, _tag_meta)
         # 3) 合并维度标签进 ai_tags（带来源追踪 VLM/model/version）
         model_name = vlm_loaded_name or VLM_MODEL_NAME
-        ai_tags = _merge_dim_tags_into_asset(asset, dim_tags, model_name)
+        ai_tags = _merge_dim_tags_into_asset(asset, dim_tags, model_name, tag_meta=_tag_meta)
         # 4) Decision Engine 评估
         from db_service import update_asset_decision
         evidence = _build_decision_evidence(asset)
@@ -4188,6 +4564,59 @@ try:
         _EVENT_NEED = {k: set(v) for k, v in _NEED.items()}
 except Exception:
     pass
+# DINO 标签还原：词表值(英文) -> 中文键；再兜一层标识关键词（模型偶尔输出 ##walk/lane 这类碎词）
+_DINO_EN2CN = {}
+try:
+    _dd = json.load(open(os.path.join(PROJECT_DIR, "dino_dict.json"), encoding="utf-8"))
+    for _k, _v in _dd.items():
+        _DINO_EN2CN.setdefault(str(_v).strip().lower(), _k)
+except Exception:
+    _dd = {}
+_DINO_SIGN_KW = [
+    ("crosswalk", "人行横道"), ("#walk", "人行横道"), ("zebra", "人行横道"),
+    ("stop line", "停止线"), ("traffic light", "交通信号灯"), ("signal light", "交通信号灯"),
+    ("no entry", "禁止通行"), ("no parking", "禁止停车"), ("stop sign", "停车让行"),
+    ("speed limit", "限速"),
+]
+def _dino_label_to_cn(lb: str):
+    """把 DINO 返回的标签还原成中文标准词；还原不出来返回 None（宁可丢，也不把英文串写进标签）。
+
+    DINO 用逗号拼接多类提示词时，会把多个类名连成一串（如 "traffic light traffic light street"），
+    所以先整体匹配，再按关键词兜底，最后才考虑单值精确匹配。"""
+    t = (lb or "").strip().lower()
+    if not t:
+        return None
+    for kw, cn in _DINO_SIGN_KW:          # 标识类关键词优先（要进 traffic_sign 维度）
+        if kw in t:
+            return cn
+    hit = _DINO_EN2CN.get(t)              # 词表值精确匹配 -> 中文键
+    if hit:
+        return hit
+    if t in _SIGN_TAGS:                   # 直接就是标准词
+        return lb.strip()
+    # 逐个英文词试：取最长能匹配上的词表项
+    toks = [x for x in re.split(r"[^a-z]+", t) if x]
+    for n in (3, 2, 1):
+        for i in range(0, max(1, len(toks) - n + 1)):
+            cand = " ".join(toks[i:i + n])
+            if cand in _DINO_EN2CN:
+                return _DINO_EN2CN[cand]
+    if re.search(r"[a-zA-Z]", t):         # 仍是英文 -> 丢弃
+        return None
+    return lb.strip()
+# 交通标识信号：DINO 词表里属于标线/标志的词（命中后进 traffic_sign 维度，不进 objects）
+try:
+    from ontology import values_of as _values_of
+    _SIGN_TAGS = set(_values_of("traffic_sign")) - {"unknown"}
+except Exception:
+    _SIGN_TAGS = set()
+# DINO 词表里的键名比本体取值更口语（"限速标志" vs 取值"限速"），先归一再判定
+_SIGN_ALIAS = {
+    "斑马线": "人行横道", "限速标志": "限速", "左转标志": "左转", "右转标志": "右转",
+    "掉头标志": "掉头", "直行标志": "直行", "禁止通行标志": "禁止通行",
+    "禁止停车标志": "禁止停车", "停车让行标志": "停车让行",
+    "注意行人标志": "注意行人", "施工标志": "施工",
+}
 def _detections_to_objects(detections: dict):
     """把真实检测结果(YOLO/DINO)映射为 ai_tags.objects 标签列表(带真实置信, 不虚报)。"""
     out = []
@@ -4205,6 +4634,19 @@ def _detections_to_objects(detections: dict):
             lb = str(d.get("label") or "").strip()
             if not lb:
                 continue
+            # 交通标识信号：DINO 提示词里的标线/标志词命中后，应进 traffic_sign 维度，
+            # 不能混到 objects 里（否则"人行横道"会变成一个目标类）
+            # DINO 常返回英文词表值或把多个类名拼成一串，先尽量还原成中文标准词
+            _lb2 = lb
+            if eng == "dino":
+                _lb2 = _dino_label_to_cn(lb)
+                if _lb2 is None:
+                    continue        # 还原不出来（英文/乱码）就别进标签，避免污染
+            _lb_sign = _SIGN_ALIAS.get(_lb2, _lb2)
+            if _lb_sign in _SIGN_TAGS:
+                cands.append((cf, _lb_sign, "sign"))
+                continue
+            lb = _lb2
             tag = _YOLO_LABEL2OBJ.get(lb)
             if not tag:
                 # DINO 属开放词(提示词通常已是中文，可原样保留)；YOLO 是固定 COCO 类名，
@@ -4212,8 +4654,16 @@ def _detections_to_objects(detections: dict):
                 # (曾出现 suitcase/handbag/train 混入目标标签)
                 tag = lb if eng == "dino" else "其他目标"
             cands.append((cf, tag, eng))
+    # 标识与目标分开截断：交通标识常是低置信（0.2~0.5），一起排序会被目标挤掉前 6 名之外
     cands.sort(key=lambda x: -x[0])
-    for cf, tag, eng in cands[:4]:
+    _signs = [c for c in cands if c[2] == "sign" and c[0] >= 0.25][:2]
+    _objs = [c for c in cands if c[2] != "sign"][:4]
+    for cf, tag, eng in _signs:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        out.append({"tag": tag, "source": "DINO", "confidence": cf, "dim": "traffic_sign"})
+    for cf, tag, eng in _objs:
         if tag in seen:
             continue
         seen.add(tag)
@@ -4290,6 +4740,47 @@ def _event_detection_conflict(ai_tags: dict, detections: dict) -> bool:
         if not (labels & need_cn):
             return True
     return False
+def _joint_infer_group(project: str, project_id, group: dict) -> dict:
+    """对一段做一次多帧联合推理（段内取 AD_JOINT_PICK 帧送模型，覆盖该段全部帧）。
+
+    返回 ({帧id: dim_tags}, 证据表 {dim: {tag: {confidence, evidence}}})；
+    取不到图/推理失败/无有效标签时返回 ({}, {})，该段的帧由调用方回退为逐帧 VLM。"""
+    from models import Asset   # worker 里的同名导入是函数局部的，抽成独立函数必须自己导入
+    out = {}
+    try:
+        _dbp2 = get_db_session()
+        try:
+            _paths = []
+            for _iid in (group.get("sample_ids") or []):
+                _a2 = _dbp2.query(Asset).filter(
+                    Asset.project_id == project_id, Asset.vector_id == _iid).first()
+                _p2 = (_a2.image_path if _a2 else "") or ""
+                if _p2 and os.path.exists(_p2):
+                    _paths.append((_iid, _p2))
+        finally:
+            _dbp2.close()
+        if not _paths:
+            return out, {}
+        if len(_paths) == 1:
+            _txt = _vlm_predict_text(Image.open(_paths[0][1]).convert("RGB"))
+        else:
+            _txt = _vlm_predict_text_multi(
+                [Image.open(_p).convert("RGB") for _i, _p in _paths])
+        _meta2 = {}
+        _dt = _parse_vlm_structured(_txt, _meta2) if _txt else {}
+        # 模型没按 JSON 输出时会退化成关键词兜底（维度少、可能出现枚举外的词），
+        # 把原始输出记下来便于调提示词
+        if _txt and ("{" not in _txt or "}" not in _txt):
+            _log(f"[Pipeline] 联合打标非JSON输出(已走关键词兜底): {str(_txt)[:220]}")
+        if not _dt:
+            _log(f"[Pipeline] 片段联合打标无有效标签(组内 {len(_paths)} 帧)，原始输出: "
+                 + (str(_txt)[:300] if _txt else "<空>"))
+        _members = list(group.get("member_ids") or [])
+        for _iid in _members:
+            out[_iid] = dict(_dt)
+    except Exception as _e:
+        _log(f"[Pipeline] 联合打标某组失败(跳过该组): {_e}")
+    return out, _meta2
 def _ai_batch_worker(
     job_pk: int,
     project: str,
@@ -4297,6 +4788,8 @@ def _ai_batch_worker(
     preset: str = "balanced",
     detect_first: bool = False,
     dino_enhance: bool = False,
+    joint_mode: bool = True,
+    clip_size: int = 0,
 ):
     """批量 AI Pipeline(检测融合版)：detect_first=1 时先 YOLO 全批检测(真实目标证据)，
 
@@ -4319,59 +4812,83 @@ def _ai_batch_worker(
         detect_ok = not detect_first   # 未开启检测时不算失败
         if detect_first and image_ids and DEVICE == "cuda":
             try:
-                _log(f"[Pipeline] 阶段1 YOLO检测 job={job_pk} frames={total}")
-                _update_job_progress(job_pk, 0, total, f"YOLO 检测 0/{total}")
                 from db_service import get_project as _gp
-                # 复用现有批量检测核心(同进程直接调用端点函数, 返回 {code,results,count})
-                resp = yolo_detect_batch(
-                    project=project,
-                    image_ids=",".join(str(x) for x in image_ids),
-                    batch_size=16,
-                    fp16="1",
-                )
-                # 关键：检测阶段失败必须中止任务。否则 0 命中会被后面的"无检测目标"逻辑
-                # 当成"这批帧都没目标"，把全部帧静默标成 AUTO_PASS 且不产生任何标签
-                # （曾导致 2034 帧空通过、分析中心无数据可统计）。
-                if not isinstance(resp, dict) or resp.get("code") != 200:
-                    raise RuntimeError("YOLO 检测失败: " + str((resp or {}).get("msg") or "无返回"))
-                detect_ok = True
-                for id_str, r in (resp.get("results") or {}).items():
-                    try:
-                        iid = int(id_str)
-                    except Exception:
-                        continue
-                    dets = []
-                    for lb, cf, bx in zip(
-                        r.get("labels") or [],
-                        r.get("scores") or [],
-                        r.get("boxes") or [],
-                    ):
-                        dets.append({"label": lb, "confidence": float(cf), "box": bx})
-                    if dets:
-                        yolo_hits[iid] = dets
-                # 落 DB asset.detections["yolo"](供 evidence 与前端)
-                db2 = get_db_session()
+                # 只对"还没检测过"的帧做检测：中断续跑时不必把已检测过的帧重新检测一遍
+                _dbp = get_db_session()
                 try:
-                    for iid, dets in yolo_hits.items():
-                        a = (
-                            db2.query(Asset)
-                            .filter(
-                                Asset.project_id == _gp(db2, project).id,
-                                Asset.vector_id == iid,
-                            )
-                            .first()
-                            if _gp(db2, project)
-                            else None
-                        )
-                        if a is None:
-                            continue
-                        dd = dict(a.detections or {})
-                        dd["yolo"] = dets
-                        a.detections = dd
-                    db2.commit()
+                    _pj = _gp(_dbp, project)
+                    _want = set(image_ids)
+                    detect_todo = [
+                        a.vector_id
+                        for a in _dbp.query(Asset).filter(Asset.project_id == _pj.id).all()
+                        if a.vector_id in _want and not (a.detections or {}).get("yolo")
+                    ] if _pj is not None else list(image_ids)
                 finally:
-                    db2.close()
-                _log(f"[Pipeline] YOLO 完成 命中 {len(yolo_hits)} 帧")
+                    _dbp.close()
+                _log(
+                    f"[Pipeline] 阶段1 YOLO检测 job={job_pk} 待检测={len(detect_todo)}/{total}（已检测的跳过）"
+                )
+                # 分批检测 + 每批更新进度：整批一次性检测时进度条会长时间停在 0/N，
+                # 看起来像卡死；分批也让"终止/暂停"在检测阶段就能生效（原来只在 VLM 阶段检查信号）。
+                _CHUNK = max(50, int(os.environ.get("AD_DETECT_CHUNK", "500")))
+                _done = 0
+                for _s in range(0, len(detect_todo), _CHUNK):
+                    _cs, _ps = _pipeline_cancel_signals()
+                    if job_pk in _cs:
+                        from models import JobStatus as _JSc
+                        _job_set(job_pk, status=_JSc.CANCELLED, progress=round(_done / max(1, total) * 100, 1),
+                                 current_stage=f"已中止于检测阶段 {_done}/{total}（剩余 {len(detect_todo) - _done} 帧未检测）")
+                        _log(f"[Pipeline] 检测阶段被终止 job={job_pk} 已完成 {_done}/{len(detect_todo)}")
+                        return
+                    while job_pk in _ps:
+                        time.sleep(1)
+                        _cs, _ps = _pipeline_cancel_signals()
+                        if job_pk in _cs:
+                            from models import JobStatus as _JSc2
+                            _job_set(job_pk, status=_JSc2.CANCELLED, progress=round(_done / max(1, total) * 100, 1),
+                                     current_stage=f"已中止于检测阶段 {_done}/{total}")
+                            return
+                    _part = detect_todo[_s:_s + _CHUNK]
+                    _update_job_progress(job_pk, _done, total,
+                                         f"YOLO 检测 {_done}/{len(detect_todo)}（本批 {len(_part)} 帧）")
+                    # 复用现有批量检测核心(同进程直接调用端点函数, 返回 {code,results,count})
+                    resp = yolo_detect_batch(
+                        project=project,
+                        image_ids=",".join(str(x) for x in _part),
+                        batch_size=16,
+                        fp16="1",
+                    )
+                    # 关键：检测阶段失败必须中止任务。否则 0 命中会被后面的"无检测目标"逻辑
+                    # 当成"这批帧都没目标"，把全部帧静默标成 AUTO_PASS 且不产生任何标签
+                    # （曾导致 2034 帧空通过、分析中心无数据可统计）。
+                    if not isinstance(resp, dict) or resp.get("code") != 200:
+                        raise RuntimeError("YOLO 检测失败: " + str((resp or {}).get("msg") or "无返回"))
+                    detect_ok = True
+                    _done += len(_part)
+                    # 每批就把结果落库：中断后已检测过的帧不会白做
+                    _dbw = get_db_session()
+                    try:
+                        for id_str, r in (resp.get("results") or {}).items():
+                            try:
+                                iid = int(id_str)
+                            except Exception:
+                                continue
+                            dets = []
+                            for lb, cf, bx in zip(r.get("labels") or [], r.get("scores") or [], r.get("boxes") or []):
+                                dets.append({"label": lb, "confidence": float(cf), "box": bx})
+                            if dets:
+                                yolo_hits[iid] = dets
+                            a = _dbw.query(Asset).filter(Asset.project_id == _pj.id, Asset.vector_id == iid).first()
+                            if a is None:
+                                continue
+                            dd = dict(a.detections or {})
+                            dd["yolo"] = dets
+                            a.detections = dd
+                        _dbw.commit()
+                    finally:
+                        _dbw.close()
+                _update_job_progress(job_pk, total, total, f"YOLO 检测完成 {_done}/{len(detect_todo)}")
+                _log(f"[Pipeline] YOLO 完成 命中 {len(yolo_hits)} 帧 / 检测 {_done} 帧")
             except Exception as e:
                 # 不再"继续纯VLM"：空 hit_ids 会让所有帧走免VLM直通，等于整轮空跑
                 _log(f"[Pipeline] YOLO 阶段失败，中止任务(不标记任何帧): {e}")
@@ -4395,7 +4912,7 @@ def _ai_batch_worker(
                 _update_job_progress(job_pk, 0, total, f"DINO 开放词检测")
                 from db_service import get_project as _gp2
                 _dct = _load_dino_dict()
-                dino_prompt = ", ".join(list(_dct.keys())[:60])
+                dino_prompt = ". ".join(list(_dct.keys())[:60]) + "."
                 if not dino_prompt.strip():
                     dino_prompt = "锥桶, 水马, 护栏, 红绿灯, 限速牌, 施工区, 障碍物"
                 resp3 = dino_detect_batch(
@@ -4459,9 +4976,67 @@ def _ai_batch_worker(
             dino_hits_local = hits3 or {}
         except Exception:
             dino_hits_local = {}
-        hit_ids = set(yolo_hits) | set(
-            dino_hits_local
-        )  # 检测出目标的帧(仅这些帧跑 VLM)
+        # 检测出目标的帧(仅这些帧跑 VLM)。不能只取"本次运行检测到的"：
+        # 续跑会跳过已检测的帧(见阶段1)，那时 yolo_hits 几乎为空 -> hit_ids 为空 ->
+        # 所有帧都被当成"无检测目标"免VLM直通，跑一轮一帧都不打标（踩过）。
+        # 这里以库里的检测记录为准，再并入本次检测结果。
+        hit_ids = set(yolo_hits) | set(dino_hits_local)
+        if detect_first:
+            try:
+                from db_service import get_project as _gp_h
+                _dbh = get_db_session()
+                try:
+                    _pjh = _gp_h(_dbh, project)
+                    if _pjh is not None:
+                        _want = set(image_ids)
+                        for _a in _dbh.query(Asset).filter(Asset.project_id == _pjh.id).all():
+                            if _a.vector_id in _want:
+                                _dd = _a.detections or {}
+                                if _dd.get("yolo") or _dd.get("dino"):
+                                    hit_ids.add(_a.vector_id)
+                finally:
+                    _dbh.close()
+                _log(f"[Pipeline] 待VLM帧数={len(hit_ids)}/{len(image_ids)}（含历史检测记录）")
+            except Exception as _e:
+                _log(f"[Pipeline] 读取历史检测记录失败(退化为仅本次检测): {_e}")
+        # ============ 阶段 2a: 片段联合打标（按视频相邻 N 帧一组，一次推理出一份标签）============
+        # 逐帧打标 + 视频级并集会把整段视频打成"什么标签都有"（事件尤其明显）。
+        # 这里改为：同一视频相邻的 N 帧一次送 VLM，综合出一份总结标签，组内帧共享。
+        # 落地方式：段内第一帧轮到时就地推理这一段，然后走下面逐帧那同一套写库逻辑。
+        # （旧实现是等所有段推理完、标签攒在内存里最后统一落库：推理阶段前端一帧结果都看不到，
+        #   中途被终止/重启时几千帧的 VLM 结果全部丢失。现在每段推理完即随帧入库。）
+        joint_tags = {}
+        joint_meta = {}    # 段下标 -> 证据表（段内帧共享）
+        joint_groups = []
+        joint_member_of = {}   # 帧 -> 所属段下标
+        joint_done = set()     # 已推理过的段下标
+        joint_project_id = None
+        # 片段级打标要覆盖整段所有帧（含无检测目标的帧），否则那些帧拿不到片段标签
+        joint_targets = list(image_ids)
+        if joint_mode and joint_targets:
+            # 段长优先用前端「Clip帧数」，其次环境变量，默认 30（Clip 统一 30 帧）
+            _SEG = max(5, int(clip_size)) if int(clip_size or 0) >= 5 else max(
+                5, int(os.environ.get("AD_JOINT_SEG", "30")))
+            _PICK = max(2, int(os.environ.get("AD_JOINT_PICK", "6")))
+            try:
+                from db_service import get_project as _gpj
+                _dbg = get_db_session()
+                try:
+                    _pg = _gpj(_dbg, project)
+                    joint_groups = _group_frames_joint(
+                        _dbg, _pg.id, joint_targets, _SEG, _PICK) if _pg else []
+                    joint_project_id = _pg.id if _pg else None
+                finally:
+                    _dbg.close()
+                for _gi, _g in enumerate(joint_groups):
+                    for _iid in (_g.get("member_ids") or []):
+                        joint_member_of[_iid] = _gi
+                _log(f"[Pipeline] 片段级联合: {len(joint_targets)} 帧 -> {len(joint_groups)} 段"
+                     f"（每段≤{_SEG} 帧，段内取 {_PICK} 帧送模型；逐段推理、随帧落库）")
+            except Exception as _e:
+                _log(f"[Pipeline] 片段联合打标整体失败，退回逐帧模式: {_e}")
+                joint_groups = []
+                joint_member_of = {}
         for pos, img_id in enumerate(image_ids, 1):
             cancel_set, pause_set = _pipeline_cancel_signals()
             if job_pk in cancel_set:
@@ -4481,6 +5056,17 @@ def _ai_batch_worker(
                     break
             if job_pk in cancel_set:
                 continue
+            if joint_groups:
+                _gi = joint_member_of.get(img_id)
+                if _gi is not None and _gi not in joint_done:
+                    joint_done.add(_gi)   # 先登记再推理：同一段只推一次
+                    _tags2, _meta2 = _joint_infer_group(
+                        project, joint_project_id, joint_groups[_gi])
+                    joint_tags.update(_tags2)
+                    joint_meta[_gi] = _meta2          # 段级证据，随段共享
+                    if not _tags2:
+                        _log(f"[Pipeline] 段 {_gi + 1}/{len(joint_groups)} 未产出有效标签，"
+                             f"该段帧回退逐帧 VLM")
             asset, _ctx, adb = _find_db_asset(project, img_id)
             if adb is None or asset is None:
                 skipped.append(img_id)
@@ -4491,8 +5077,10 @@ def _ai_batch_worker(
                     skipped.append(img_id)
                     adb.close()
                     continue
-                if detect_first and detect_ok and img_id not in hit_ids:
+                if (detect_first and detect_ok and img_id not in hit_ids
+                        and img_id not in joint_tags):
                     # 无检测目标帧: 跳过 VLM(省算力), 直接免人工通过
+                    # 注意：若该帧属于某个已做片段级打标的片段，则不跳过（要用片段标签）
                     from db_service import update_asset_decision as _uad0
                     _uad0(
                         adb, asset.asset_id, "AUTO_PASS", "无检测目标(免VLM直通)", None
@@ -4500,23 +5088,43 @@ def _ai_batch_worker(
                     adb.commit()
                     processed_ok += 1
                     continue
-                output_text = _vlm_predict_text(Image.open(img_path).convert("RGB"))
+                _tag_meta = {}
+                if joint_mode and img_id in joint_tags:
+                    # 多帧联合模式：标签来自本组的多帧联合推理结果（组内共享），不再逐帧调用
+                    dim_tags = dict(joint_tags.get(img_id) or {})
+                    output_text = "joint" if dim_tags else ""
+                    # 段级证据（F1→FN）随段共享，直接挂到本帧
+                    _tag_meta = joint_meta.get(joint_member_of.get(img_id)) or {}
+                else:
+                    output_text = _vlm_predict_text(Image.open(img_path).convert("RGB"))
                 if not output_text:
                     failed.append(img_id)
                     continue
                 else:
-                    dim_tags = _parse_vlm_structured(output_text)
+                    if not (joint_mode and img_id in joint_tags):
+                        dim_tags = _parse_vlm_structured(output_text, _tag_meta)
                     model_name = vlm_loaded_name or VLM_MODEL_NAME
                     # VLM 的 objects 维弃用(以真实检测为准); 若帧无检测则保留 VLM objects 作兜底
                     if img_id in yolo_hits:
                         dim_tags.pop("objects", None)
-                    _merge_dim_tags_into_asset(asset, dim_tags, model_name)
+                    _merge_dim_tags_into_asset(asset, dim_tags, model_name, tag_meta=_tag_meta)
                     # ---- 检测融合: objects 维 = YOLO 真实检测(映射到标准目标类别) ----
                     if img_id in yolo_hits:
-                        objs = _detections_to_objects(asset.detections or {})
-                        if objs:
+                        _d2o = _detections_to_objects(asset.detections or {})
+                        _objs = [o for o in _d2o if (o.get("dim") or "objects") == "objects"]
+                        _signs = [o for o in _d2o if o.get("dim") == "traffic_sign"]
+                        if _objs or _signs:
                             ai = dict(asset.ai_tags or {})
-                            ai["objects"] = objs
+                            if _objs:
+                                ai["objects"] = _objs
+                            if _signs:
+                                # 交通标识信号：与 VLM 判出的标识合并去重
+                                _have = {t.get("tag") for t in (ai.get("traffic_sign") or []) if isinstance(t, dict)}
+                                _merged = list(ai.get("traffic_sign") or [])
+                                for _sg in _signs:
+                                    if _sg["tag"] not in _have:
+                                        _merged.append(_sg)
+                                ai["traffic_sign"] = _merged
                             asset.ai_tags = ai
                     evidence = _build_decision_evidence(asset)
                     decision = dec_engine.decide(evidence)
@@ -4567,7 +5175,13 @@ def _ai_batch_worker(
                     adb.close()
                 except Exception:
                     pass
-            _update_job_progress(job_pk, pos, total, f"VLM+融合决策 {pos}/{total}")
+            _update_job_progress(
+                job_pk,
+                pos,
+                total,
+                (f"片段联合打标+融合决策 {pos}/{total}"
+                 if joint_groups else f"VLM+融合决策 {pos}/{total}"),
+            )
         cancel_set, _ = _pipeline_cancel_signals()
         if job_pk in cancel_set:
             return
@@ -4695,29 +5309,64 @@ def _finish_job(pk: int, result=None):
 @app.post("/api/pipeline/run_ai_batch")
 def pipeline_run_ai_batch(
     project: str = Form("default"),
-    image_ids: str = Form(...),
+    image_ids: str = Form(None),
     preset: str = Form(None),
     detect_first: int = Form(0),
     dino_enhance: int = Form(0),
+    only_unprocessed: int = Form(1),
+    joint_frames: int = Form(1),
+    clip_size: int = Form(0),
 ):
     """创建批量 AI Pipeline 任务（VLM 结构化 → 维度标签 → Decision Engine 决策）。
 
-    image_ids 为逗号分隔的数字。返回 {job_id, status}，进度走 GET /api/pipeline/{job_id}。"""
+    image_ids 逗号分隔；**留空/传 all 表示整个项目**（由后端挑帧，前端不必再把全量 id 塞过来）。
+    only_unprocessed=1（默认）为增量：已有 ai_tags 的帧视为已处理直接跳过，
+    这样新入库的帧不会连带把老帧重跑一遍；勾选检测时，已标但没检测记录的帧仍会补跑。
+
+    clip_size 为 Clip 段长（帧），默认 30：前端「Clip帧数」传进来的就是它，
+    这样 Clip 链路与片段联合打标用同一个段长，不会一边 50 一边 30。
+    """
     from db_service import create_job
-    from models import JobType
-    # 解析 image_ids
-    ids = []
+    from models import JobType, Asset, AssetStatus
+    preset = preset if isinstance(preset, str) and preset else "balanced"
+    ids_in = []
     for s in str(image_ids or "").replace(" ", "").split(","):
         if s.isdigit():
-            ids.append(int(s))
-    if not ids:
-        return {"code": 400, "msg": "未解析到有效的 image_ids"}
-    preset = preset if isinstance(preset, str) and preset else "balanced"
+            ids_in.append(int(s))
+    whole_project = (not ids_in) or str(image_ids or "").strip().lower() == "all"
     db = get_db_session()
     try:
         proj = _ensure_db_project(db, project)
         if proj is None:
             return {"code": 500, "msg": "数据库未就绪"}
+        rows = db.query(Asset).filter(Asset.project_id == proj.id).all()
+        if not whole_project:
+            # 在内存里筛：指定 id 可能上千，SQL 的 IN(...) 参数有上限
+            want = set(ids_in)
+            rows = [a for a in rows if a.vector_id in want]
+        picked, skipped_tagged, redetect = [], 0, 0
+        for a in rows:
+            tagged = bool(a.ai_tags)
+            has_det = bool((a.detections or {}).get("yolo"))
+            if only_unprocessed and tagged and (has_det or not detect_first):
+                skipped_tagged += 1
+                continue
+            if only_unprocessed and tagged and detect_first and not has_det:
+                redetect += 1   # 已标但缺检测记录：本次补跑检测，仍计入任务
+            picked.append(a.vector_id)
+        ids = picked
+        if not ids:
+            return {
+                "code": 200,
+                "msg": "没有需要处理的帧：%d 帧都已跑过 AI 分析（如需重跑请取消勾选「增量」）" % skipped_tagged,
+                "job_id": None,
+                "skipped": skipped_tagged,
+                "pending": 0,
+            }
+        _log(
+            "[Pipeline] 选帧: 候选=%d 跳过已处理=%d 本次=%d (增量=%s 检测=%s)"
+            % (len(rows), skipped_tagged, len(ids), bool(only_unprocessed), bool(detect_first))
+        )
         # 创建 Job 记录
         job = create_job(
             db,
@@ -4728,6 +5377,7 @@ def pipeline_run_ai_batch(
                 "image_ids": ids,
                 "preset": preset,
                 "detect_first": bool(detect_first),
+                "clip_size": int(clip_size or 0),
                 "pipeline": "vlm->tags->decision",
             },
         )
@@ -4738,17 +5388,78 @@ def pipeline_run_ai_batch(
     # 后台线程执行（避免阻塞；uvicorn workers=1 下 threading 足够）
     t = threading.Thread(
         target=_ai_batch_worker,
-        args=(job_pk, project, ids, preset, bool(detect_first), bool(dino_enhance)),
+        args=(job_pk, project, ids, preset, bool(detect_first), bool(dino_enhance),
+              bool(joint_frames), int(clip_size or 0)),
         daemon=True,
     )
     t.start()
     _log(
         f"[Pipeline] 批量 AI 任务已创建 job_pk={job_pk} frames={len(ids)} project={project} preset={preset}"
     )
+    extra = "，跳过已处理 %d 帧" % skipped_tagged if skipped_tagged else ""
+    if redetect:
+        extra += "（其中 %d 帧已标但补跑检测）" % redetect
     return {
         "code": 200,
-        "msg": f"批量 AI Pipeline 已启动，共 {len(ids)} 帧",
+        "msg": f"批量 AI Pipeline 已启动，本次 {len(ids)} 帧{extra}",
         "job_id": str(job_pk),
+        "pending": len(ids),
+        "skipped": skipped_tagged,
+    }
+def _running_tag_jobs(project: str, job_pk: int = None) -> list:
+    """当前正在跑的 TAG 任务 id 列表（临时终止/暂停用）"""
+    from models import Job, JobType, JobStatus as _JS
+    db = get_db_session()
+    try:
+        if job_pk:
+            return [j.id for j in db.query(Job).filter(Job.id == int(job_pk)).all()]
+        q = db.query(Job).filter(
+            Job.status.in_([_JS.RUNNING, _JS.PENDING]), Job.job_type == JobType.TAG
+        )
+        proj = _ensure_db_project(db, project)
+        if proj is not None:
+            q = q.filter(Job.project_id == proj.id)
+        return [j.id for j in q.all()]
+    finally:
+        db.close()
+@app.post("/api/pipeline/cancel")
+def pipeline_cancel(project: str = Form("default"), job_pk: int = Form(None)):
+    """临时终止正在跑的 AI 批任务。
+
+    worker 逐帧检查取消信号，命中即把任务标为 CANCELLED 并保留进度
+    （"已中止于 N/M，剩余 K 帧未处理"）；已处理的帧全部落库，
+    重发时勾选「增量」即可从未处理的帧续跑，不会重跑已完成的。"""
+    ids = _running_tag_jobs(project, job_pk)
+    if not ids:
+        return {"code": 404, "msg": "当前没有正在运行的 AI 分析任务"}
+    with _pipeline_lock:
+        _ai_pipeline_pause.difference_update(ids)   # 暂停中的任务也要能被终止
+        _ai_pipeline_cancel.update(ids)
+    _log(f"[Pipeline] 收到临时终止信号 job={ids}")
+    return {
+        "code": 200,
+        "msg": "已发送终止信号（job %s）：当前帧处理完即停，进度保留，重发勾选「增量」可续跑" % ids,
+        "jobs": ids,
+    }
+@app.post("/api/pipeline/pause")
+def pipeline_pause(
+    project: str = Form("default"), job_pk: int = Form(None), resume: int = Form(0)
+):
+    """暂停 / 继续正在跑的 AI 批任务（帧间等待，不丢进度、不重载模型）"""
+    ids = _running_tag_jobs(project, job_pk)
+    if not ids:
+        return {"code": 404, "msg": "当前没有正在运行的 AI 分析任务"}
+    with _pipeline_lock:
+        if int(resume or 0):
+            _ai_pipeline_pause.difference_update(ids)
+        else:
+            _ai_pipeline_pause.update(ids)
+    _log(f"[Pipeline] {'继续' if int(resume or 0) else '暂停'} job={ids}")
+    return {
+        "code": 200,
+        "msg": ("已继续 job %s" if int(resume or 0) else "已暂停 job %s（帧间生效）") % ids,
+        "jobs": ids,
+        "paused": not int(resume or 0),
     }
 @app.get("/api/pipeline/list")
 def pipeline_list(
@@ -4774,6 +5485,7 @@ def pipeline_list(
         jobs = q.order_by(Job.created_at.desc()).limit(max(1, min(limit, 200))).all()
         out = []
         from db_service import get_project_by_id as _gp_id
+        _cancel_set, _pause_set = _pipeline_cancel_signals()
         for j in jobs:
             proj = _gp_id(db, j.project_id)
             out.append(
@@ -4785,6 +5497,7 @@ def pipeline_list(
                     "progress": j.progress,
                     "current_stage": j.current_stage,
                     "error": j.error,
+                    "paused": j.id in _pause_set,   # 前端据此显示"已暂停/继续"
                     "created_at": j.created_at.isoformat() if j.created_at else None,
                 }
             )
@@ -5030,6 +5743,65 @@ def benchmark_sample_add(
         }
     finally:
         db.close()
+@app.post("/api/benchmark/samples/import")
+def benchmark_samples_import(
+    project: str = Form("default"),
+    source: str = Form("reviewed"),
+    limit: int = Form(200),
+    split: str = Form("val"),
+):
+    """批量加入 Benchmark 样本（真值取自人工审核结果），省掉逐帧手填。
+
+    source:
+      reviewed — 人工审核过的帧（final_result.decided_by=human），GT = final_tags
+      modified — 人工改过标签的帧（human_tags 非空），GT = final_tags（人工优先覆盖后）
+      random   — 随机抽 N 帧，GT 留空待人工核对（评测时自动跳过未填真值的样本）
+
+    ⚠️ 诚实提醒：人工只点了"通过"、没改任何标签的帧，其真值就等于模型自己的输出，
+    拿它评测只会得到接近满分、没有参考意义 —— 真值要来自人工的独立判断（改过/重标/外部标注）。
+    """
+    import random as _random
+    from models import Asset
+    from db_service import add_benchmark_sample, get_benchmark_samples
+    db = get_db_session()
+    try:
+        proj = _ensure_db_project(db, project)
+        if proj is None:
+            return {"code": 500, "msg": "数据库未就绪"}
+        src = (source or "reviewed").lower()
+        if src not in ("reviewed", "modified", "random"):
+            return {"code": 400, "msg": f"未知来源: {src}（可选 reviewed/modified/random）"}
+        existing = {s.asset_id for s in get_benchmark_samples(db, proj.id)}
+        picked = []
+        for a in db.query(Asset).filter(Asset.project_id == proj.id).all():
+            if a.asset_id in existing:
+                continue
+            if src == "modified":
+                if not (a.human_tags and any((a.human_tags or {}).values())):
+                    continue
+            elif src == "reviewed":
+                if str((a.final_result or {}).get("decided_by") or "") != "human":
+                    continue
+            picked.append(a)
+        if src == "random":
+            _random.shuffle(picked)
+        picked = picked[: max(1, min(int(limit or 200), 5000))]
+        for a in picked:
+            gt = {} if src == "random" else dict(a.final_tags or {})
+            add_benchmark_sample(db, proj.id, a.asset_id, gt, split or "val")
+        db.commit()
+        label = {"reviewed": "人工审核过的帧", "modified": "人工改过标签的帧",
+                 "random": "随机抽样（待填真值）"}[src]
+        return {
+            "code": 200,
+            "added": len(picked),
+            "source": src,
+            "split": split,
+            "msg": f"已从「{label}」导入 {len(picked)} 个样本"
+            + ("（真值留空，请在样本清单里补齐后再评测）" if src == "random" else "（真值取自标签）"),
+        }
+    finally:
+        db.close()
 @app.get("/api/benchmark/samples")
 def benchmark_samples(project: str = Query("default")):
     """列出 Benchmark 样本（含 asset 缩略信息与 GT）"""
@@ -5111,7 +5883,11 @@ def benchmark_evaluate(project: str = Form("default"), combo: str = Form(None)):
         per_asset = []
         detailed = []
         missing = 0
+        no_gt = 0
         for s in samples:
+            if not (s.gt_tags or {}):
+                no_gt += 1          # 真值留空的样本（随机抽样待标注）不参与评测，避免把 P/R 拉成 0
+                continue
             asset = db.query(Asset).filter(Asset.asset_id == s.asset_id).first()
             if asset is None:
                 missing += 1
@@ -5127,6 +5903,13 @@ def benchmark_evaluate(project: str = Form("default"), combo: str = Form(None)):
                     "sources": src_map,
                 }
             )
+        if not per_asset:
+            return {
+                "code": 400,
+                "msg": "%d 个样本没有可用真值（跳过 %d 个真值留空的，缺失资产 %d 个），无法评测。"
+                       "请在样本清单里补齐真值，或点「导入人工审核结果」" % (len(samples), no_gt, missing),
+                "skipped_no_gt": no_gt,
+            }
         agg = aggregate_evaluations(per_asset)
         # combo 过滤
         combo = (combo or "all").lower()
@@ -5145,6 +5928,7 @@ def benchmark_evaluate(project: str = Form("default"), combo: str = Form(None)):
             "sample_count": len(samples),
             "evaluated_count": len(per_asset),
             "missing_asset": missing,
+            "skipped_no_gt": no_gt,
             "results": agg,  # {source: {samples, macro, per_dim}}
             "per_sample": detailed,
         }
@@ -5490,6 +6274,7 @@ def ontology_list(project: str = Query("default")):
     from ontology import dimensions as _dims
     D = _dims()
     order = [
+        ("traffic_sign", "交通标识信号"),
         ("vehicle", "车型"),
         ("resolution", "分辨率"),
         ("time", "时间"),
@@ -5581,7 +6366,8 @@ def ontology_candidates(project: str = Query("default"), dim: str = Query(None))
     dims = _dims()
     dismissed = dismissed_map()      # 已"放弃使用"的词不再提示
     # 排序优先级：事件/场景最高（平台首要关注），其次是明细表那 8 个字段，其余维度最后
-    show = ["vehicle", "resolution", "time", "weather", "road", "objects", "events", "scene"]
+    show = ["vehicle", "resolution", "time", "weather", "road", "objects", "events",
+            "traffic_sign", "scene"]
     def _prio(dim):
         if dim == "events":
             return 0
@@ -5740,18 +6526,31 @@ def search_fusion(
     # ---- 1) 语义检索（SigLIP 可用时；否则该路返回空）----
     sem_scores = {}  # vector_id -> float
     sem_ok = False
+    sem_note = ""
     try:
+        # SigLIP 可能被 VLM 任务卸载。这里补上按需重载（原来只有文本/以图搜图两个接口调了
+        # _ensure_siglip，融合搜索漏了 -> VLM 跑过之后融合搜索静默返回 0 条）。
+        # 但"重载"会腾显存把正在跑的 VLM 挤掉，任务会反复重载 -> 有任务在跑时只降级不抢显存。
+        if not LITE_MODE and query.strip() and siglip_model is None:
+            if _running_tag_jobs(project):
+                sem_note = "语义引擎暂不可用：AI 分析任务正在运行（避免抢显存中断任务），本次仅按标签检索"
+                _log("[搜索] " + sem_note)
+            else:
+                _ensure_siglip()
         if not LITE_MODE and siglip_model is not None and query.strip():
             ctx = load_project_context(project)
             idx = ctx["index"]
             if idx is not None and idx.ntotal > 0:
-                inputs = siglip_processor(
-                    text=[query],
-                    return_tensors="pt",
-                    padding="max_length",
-                    max_length=64,
-                ).to(DEVICE)
-                with torch.no_grad():
+                with _gpu_slot("SigLIP 语义检索"), torch.no_grad():
+                    if siglip_model is None or siglip_processor is None:
+                        # 排队期间被别的 AI 任务卸了：本轮只按标签检索（由外层 except 收口）
+                        raise RuntimeError("SigLIP 已被其它 AI 任务卸载（显存互斥）")
+                    inputs = siglip_processor(
+                        text=[query],
+                        return_tensors="pt",
+                        padding="max_length",
+                        max_length=64,
+                    ).to(DEVICE)
                     if DEVICE == "cuda":
                         with torch.cuda.amp.autocast():
                             tf = siglip_model.get_text_features(**inputs)
@@ -5765,6 +6564,8 @@ def search_fusion(
                 sem_ok = True
     except Exception as e:
         _log(f"[搜索] 语义检索降级: {e}")
+        if not sem_note:
+            sem_note = "语义检索本轮降级（显存被其它 AI 任务占用），结果仅按标签匹配"
     # ---- 2) Tag / 结构化过滤（DB 侧，final/ai 双匹配）----
     tag_hits = set()
     from db_service import search_assets_by_tags, get_project
@@ -5869,12 +6670,122 @@ def search_fusion(
                     "tag_hit": r["tag_hit"],
                 }
             )
+    # ---- 按"片段"聚合结果 ----
+    # 打标是"每 50 个抽样帧一段、一份标签"，搜索也应以段为单位给出，
+    # 否则同一段的 50 帧会重复出现 50 次（标签完全相同，没有信息量）。
+    # 分段由后端按各视频的帧顺序现算（同一视频按时间戳排序后每 SEG 帧一段），
+    # 与打标时的切段口径一致，不需要重跑打标。
+    _SEG = max(5, int(os.environ.get("AD_JOINT_SEG", "30")))
+    _seg_of, _frames_of, _by_video = {}, {}, {}
+    _clip_rows = []          # 没有源视频的帧（Clip 链路抽出的图）：按文件名恢复成段
+    for _m in meta:
+        _vs = _m.get("video_source") or {}
+        _vp = _vs.get("video_path") if isinstance(_vs, dict) else None
+        if _vp:
+            _by_video.setdefault(_vp, []).append((_vs.get("timestamp") or 0, _m.get("id")))
+            continue
+        _parts = _clip_name_parts(_m.get("path") or _m.get("filename") or "")
+        if _parts and isinstance(_m.get("id"), int):
+            # 载荷就是帧 id（这里只需要段内顺序 + id）
+            _clip_rows.append((_parts[0], _parts[1], _parts[2], _m.get("id")))
+    for _vp, _lst in _by_video.items():
+        _lst.sort(key=lambda x: (x[0], x[1] if x[1] is not None else 0))
+        for _si, _seg in enumerate(_seg_chunks([x[1] for x in _lst], _SEG)):
+            _k = (_vp, _si)
+            for _vid in _seg:
+                _seg_of[_vid] = _k
+            _frames_of[_k] = list(_seg)
+    # Clip 链路的帧同样每 _SEG 帧一段：以前这里直接 continue 丢掉，导致这些帧在
+    # "按片段给结果"的搜索里彻底不可见（CLIP测试 实测 40 个命中被丢掉 31 个）。
+    for _ck, _run in _split_clip_runs(_clip_rows):
+        _tag, _run_i = _ck
+        _label = ("Clip " + _tag) if _run_i == 0 else "Clip %s·%d" % (_tag, _run_i + 1)
+        # _run 里存的就是帧 id（这一步的行载荷），按文件名恢复出来的顺序已排好
+        for _si, _seg in enumerate(_seg_chunks(list(_run), _SEG)):
+            _k = (_label, _si)
+            for _vid in _seg:
+                _seg_of[_vid] = _k
+            _frames_of[_k] = list(_seg)
+    _grouped, _order = {}, []
+    _no_video = 0
+    for _it in items:
+        _vid = _it.get("id")
+        _k = _seg_of.get(_vid)
+        if _k is None:
+            # 图片直导帧（没有源视频）无法组成 Clip：融合语义搜索按"片段"给结果，
+            # 这类帧就不展示了（否则会冒出一条"单帧"结果）。要看单图去图集/明细表。
+            _no_video += 1
+            continue
+        _g = _grouped.get(_k)
+        if _g is None:
+            _g = _grouped[_k] = dict(_it)
+            _g["segment"] = {"video": os.path.basename(_k[0]) if _k[0] else "",
+                             "index": _k[1] if isinstance(_k[1], int) else 0,
+                             "frame_count": len(_frames_of.get(_k) or [_vid]),
+                             "frame_ids": list(_frames_of.get(_k) or [_vid])}
+            _g["_best"] = _it.get("score") or 0
+            _order.append(_k)
+        else:
+            _sc = _it.get("score") or 0
+            if _sc > _g["_best"]:           # 段的分值取段内最高，代表帧也换成这一帧
+                _g["_best"] = _sc
+                for _f in ("id", "filename", "image_url", "path", "score", "semantic_score",
+                           "tag_hit", "video_path", "timestamp"):
+                    if _f in _it:
+                        _g[_f] = _it.get(_f)
+    if meta and _no_video and not _order:
+        items = []          # 结果全是图片直导帧（无源视频）-> 按片段的搜索不展示
+    if _order:
+        _segs = []
+        for _k in _order:
+            _g = _grouped[_k]
+            _g.pop("_best", None)
+            # 代表帧取段内中间那帧（比首帧更能代表整段）
+            _fids = _g["segment"]["frame_ids"]
+            if _fids:
+                _g["id"] = _fids[len(_fids) // 2]
+                _g["image_url"] = "/api/image/%s/%s" % (project, _g["id"])
+                _mm = next((m for m in meta if m.get("id") == _g["id"]), None)
+                if _mm is not None:
+                    for _f in ("filename", "path", "video_source", "timestamp", "video_path"):
+                        if _mm.get(_f) is not None:
+                            _g[_f] = _mm.get(_f)
+            _segs.append(_g)
+        _segs.sort(key=lambda x: -(x.get("score") or 0))
+        items = _segs
+    # 每段附上综合标签（代表帧那帧的 ai_tags）：点开 Clip 连播时前端在右下角显示，
+    # 用来核对"标签是不是真的对得上画面"。原来只有图片和分值，看不到依据。
+    if items:
+        for _it in items:
+            _it.setdefault("tags", {})
+        try:
+            from models import Asset as _As
+            _ids = [it.get("id") for it in items if isinstance(it.get("id"), int)][:1000]
+            if _ids:
+                _dbt = get_db_session()
+                try:
+                    _pt = _ensure_db_project(_dbt, project)
+                    _tagmap = {}
+                    if _pt is not None:
+                        for _a in _dbt.query(_As).filter(
+                                _As.project_id == _pt.id, _As.vector_id.in_(_ids)).all():
+                            _tagmap[_a.vector_id] = _a.ai_tags or {}
+                    for _it in items:
+                        _it["tags"] = _tagmap.get(_it.get("id")) or {}
+                finally:
+                    _dbt.close()
+        except Exception as _e:
+            _log(f"[搜索] 附加片段标签失败(不影响搜索本身): {_e}")
     return {
         "code": 200,
         "query": query,
+        "matched_frames": len(union),
+        "segment_count": len(items),
+        "hidden_no_video": _no_video,     # 被隐藏的图片直导帧数（无源视频，组不成 Clip）
         "tag_conditions": tag_conditions,
         "meta_conditions": meta_conds,
         "semantic_engine": sem_ok,
+        "semantic_note": sem_note,
         "semantic_total": len(sem_scores),
         "tag_hit_total": len(tag_hits),
         "total": len(items),
@@ -6267,7 +7178,7 @@ except Exception:  # 缺 torch 等依赖时进入轻量模式，避免整个应�
     build_clips_from_metadata = load_clips = save_clips = update_clip_result = set_clip_decision = None
     predict_clip = None
 @app.post("/api/clips/scan")
-def clips_scan(project: str = Form("default"), clip_size: int = Form(50)):
+def clips_scan(project: str = Form("default"), clip_size: int = Form(30)):
     """扫描底库，把视频抽出的帧分组成 Clip 并持久化到 clips.json"""
     if build_clips_from_metadata is None:
         return {"code": 500, "msg": "Clip 模块不可用（依赖缺失，服务处于轻量模式）"}
@@ -6315,16 +7226,15 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
     clip = next((c for c in clips if c["clip_id"] == clip_id), None)
     if not clip:
         return {"code": 404, "msg": "Clip不存在，请先 POST /api/clips/scan"}
-    # 复用现有VLM互斥加载逻辑
-    _free_dino(); _free_yolo()
-    if vlm_model is None:
-        try:
-            with _GPU_MODEL_LOCK:
-                init_vlm_local()
-        except Exception as e:
-            return {"code": 500, "msg": f"VLM加载失败: {e}"}
+    # 加载与推理放在同一个 GPU 闸门内：12G 卡上模型不能共存，
+    # 也避免"加载完->释放锁->被别人卸掉"这种空窗（原来分两段加锁就有这个缝）
     try:
-        with _GPU_MODEL_LOCK:   # 推理期间不允许别的请求把模型卸掉
+        with _gpu_slot("Clip VLM 判定"):
+            _free_dino(); _free_yolo()
+            if vlm_model is None:
+                init_vlm_local()
+            if vlm_model is None:
+                return {"code": 500, "msg": "VLM 加载失败（显存不足或权重缺失）"}
             result, raw = predict_clip(vlm_model, vlm_processor, clip["frame_paths"])
     except Exception as e:
         # 只记错误不落 decision：异常多为环境/依赖问题，保持可重试，别把 Clip 永久标成需人工
@@ -6334,11 +7244,12 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
         _emsg = str(e).lower()
         if "out of memory" in _emsg or isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ())):
             try:
-                torch.cuda.empty_cache()
+                with _gpu_slot("Clip OOM 清理"):   # 清理也要排队，别在别人推理时抽显存
+                    torch.cuda.empty_cache()
+                    _free_vlm()
+                _vram_log("OOM 后已卸载 VLM")
             except Exception:
                 pass
-            _free_vlm()
-            _vram_log("OOM 后已卸载 VLM")
             _log(f"[Clip] VLM 推理 OOM，已卸载 VLM 释放显存；下次调用会重新加载")
         update_clip_result(ctx, clip_id, {"error": str(e)})
         return {"code": 500, "msg": f"VLM推理失败: {e}"}
@@ -6394,6 +7305,213 @@ def clips_video_summary(project: str = Query("default")):
                 v["objects"][t] = v["objects"].get(t, 0) + 1
     videos = sorted(by_video.values(), key=lambda x: (-x["clips"], x["video_name"]))
     return {"code": 200, "total_videos": len(videos), "total_clips": len(clips), "videos": videos}
+# ============================================================
+# ===== 单帧上下文回放：回到原始视频，取该帧前后连续画面（不抽稀）=====
+# 抽帧是 1:N 稀疏的，搜索命中的帧之间隔着好几帧，连起来看不出运动；
+# 这里按帧的原始帧号回原始视频解出前后 span 帧，前端按真实帧率播放。
+# ============================================================
+_FRAME_CACHE = os.path.join(PROJECT_DIR, "_frame_cache")
+def _prune_frame_cache(keep: int = 40):
+    """缓存目录只保留最近若干段，避免越积越多（原帧 jpg 每帧约 200KB）"""
+    try:
+        ds = [os.path.join(_FRAME_CACHE, d) for d in os.listdir(_FRAME_CACHE)]
+        ds = [d for d in ds if os.path.isdir(d)]
+        if len(ds) <= keep:
+            return
+        ds.sort(key=lambda d: os.path.getmtime(d))
+        for d in ds[:-keep]:
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+@app.get("/api/video_window")
+def video_window(
+    project: str = Query("default"),
+    image_id: int = Query(...),
+    span: int = Query(30),
+    id_b: int = Query(None),
+    max_side: int = Query(1280),
+):
+    """取【原始视频】里的连续画面，供前端带完整控制的播放器播放。
+
+    - 只给 image_id：取它前后 span 帧（单帧上下文回放）；
+    - 给 image_id + id_b：取这两帧之间（一段 clip 的完整原始画面）；
+    返回 {urls, fps, start_frame, center_frame, count}；帧按需解到磁盘缓存。"""
+    if cv2 is None:
+        return {"code": 400, "msg": "服务器未安装 opencv-python"}
+    asset, _c, db = _find_db_asset(project, image_id)
+    if db is None:
+        return {"code": 500, "msg": "数据库未就绪"}
+    try:
+        if asset is None:
+            return {"code": 404, "msg": "帧不存在"}
+        vs = (asset.asset_metadata or {}).get("video_source") or {}
+        vpath, fidx = vs.get("video_path"), vs.get("frame_index")
+        if not vpath or fidx is None:
+            return {"code": 400, "msg": "该帧不是视频抽帧（没有原始视频信息），无法回看原帧"}
+        if not os.path.exists(vpath):
+            return {"code": 400, "msg": "原始视频不可访问: " + str(vpath)}
+        # 段范围模式：id_b 与 id_a 同属一个视频时，取两帧之间的完整画面
+        f_end = None
+        if id_b is not None:
+            try:
+                a2, _c2, _db2 = _find_db_asset(project, id_b)
+                try:
+                    vs2 = ((a2.asset_metadata or {}).get("video_source") or {}) if a2 is not None else {}
+                    if vs2.get("video_path") == vpath and vs2.get("frame_index") is not None:
+                        f_end = int(vs2["frame_index"])
+                finally:
+                    if _db2 is not None:
+                        _db2.close()
+            except Exception:
+                f_end = None
+        if f_end is not None:
+            start = max(0, min(int(fidx), f_end))
+            span = max(2, min(abs(int(fidx) - f_end) + 1, 900))
+        else:
+            span = max(10, min(int(span or 30), 400))
+            start = max(0, int(fidx) - span // 2)
+        max_side = max(320, min(int(max_side or 1280), 1920))
+        base = re.sub(r"[^0-9A-Za-z_\-]", "_", os.path.splitext(os.path.basename(vpath))[0])[-40:]
+        key = "%s_%d_%d_%d" % (base, start, span, max_side)
+        cdir = os.path.join(_FRAME_CACHE, key)
+        os.makedirs(cdir, exist_ok=True)
+        fps = 15.0
+        stamp = os.path.join(cdir, "done.txt")
+        if not os.path.exists(stamp):
+            cap = cv2.VideoCapture(vpath)
+            if not cap.isOpened():
+                return {"code": 500, "msg": "原始视频无法打开"}
+            try:
+                _f = cap.get(cv2.CAP_PROP_FPS)
+                if _f and _f > 0:
+                    fps = float(_f)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+                for i in range(span):
+                    ok, fr = cap.read()
+                    if not ok or fr is None:
+                        break
+                    try:
+                        _h, _w = fr.shape[:2]
+                        _mx = max(_h, _w)
+                        if _mx > max_side:
+                            _sc = max_side / float(_mx)
+                            fr = cv2.resize(fr, (int(_w * _sc), int(_h * _sc)),
+                                            interpolation=cv2.INTER_AREA)
+                    except Exception:
+                        pass
+                    cv2.imwrite(os.path.join(cdir, "%05d.jpg" % i), fr,
+                                [cv2.IMWRITE_JPEG_QUALITY, 85])
+            finally:
+                cap.release()
+            try:
+                with open(stamp, "w", encoding="utf-8") as f2:
+                    f2.write(str(fps))
+            except Exception:
+                pass
+            _prune_frame_cache()
+        else:
+            try:
+                fps = float(open(stamp, encoding="utf-8").read().strip() or fps)
+            except Exception:
+                pass
+        files = sorted(x for x in os.listdir(cdir) if x.endswith(".jpg"))
+        return {
+            "code": 200,
+            "video": os.path.basename(vpath),
+            "fps": round(fps, 2),
+            "start_frame": start,
+            "count": len(files),
+            "center_frame": int(fidx),
+            "urls": ["/api/frame_cache/%s/%s" % (key, x) for x in files],
+        }
+    finally:
+        db.close()
+@app.get("/api/video_clip")
+def video_clip(
+    project: str = Query("default"),
+    id_a: int = Query(...),
+    id_b: int = Query(None),
+    max_frames: int = Query(600),
+):
+    """把原始视频里某一段（两帧之间的连续画面）以 MJPEG 流推给前端 —— 就是"播这一段的视频"。
+
+    为什么这么做：抽帧是 1:5 稀疏的，把抽出来的帧一张张切着放会一跳一跳，不像视频；
+    这里直接解原始视频的连续帧、按视频真实帧率推流。用 MJPEG 是因为源文件是 AVI
+    （浏览器认不了），而服务器上没有 ffmpeg 可转码——MJPEG 浏览器原生支持。
+    id_a/id_b 给段内首尾两帧，窗口就正好是这一段；只给 id_a 则默认取前后 50 帧。"""
+    from fastapi.responses import StreamingResponse
+    if cv2 is None:
+        return JSONResponse(status_code=400, content={"msg": "服务器未安装 opencv-python"})
+    a1, _c, db = _find_db_asset(project, id_a)
+    if db is None:
+        return JSONResponse(status_code=500, content={"msg": "数据库未就绪"})
+    try:
+        if a1 is None:
+            return JSONResponse(status_code=404, content={"msg": "帧不存在"})
+        vs = (a1.asset_metadata or {}).get("video_source") or {}
+        vpath, f1 = vs.get("video_path"), vs.get("frame_index")
+        if not vpath or f1 is None:
+            return JSONResponse(status_code=400, content={"msg": "该帧不是视频抽帧，无法回原始视频"})
+        if not os.path.exists(vpath):
+            return JSONResponse(status_code=400, content={"msg": "原始视频不可访问: " + str(vpath)})
+        f1 = int(f1)
+        f2 = None
+        if id_b is not None:
+            a2, _c2, _db2 = _find_db_asset(project, id_b)
+            try:
+                vs2 = ((a2.asset_metadata or {}).get("video_source") or {}) if a2 is not None else {}
+                if vs2.get("video_path") == vpath and vs2.get("frame_index") is not None:
+                    f2 = int(vs2["frame_index"])
+            finally:
+                if _db2 is not None:
+                    _db2.close()
+        if f2 is None:
+            f2 = f1 + 50
+        start, end = min(f1, f2), max(f1, f2)
+        n = max(1, min(int(max_frames), end - start + 1))
+        _vp = vpath
+
+        def _gen():
+            cap = cv2.VideoCapture(_vp)
+            if not cap.isOpened():
+                return
+            try:
+                _fps = cap.get(cv2.CAP_PROP_FPS)
+                if not _fps or _fps <= 0:
+                    _fps = 15.0
+                _delay = 1.0 / float(_fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+                for _i in range(n):
+                    ok, fr = cap.read()
+                    if not ok or fr is None:
+                        break
+                    ok2, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 82])
+                    if not ok2:
+                        continue
+                    data = buf.tobytes()
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                           + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+                    time.sleep(_delay)
+            finally:
+                cap.release()
+
+        _log(f"[回放] 原视频片段推流 {os.path.basename(_vp)} 帧 {start}~{start + n - 1}")
+        return StreamingResponse(
+            _gen(), media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
+    finally:
+        db.close()
+@app.get("/api/frame_cache/{key}/{name}")
+def frame_cache_get(key: str, name: str):
+    """回看原帧的图片服务（限定在缓存目录内，防目录穿越）"""
+    if ("/" in key or ".." in key or "/" in name or ".." in name
+            or not name.lower().endswith(".jpg")):
+        return JSONResponse(status_code=400, content={"msg": "非法路径"})
+    pth = os.path.join(_FRAME_CACHE, key, name)
+    if not os.path.isfile(pth):
+        return JSONResponse(status_code=404, content={"msg": "不存在"})
+    return FileResponse(pth, media_type="image/jpeg")
 @app.get("/api/clips/stats")
 def clips_stats(project: str = Query("default")):
     """Clip 判定结果汇总：各决策计数 + 场景/事件标签聚合（供审核中心可视化）"""
@@ -6442,7 +7560,7 @@ if __name__ == "__main__":
     _log(f"服务启动 http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, workers=1, access_log=False)
 @app.post("/api/prune_missing")
-def prune_missing(project: str = Form("default")):
+def prune_missing(project: str = Form("default"), confirm: str = Form(None)):
     """清理失效资产(手动删除图片后残留的黑片记录)：以磁盘文件为唯一真相——
     文件已不存在的资产连带删除(DB 资产+检测缓存+推理缓存+审核+HardCase+孤儿Source+metadata 索引项)。
     红线：本端点只清数据库/索引记录，绝不删除磁盘/网盘任何文件。"""
@@ -6469,7 +7587,46 @@ def prune_missing(project: str = Form("default")):
                 for a in assets
                 if a.image_path and not _os.path.exists(a.image_path)
             ]
+            _total_a = len(assets)
+            _ratio = (len(miss_bn) / float(_total_a)) if _total_a else 0.0
+            # 安全闸：缺失比例过高时先要一次显式确认。
+            # 防的是"网盘没挂载 / 路径变了"这种情形——那时所有文件都判为缺失，
+            # 一键下去会把整个库的记录（含标签/审核/评测）全删掉。
+            if _ratio >= 0.3 and str(confirm or "") != "1":
+                _log(f"[清理] 缺失比例 {len(miss_bn)}/{_total_a}，等待确认")
+                return {
+                    "code": 409,
+                    "need_confirm": True,
+                    "missing": len(miss_bn),
+                    "total": _total_a,
+                    "msg": "检测到 %d/%d 帧（%.0f%%）的文件已不存在。\n\n"
+                           "继续将【连带删除】这些资产的标签、审核记录、评测记录与索引项"
+                           "（只删数据库记录，绝不删磁盘文件）。\n\n"
+                           "如果这是你有意删除的图片，可以继续；"
+                           "如果是网盘未挂载/路径变动导致的，请先恢复挂载再操作。"
+                           % (len(miss_bn), _total_a, _ratio * 100),
+                }
             if miss_bn:
+                # 清理前自动备份数据库（网络盘/本地盘各留一份，成本几 MB）
+                try:
+                    # 用 SQLite 官方备份接口：直接 copyfile 一个开着 WAL 的库，
+                    # 可能拷到撕裂的中间状态（曾侥幸拷出一份 integrity ok 的）。
+                    import sqlite3 as _sq3
+                    _bkdir = os.path.join(PROJECT_DIR, "_db_backups")
+                    _os.makedirs(_bkdir, exist_ok=True)
+                    _bk = os.path.join(
+                        _bkdir, "mining_%s.db" % time.strftime("%Y%m%d_%H%M%S"))
+                    _src = _sq3.connect(os.path.join(PROJECT_DIR, "workspace", "mining.db"))
+                    _dst = _sq3.connect(_bk)
+                    try:
+                        with _dst:
+                            _src.backup(_dst)
+                    finally:
+                        _src.close()
+                        _dst.close()
+                    _log(f"[清理] 已备份数据库(SQLite备份接口): {_bk}")
+                except Exception as _e:
+                    _log(f"[清理] 数据库备份失败(继续清理): {_e}")
                 r1 = delete_assets_by_filenames(db, proj.id, miss_bn)
                 db_removed = r1["assets"]
                 src_removed = r1["sources"]

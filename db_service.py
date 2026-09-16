@@ -1162,19 +1162,35 @@ def delete_assets_by_filenames(db, project_id: int, basenames) -> dict:
     if not basenames:
         return {"assets": 0, "sources": 0}
     basenames = [b for b in basenames if b]
-    conds = []
-    for b in basenames:
-        conds.append(Asset.image_path == b)
-        conds.append(Asset.image_path.like("%/" + b))
-    assets = db.query(Asset).filter(Asset.project_id == project_id, or_(*conds)).all()
+    if not basenames:
+        return {"assets": 0, "sources": 0}
+    # 分批查：每个文件名产生 2 个条件，一次拼上万条会触发
+    # sqlite3.OperationalError: Expression tree is too large (maximum depth 1000)
+    # （曾导致 /api/prune_missing 直接 500）
+    BATCH = 300
+    found, seen_ids = [], set()
+    for i in range(0, len(basenames), BATCH):
+        chunk = basenames[i:i + BATCH]
+        conds = []
+        for b in chunk:
+            conds.append(Asset.image_path == b)
+            conds.append(Asset.image_path.like("%/" + b))
+        for a in db.query(Asset).filter(Asset.project_id == project_id, or_(*conds)).all():
+            if a.id not in seen_ids:
+                seen_ids.add(a.id)
+                found.append(a)
+    assets = found
     if not assets:
         return {"assets": 0, "sources": 0}
     asset_ids = [a.id for a in assets]
     src_ids = {a.source_id for a in assets if a.source_id}
-    for cls in (Frame, DetectionCache, InferenceCache, HardCase, ReviewRecord):
-        if hasattr(cls, "asset_id"):
-            db.query(cls).filter(cls.asset_id.in_(asset_ids)).delete(synchronize_session=False)
-    db.query(Asset).filter(Asset.id.in_(asset_ids)).delete(synchronize_session=False)
+    # 主键删除同样分批：SQLite 的 in_() 参数个数也有上限
+    for i in range(0, len(asset_ids), 800):
+        ids = asset_ids[i:i + 800]
+        for cls in (Frame, DetectionCache, InferenceCache, HardCase, ReviewRecord):
+            if hasattr(cls, "asset_id"):
+                db.query(cls).filter(cls.asset_id.in_(ids)).delete(synchronize_session=False)
+        db.query(Asset).filter(Asset.id.in_(ids)).delete(synchronize_session=False)
     rm_src = 0
     for sid in src_ids:
         if not db.query(Asset).filter(Asset.source_id == sid).first():

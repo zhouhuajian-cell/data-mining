@@ -282,6 +282,9 @@
         .audit-stat .v { font-size: 20px; font-weight: 800; color: var(--primary); }
         .audit-detail { flex: 1; min-width: 380px; }
         .audit-detail img.main { width: 100%; max-height: 340px; object-fit: contain; background: #000; border-radius: var(--radius-md); border: 1px solid var(--border); }
+        /* 可放大的图片统一给 zoom-in 光标（放大动作由全局委托 imgZoomLayer 接管） */
+        #auditPanel img, #hardCasePanel img, #benchmarkPanel img, #dataAssetPanel img,
+        #fusionSearchPanel img, #assetTablePanel img, #demandPanel img { cursor: zoom-in; }
         .audit-tag-group { margin: 10px 0 4px; }
         .audit-tag-group .dim { font-size: 12px; color: var(--text-muted); margin-right: 8px; font-weight: 700; min-width: 52px; display: inline-block; }
         .audit-chip { display: inline-block; margin: 2px 6px 2px 0; padding: 3px 10px; border-radius: 20px; font-size: 12px; background: rgba(0,212,255,0.12); border: 1px solid rgba(0,212,255,0.4); color: var(--text-main); }
@@ -437,7 +440,7 @@
                     数据审核 <span id="auditProjectTag" style="color: var(--primary); font-size: 13px;"></span>
                     <span style="flex:1;"></span>
                     <button class="secondary" onclick="auditRefresh()" style="padding:4px 12px; font-size:12px;">刷新队列</button>
-                    <button class="secondary" onclick="auditRunBatch()" style="padding:4px 12px; font-size:12px;" title="一键跑完两段：① 全部已入库帧的 AI检测(融合YOLO/DINO)+场景分析+自动决策；② 帧组成 Clip 后逐片段 VLM 场景判定">AI场景分析</button><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiFuseDetect" checked> 融合YOLO检测</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiDinoEnhance"> 增强DINO开放词</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="② 段：每 N 帧组成一个 Clip 做 VLM 判定">Clip帧数 <input type="number" id="clipSizeInput" value="50" min="5" step="5" style="width:58px; padding:2px 4px;"></label>
+                    <button class="secondary" onclick="auditRunBatch()" style="padding:4px 12px; font-size:12px;" title="一键跑完两段：① 全部已入库帧的 AI检测(融合YOLO/DINO)+场景分析+自动决策；② 帧组成 Clip 后逐片段 VLM 场景判定">AI场景分析</button><button class="secondary" id="aiPauseBtn" onclick="aiTogglePause()" style="padding:4px 10px; font-size:12px; margin-left:6px;" title="暂停当前 AI 任务：帧间生效，不丢进度、不重载模型，点一下继续">暂停</button><button class="secondary" onclick="aiCancelBatch()" style="padding:4px 10px; font-size:12px; margin-left:4px; color:var(--danger); border-color:rgba(239,68,68,0.5);" title="临时终止当前 AI 任务：当前帧处理完即停，已处理的帧全部保留，重发时勾选「增量」即可续跑">终止</button><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiOnlyNew" checked> 增量（跳过已跑过的帧）</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="勾选=只跑还没做 AI 分析的帧（新入库的帧）；取消=全部重跑（改了提示词/本体后需要）"><input type="checkbox" id="aiFuseDetect" checked> 融合YOLO检测</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiDinoEnhance"> 增强DINO开放词</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="② 段：每 N 帧组成一个 Clip 做 VLM 判定">Clip帧数 <input type="number" id="clipSizeInput" value="30" min="5" step="5" style="width:58px; padding:2px 4px;"></label>
                     </div>
 <div id="aiJobProg" style="display:none; margin-top:10px; padding:8px 12px; background:rgba(0,0,0,0.25); border:1px solid rgba(245,158,11,.4); border-radius:8px;">
                         <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:5px;">
@@ -495,7 +498,17 @@
                             <label style="font-size:12px;">split
                                 <select id="bmSplit" style="padding:6px;"><option>val</option><option>test</option><option>train</option></select>
                             </label>
-                        </div><textarea id="bmGtInput" rows="3" spellcheck="false" style="width:100%; margin-top:6px; font-family:monospace; font-size:12px; background:rgba(0,0,0,0.5); color:var(--text-main); border:1px solid var(--border); border-radius:6px; padding:6px;">{"weather":["雨天"],"road":["城市道路"],"time":["夜晚"],"objects":["行人"],"events":["行人横穿"],"risk":["中风险"]}</textarea>                        <div class="audit-actions" style="margin-top:6px;">
+                        </div>                        <textarea id="bmGtInput" rows="3" spellcheck="false" placeholder='人工核对后的真值 JSON，例如：&#10;{"time":["夜晚"],"weather":["晴天"],"road":["直路"],"scene":["城市道路"],"objects":["行人"],"events":["行人横穿"],"risk":["低风险"]}&#10;（必须人工判断，禁止直接照抄示例或 AI 结果）' style="width:100%; margin-top:6px; font-family:monospace; font-size:12px; background:rgba(0,0,0,0.5); color:var(--text-main); border:1px solid var(--border); border-radius:6px; padding:6px;"></textarea>                        <div style="margin-top:8px; padding:6px 8px; background:rgba(245,158,11,0.08); border-left:2px solid #f59e0b; border-radius:4px; font-size:11px; line-height:1.7; color:var(--text-muted);">
+                            <b style="color:#f59e0b;">真值口径</b>：真值必须来自人工的独立判断（改过/重标标签）。
+                            只被点过「通过」、人工没改任何标签的帧，其真值等于模型自己的输出，拿它评测会虚高到接近满分。
+                        </div>
+                        <div class="audit-actions" style="margin-top:6px;">
+                            <button class="secondary" onclick="bmImport('modified')" title="把人工改过标签的帧（human_tags 非空）作为样本，真值 = 人工修正后的 final_tags —— 这是最有价值的真值">导入人工改过的</button>
+                            <button class="secondary" onclick="bmImport('reviewed')" title="把人工审核过（点了通过/修改）的帧作为样本，真值 = final_tags">导入人工审核结果</button>
+                            <label style="font-size:12px;">随机抽 <input id="bmRandomN" type="number" value="200" min="10" style="width:64px; padding:4px;"> 帧</label>
+                            <button class="secondary" onclick="bmImport('random')" title="随机抽样加入样本，真值留空 —— 人工在样本清单里核对填写后再评测（评测会自动跳过未填真值的样本）">抽入待标注</button>
+                        </div>
+                        <div class="audit-actions" style="margin-top:6px;">
                             <button onclick="bmAddSample()">加入 Benchmark</button>
                             <button class="secondary" onclick="bmEvaluate('all')">运行评测 (all)</button>
                             <select id="bmCombo" style="padding:6px;" onchange="">
@@ -518,6 +531,7 @@
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></div>
                     融合语义搜索 <span id="fsProjectTag" style="font-size:13px;"></span>
                     <span style="flex:1;"></span>
+                    <button class="secondary" id="fsGaveUpBtn" onclick="fsToggleGaveUp()" style="display:none; padding:4px 12px; font-size:12px; margin-right:6px;" title="被放弃的本体候选词放在这里，点标签即可放回">已放弃 0</button>
                     <button class="secondary" onclick="fsLoadOntology()" style="padding:4px 12px; font-size:12px;">刷新</button>
                 </div>
                 <div class="control-group" style="flex-wrap:wrap;">
@@ -527,6 +541,8 @@
                 </div>
                 <div id="fsDims" style="display:flex; gap:10px; flex-wrap:wrap; margin-top:8px;"></div>
                 <div id="fsCandidates" style="margin-top:10px;"></div>
+                <!-- 已放弃的词：不常驻，平时只留右上角按钮，点开才展开 -->
+                <div id="fsGaveUpBox" style="display:none; margin-top:8px;"></div>
                 <div id="fsResult" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; margin-top:12px;">
                     <div class="audit-empty" style="grid-column:1/-1;">输入自然语言或选择维度标签进行检索</div>
                 </div>
@@ -731,6 +747,62 @@
         <button id="fpPrev" class="fp-btn" onclick="changePage(-1)">◀ 上一页</button>
         <span class="fp-info">第 <b id="fpPageCurrent">1</b> / <b id="fpPageTotal">0</b> 页</span>
         <button id="fpNext" class="fp-btn" onclick="changePage(1)">下一页 ▶</button>
+    </div><!-- 统一图片放大层：点图放大，点任意处还原（由全局委托接管所有裸 img） -->
+    <!-- 原视频片段播放（MJPEG 连续画面；点任意处关闭，再点卡片可重播） -->
+    <div id="videoClip" onclick="fsHideVideo()" style="display:none; position:fixed; inset:0; z-index:10090; background:rgba(0,0,0,0.95); flex-direction:column; align-items:center; justify-content:center; padding:14px; cursor:zoom-out;">
+        <img id="videoClipImg" alt="" style="max-width:97vw; max-height:84vh; background:#000; border-radius:6px; box-shadow:0 10px 40px rgba(0,0,0,.6);">
+        <div id="videoClipCap" style="color:#cbd5e1; font-size:13px; margin-top:10px; text-align:center; max-width:94vw;"></div>
+        <div style="color:var(--text-muted); font-size:12px; margin-top:4px;">按原始视频帧率播放连续画面 · 点任意处关闭（再点卡片重播）</div>
+    </div>
+    <!-- 搜索结果"详情"弹层：卡片只留图片，其它字段都在这里 -->
+    <div id="fsDetail" onclick="fsHideDetail()" style="display:none; position:fixed; inset:0; z-index:10080; background:rgba(0,0,0,0.9); align-items:center; justify-content:center; padding:20px;">
+        <div onclick="event.stopPropagation()" style="background:#1e293b; border:1px solid rgba(0,212,255,0.4); border-radius:10px; padding:16px 18px; width:min(720px,94vw); max-height:88vh; overflow:auto; color:#fff;">
+            <div style="display:flex; align-items:center; margin-bottom:10px; gap:8px;">
+                <b>片段详情</b>
+                <button onclick="fsPlayDetailOriginal()" style="font-size:12px; padding:3px 10px;" title="播放这一段对应的原始视频连续画面（不抽稀）">▶ 播放原视频片段</button>
+                <span style="flex:1;"></span>
+                <button class="secondary" onclick="fsHideDetail()" style="font-size:12px; padding:3px 10px;">关闭</button>
+            </div>
+            <table style="width:100%; font-size:12.5px; border-collapse:collapse;"><tbody id="fsDetailBody"></tbody></table>
+            <div style="color:var(--text-muted); font-size:11px; margin:12px 0 4px;">原始 JSON</div>
+            <pre id="fsDetailJson" style="background:#0b1220; border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:10px; font-size:11.5px; line-height:1.5; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; margin:0; color:#cbd5e1;"></pre>
+        </div>
+    </div>
+    <!-- 搜索结果连播器：把抽出来的帧按 视频+时间 顺序连着播，像看片段回放 -->
+    <div id="fsPlayer" style="display:none; position:fixed; inset:0; z-index:10070; background:rgba(0,0,0,0.96); flex-direction:column; align-items:center; justify-content:center; padding:16px;">
+        <img id="fsPlayerImg" data-nozoom="1" alt="" style="max-width:96vw; max-height:78vh; object-fit:contain; border-radius:6px; background:#000;">
+        <div id="fsPlayerCap" style="color:#cbd5e1; font-size:13px; margin-top:8px; max-width:92vw; word-break:break-all; text-align:center;"></div>
+        <!-- 本段综合标签：放右下角，便于一边看画面一边核对标签是否打得对（原来只有图，验证不了） -->
+        <div id="fsPlayerTags" style="display:none; position:absolute; right:14px; bottom:14px; max-width:46vw; max-height:46vh; overflow:auto; background:rgba(8,14,26,0.9); border:1px solid rgba(148,163,184,0.35); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.6; text-align:left; color:#cbd5e1;"></div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:12px; flex-wrap:wrap; justify-content:center;">
+            <button class="secondary" onclick="fsPlayRestart()" title="回到第一帧重新播放（快捷键 R）">⏮ 从头播放</button>
+            <button class="secondary" onclick="fsPlayPrev()" title="上一帧（←）">◀</button>
+            <button id="fsPlayerToggle" onclick="fsPlayToggle()" style="min-width:78px;" title="播放/暂停（空格）">播放</button>
+            <button class="secondary" onclick="fsPlayNext()" title="下一帧（→）">▶</button>
+            <input id="fsPlaySeek" type="range" min="1" max="1" value="1" step="1" oninput="fsPlaySeek(this.value)"
+                   title="拖动跳到任意帧" style="width:200px; vertical-align:middle; cursor:pointer;">
+            <label style="color:var(--text-muted); font-size:12px;" title="播到最后一帧后自动从头继续">
+                <input type="checkbox" id="fsPlayLoop"> 循环
+            </label>
+            <label style="color:var(--text-muted); font-size:12px;">速度
+                <select id="fsPlaySpeed" onchange="fsPlayApplySpeed()" style="padding:4px;">
+                    <option value="1000">1 帧/秒</option>
+                    <option value="500" selected>2 帧/秒</option>
+                    <option value="250">4 帧/秒</option>
+                    <option value="125">8 帧/秒</option>
+                    <option value="83">12 帧/秒</option>
+                    <option value="67">15 帧/秒（原速）</option>
+                    <option value="33">30 帧/秒（原速）</option>
+                </select>
+            </label>
+            <span id="fsPlayerIdx" style="color:var(--text-muted); font-size:12px;"></span>
+            <button class="secondary" onclick="fsPlayClose()">关闭</button>
+        </div>
+    </div>
+    <div id="imgZoomLayer" style="display:none; position:fixed; inset:0; z-index:10060; background:rgba(0,0,0,0.94); cursor:zoom-out; align-items:center; justify-content:center; flex-direction:column; padding:18px;">
+        <img id="imgZoomPic" alt="" style="max-width:96vw; max-height:88vh; object-fit:contain; border-radius:6px; box-shadow:0 10px 44px rgba(0,0,0,0.65);">
+        <div id="imgZoomCap" style="color:#cbd5e1; font-size:13px; margin-top:10px; max-width:90vw; word-break:break-all;"></div>
+        <div style="color:var(--text-muted); font-size:12px; margin-top:4px;">点击任意处 / 按 Esc 还原</div>
     </div><!-- 弹窗 -->    <div id="imageModal" class="modal" onclick="closeModal(event)">
         <div class="modal-content" id="modalContentWrapper">
             <div class="close-btn" onclick="closeModal(event)">×</div>
@@ -1562,7 +1634,59 @@
 
 
 
-        function closeModal(e) { if(e.target.id === 'imageModal' || e.target.className === 'close-btn') document.getElementById('imageModal').classList.remove('active'); }
+        function closeModal(e) {
+            // 点弹层任意处（含图片本身）都还原：原来是只有点背景或关闭按钮才关，
+            // 点图片没反应，用户以为放大坏了。按 Esc 也关。
+            document.getElementById('imageModal').classList.remove('active');
+        }
+
+        // ===== 统一图片放大层 =====
+        // 任何"没有自带放大逻辑"的图（审核中心卡片/大图、Hard Case、Benchmark、
+        // 数据资产管理缩略图…）都由它接管：点图放大，点任意处还原。
+        // 单独放在 body 上（不在任何面板内）：面板悬停带 transform，会把 position:fixed
+        // 的弹层变成"相对面板定位"，导致放大后显示不全。
+        function imgZoomOpen(src, caption) {
+            const lay = document.getElementById('imgZoomLayer');
+            if (!lay || !src) return;
+            document.getElementById('imgZoomPic').src = src;
+            document.getElementById('imgZoomCap').textContent = caption || '';
+            lay.style.display = 'flex';
+        }
+        function imgZoomClose() {
+            const lay = document.getElementById('imgZoomLayer');
+            if (!lay) return;
+            lay.style.display = 'none';
+            document.getElementById('imgZoomPic').src = '';
+        }
+        document.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Escape') { imgZoomClose(); }
+        });
+        // 融合搜索的放大层原来写在面板内部：面板 hover 带 transform，
+        // 会把 position:fixed 变成"相对面板定位"，放大后显示不全。挪到 body 上。
+        (function () {
+            const l = document.getElementById('fsLightbox');
+            if (l && l.parentElement !== document.body) document.body.appendChild(l);
+        })();
+        document.addEventListener('click', function (ev) {
+            const t = ev.target;
+            if (!t || !t.closest) return;
+            // 放大层内部：点击任意处（含图片）还原
+            if (t.closest('#imgZoomLayer')) { imgZoomClose(); return; }
+            const img = t.closest('img');
+            if (!img) return;
+            if (img.closest('#imageModal') || img.closest('#fsLightbox')) return;  // 各自已有弹层
+            if (img.closest('[onclick]')) return;      // 图集缩略图自带带检测框的弹窗
+            // 注意：卡片若用 JS 赋 onclick（card.onclick=...）而不是 HTML 属性，上面的
+            // [onclick] 选择器匹配不到，必须给它的 <img> 标 data-nozoom="1"，
+            // 否则这里会在捕获阶段 stopPropagation 把卡片点击吞掉（表现为"点了只弹单帧图"）。
+            if (img.dataset && img.dataset.nozoom === '1') return;
+            const src = img.currentSrc || img.src || '';
+            if (!/\/api\/image\/|^blob:|^data:image/.test(src)) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            const cap = [img.getAttribute('alt'), img.getAttribute('title')].filter(Boolean).join(' · ');
+            imgZoomOpen(src, cap);
+        }, true);
 
 
 
@@ -3455,7 +3579,7 @@
 
                 const clipEl = document.getElementById('clipSizeInput');
 
-                const clipSize = parseInt((clipEl || {}).value) || 50;
+                const clipSize = parseInt((clipEl || {}).value) || 30;
 
                 // 每段 Clip 覆盖的原始视频时长 = (段内帧数-1) × 步长 ÷ 帧率
                 const secs = (((clipSize - 1) * step) / 30).toFixed(1);
@@ -4265,7 +4389,7 @@ function buildDemandPanel() {
         </div>
         <div style="font-size:13px; font-weight:700; margin:14px 0 8px;">场景覆盖看板
             <span style="color:var(--text-muted); font-weight:400; font-size:12px;">
-                （<span style="color:#a78bfa;">Clip</span> 50 帧为一段、每段记 1 次 · <span style="color:var(--primary);">Image</span> 每帧记 1 次）
+                （<span style="color:#a78bfa;">Clip</span> 30 帧为一段、每段记 1 次 · <span style="color:var(--primary);">Image</span> 每帧记 1 次）
             </span></div>
         <div id="demandCoverage" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px;">
             <div style="font-size:12px; color:var(--text-muted);">加载中…</div>
@@ -4606,6 +4730,49 @@ async function bmLoadHistory() {
 
 }
 
+// 批量导入样本：真值取自人工审核结果，省掉逐帧手填（1.4 万帧靠手填没法评测）
+async function bmImport(source) {
+
+    const proj = currentProject || 'default';
+
+    const splitEl = document.getElementById('bmSplit');
+
+    const nEl = document.getElementById('bmRandomN');
+
+    const n = parseInt((nEl || {}).value) || 200;
+
+    const tip = {
+
+        modified: '把「人工改过标签」的帧导入为样本（真值 = 人工修正后的标签）？这是最有参考价值的真值。',
+
+        reviewed: '把「人工审核过」的帧导入为样本（真值 = final_tags）？\n\n注意：只点了「通过」而没改标签的帧，真值等于模型自己的输出，评测会虚高。',
+
+        random: '随机抽取 ' + n + ' 帧加入样本（真值留空）？\n\n之后需要人工在样本清单里核对填写真值，评测时会自动跳过未填真值的样本。'
+
+    }[source];
+
+    if (!confirm(tip)) return;
+
+    const fd = new FormData();
+
+    fd.append('project', proj);
+
+    fd.append('source', source);
+
+    fd.append('split', (splitEl && splitEl.value) || 'val');
+
+    if (source === 'random') fd.append('limit', n);
+
+    let r = null;
+
+    try { r = await auditFetch('/api/benchmark/samples/import', fd); } catch (e) { return alert('网络异常: ' + e.message); }
+
+    alert((r && r.msg) || '导入失败');
+
+    bmRefresh();
+
+}
+
 async function bmAddSample() {
 
     const imgId = document.getElementById('bmImageId');
@@ -4696,7 +4863,11 @@ function bmRenderResult(res, combo) {
 
     const srcs = (res.sources || res.metrics) || {};
 
-    const meta = res.sample_count != null ? ('样本 ' + res.evaluated_count + '/' + res.sample_count + ' 条') : '';
+    const meta = res.sample_count != null
+        ? ('样本 ' + res.evaluated_count + '/' + res.sample_count + ' 条'
+           + (res.skipped_no_gt ? '（跳过 ' + res.skipped_no_gt + ' 条真值留空）' : '')
+           + (res.missing_asset ? '（缺失 ' + res.missing_asset + ' 条）' : ''))
+        : '';
 
     let html = '<div style="font-size:13px; font-weight:700; margin-bottom:6px;">评测结果 [' + (combo || 'all') + '] ' + meta + '</div>';
 
@@ -4759,7 +4930,7 @@ async function fsLoadOntology() {
     if (!box) return;
     box.innerHTML = '';
     // 字段与明细表一致：车型 分辨率 时间 天气 道路 目标 事件 场景（顺序即接口返回顺序）
-    const order = ['vehicle', 'resolution', 'time', 'weather', 'road', 'objects', 'events', 'scene'];
+    const order = ['traffic_sign', 'vehicle', 'resolution', 'time', 'weather', 'road', 'objects', 'events', 'scene'];
     order.forEach(function(dim) {
         const def = fsOntology[dim];
         if (!def) return;
@@ -4789,9 +4960,9 @@ async function fsLoadCandidates() {
     const head = '<div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">'
         + '<b style="color:var(--warning);">标签维护</b>';
     if (!cs.length) {
-        // 候选池空也要显示"已放弃"那行，否则放弃过的词就找不回来了
-        box.innerHTML = head + ' · 候选池为空：当前数据里的标签都在本体词表内</div>'
-            + fsDismissedLine(d && d.dismissed);
+        // 候选池空：整块不显示（不常驻占位）；放弃过的词收在右上角「已放弃 N」按钮里，不会丢
+        box.innerHTML = '';
+        fsRenderGaveUp(d && d.dismissed);
         return;
     }
     box.innerHTML = head + ' · 模型识别到 ' + cs.length + ' 个本体还没有的词（事件/场景优先），'
@@ -4809,20 +4980,34 @@ async function fsLoadCandidates() {
                  + '<button class="secondary" style="font-size:11px; padding:2px 8px;" onclick="fsPromote(' + i + ',\'alias\')">归并…</button>'
                  + '<button class="secondary" style="font-size:11px; padding:2px 8px;" onclick="fsDismiss(' + i + ')">放弃使用</button>'
                  + '</div>';
-        }).join('') + '</div>'
-        + fsDismissedLine(d && d.dismissed);
+        }).join('') + '</div>';
+    fsRenderGaveUp(d && d.dismissed);
 }
 
-// 已放弃的词：不占主区，折叠成一行，点标签即可放回候选池
-function fsDismissedLine(list) {
+// 已放弃的词：不常驻——平时只在面板右上角留一个「已放弃 N」按钮，点开才展开，
+// 点其中的标签即可放回候选池（原来这一行常驻占位）。
+function fsRenderGaveUp(list) {
     window._fsGaveUp = list || [];
-    if (!window._fsGaveUp.length) return '';
-    return '<div style="font-size:11px; color:var(--text-muted); margin-top:6px;">已放弃 '
-        + window._fsGaveUp.length + ' 个（点击放回）：'
+    const btn = document.getElementById('fsGaveUpBtn');
+    const box = document.getElementById('fsGaveUpBox');
+    const n = window._fsGaveUp.length;
+    if (btn) {
+        btn.style.display = n ? '' : 'none';
+        if (n) btn.innerText = '已放弃 ' + n;
+    }
+    if (!box) return;
+    if (!n) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.innerHTML = '<div style="font-size:11px; color:var(--text-muted);">已放弃 '
+        + n + ' 个（点击放回）：'
         + window._fsGaveUp.map(function(g, i) {
             return '<span class="audit-chip muted" style="cursor:pointer; font-size:11px;"'
                  + ' title="点一下放回候选池" onclick="fsDismiss(null,' + i + ')">' + g.tag + '</span>';
         }).join('') + '</div>';
+}
+function fsToggleGaveUp() {
+    const box = document.getElementById('fsGaveUpBox');
+    if (!box) return;
+    box.style.display = (getComputedStyle(box).display === 'none') ? 'block' : 'none';
 }
 
 // 放弃使用 / 放回候选池（i 为候选下标；gi 为已放弃列表下标）
@@ -4897,22 +5082,37 @@ async function fsSearch() {
         const items = (r && r.results) || [];
         if (!r || r.code !== 200) { box.innerHTML = '<div class="audit-empty" style="grid-column:1/-1;">' + ((r && r.msg) || '检索失败') + '</div>'; return; }
         const condStr = Object.keys(r.tag_conditions || {}).map(function(k) { return k + ':' + r.tag_conditions[k].join('/'); }).join(' ');
+        window._fsLast = items;   // 连播器用：记住本次结果（含 video_source/timestamp 以便按视频排序）
         const info = '<div style="grid-column:1/-1; font-size:12px; color:var(--text-muted);">'
-            + '命中 ' + r.total + ' 条 · 条件: ' + (condStr || '仅语义') + (r.semantic_engine ? ' · 语义引擎: on' : ' · 语义引擎: 未加载(仅标签匹配)')
-            + ' <button class="secondary" onclick="fsSearch()" style="font-size:11px; padding:2px 8px; margin-left:8px;">重新检索</button></div>';
+            + '命中 ' + (r.segment_count != null ? r.segment_count + ' 段' : r.total + ' 条')
+            + (r.matched_frames != null ? '（' + r.matched_frames + ' 帧）' : '')
+            + ' · 条件: ' + (condStr || '仅语义')
+            + ' · 语义引擎: ' + (r.semantic_engine ? 'on' : (r.semantic_note || '未加载(仅标签匹配)'))
+            + ' <button class="secondary" onclick="fsSearch()" style="font-size:11px; padding:2px 8px; margin-left:8px;">重新检索</button>'
+            + '</div>';
         box.innerHTML = info;
         if (!items.length) { box.innerHTML += '<div class="audit-empty" style="grid-column:1/-1;">无结果。可放宽维度选择，或去掉部分标签条件（当前为严格 AND）。</div>'; return; }
         items.forEach(function(it) {
             const card = document.createElement('div');
             card.style.cssText = 'background:rgba(0,0,0,0.35); border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; cursor:pointer; transition:all .2s;';
-            card.onclick = function() { fsOpen(it); };
+            const seg = (it.segment && it.segment.frame_count > 1) ? it.segment : null;
+            // 点卡片 = 直接播放这一段（不再先弹单帧、再点播放）
+            card.onclick = function() {
+                const fids = (it.segment && it.segment.frame_ids) || [it.id];
+                // 点卡片 = 播这一段抽出来的帧（默认 30 帧），带进度条/从头/暂停/倍速/按帧。
+                // 想看这一段对应的真实连续画面，点「详情」->「播放原视频片段」。
+                fsPlayFrames(fids, (it.segment && it.segment.video) || '', it.tags || null, it.id);
+            };
             card.innerHTML = `
 
-                <img src="${fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id)}" style="width:100%; height:110px; object-fit:cover; display:block; background:#000;" onerror="this.style.visibility='hidden'">
-                <div style="padding:6px 8px; font-size:11px; color:var(--text-muted);">
-                    <div>#${it.id} <span style="color:var(--primary); float:right;">${it.score}</span></div>
-                    ${it.tag_hit ? '<span style="color:#10b981;">标签命中</span> ' : ''}${it.filename ? it.filename.slice(-24) : ''}
-                </div>`;
+                <img data-nozoom="1" src="${fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id)}" style="width:100%; height:110px; object-fit:cover; display:block; background:#000;" onerror="this.style.visibility='hidden'">
+                <button class="secondary" title="查看这一段的完整信息"
+                        style="position:absolute; top:4px; right:4px; font-size:10px; padding:1px 7px; opacity:.85;"
+                        onclick="event.stopPropagation();fsShowDetail(_fsCardRef(this))">详情</button>`;
+            card.style.position = 'relative';
+            card._it = it;
+            window._fsCards = window._fsCards || {};
+            window._fsCards[it.id] = it;
 
             box.appendChild(card);
 
@@ -4928,6 +5128,488 @@ async function fsSearch() {
 
 
 
+// 卡片"详情"：卡片本身只留图片，文件名/分值/段信息/源视频路径/时间戳等都在这里看。
+// 取卡片对应的数据对象（避免把对象塞进 onclick 字符串）
+function _fsCardRef(btn) {
+    const card = btn.closest('div');
+    return (card && card._it) || {};
+}
+function fsShowDetail(it) {
+    const box = document.getElementById('fsDetail');
+    if (!box) return;
+    window._fsDetailIt = it;
+    const sg = it.segment || {};
+    const vs = it.video_source || {};
+    const rows = [
+        ['帧号 (id)', it.id],
+        ['文件名', it.filename || '-'],
+        // 源数据路径：与原始 JSON 的 path 字段一一对应（Clip 链路帧没有源视频，但一定有它）
+        ['源数据路径', it.path || '-'],
+        ['匹配分', it.score != null ? it.score : '-'],
+        ['语义分', it.semantic_score != null ? it.semantic_score : '-'],
+        ['标签命中', it.tag_hit ? '是' : '否'],
+        ['所属段', sg.index != null ? ('第 ' + sg.index + ' 段') : '-'],
+        ['本段帧数', sg.frame_count != null ? sg.frame_count : '-'],
+        ['段内帧号', (sg.frame_ids || []).join(', ')],
+        ['源视频', vs.video_path || it.video_path || '-'],
+        ['原始帧号', vs.frame_index != null ? vs.frame_index : '-'],
+        ['时间戳(秒)', vs.timestamp != null ? Number(vs.timestamp).toFixed(3) : '-'],
+    ];
+    document.getElementById('fsDetailBody').innerHTML = rows.map(function (r) {
+        return '<tr><td style="color:var(--text-muted); padding:4px 10px 4px 0; white-space:nowrap; vertical-align:top;">'
+            + r[0] + '</td><td style="padding:4px 0; word-break:break-all;">' + String(r[1] == null ? '-' : r[1]) + '</td></tr>';
+    }).join('');
+    document.getElementById('fsDetailJson').textContent = JSON.stringify(it, null, 1);
+    box.style.display = 'flex';
+}
+// 详情页里播"原视频"：关掉详情，取这一段的原始连续画面（全帧）交给播放器
+function fsPlayDetailOriginal() {
+    const it = window._fsDetailIt;
+    if (!it) return;
+    fsHideDetail();
+    fsPlaySegmentFrames(it);
+}
+function fsHideDetail() {
+    const box = document.getElementById('fsDetail');
+    if (box) box.style.display = 'none';
+}
+
+// ===== 搜索结果连播：把抽出来的帧按 视频+时间戳 顺序连着播 =====
+// 抽帧本身是 1:N 稀疏的，单帧看没有连续感；连起来播就接近"回看这段片段"。
+let fsPlayList = [], fsPlayI = 0, fsPlayTimer = null, fsPlayRaf = null, fsPlayPlaying = false, fsPlayLast = 0;
+
+function _fsPlayKey(it) {
+    const vs = it.video_source || {};
+    const vp = vs.video_path || it.video_path || '';
+    const ts = vs.timestamp != null ? vs.timestamp : (it.timestamp != null ? it.timestamp : 0);
+    return [String(vp), Number(ts) || 0, Number(it.id) || 0];
+}
+
+// 点卡片播放：回原始视频取【这一段对应的连续帧】（不抽稀），交给带完整控制的播放器
+// （进度条 / 从头播放 / 播放暂停 / 倍速慢速 / 按帧前后翻）。抽帧是 1:5 稀疏的，
+// 直接放抽样帧会一跳一跳，所以这里取原始连续帧。
+async function fsPlaySegmentFrames(it) {
+    const sg = it.segment || {};
+    const fids = (sg.frame_ids || (it.id != null ? [it.id] : []));
+    if (!fids.length) return alert('这一段没有可播放的帧');
+    const center = fids[Math.floor(fids.length / 2)];
+    const cap = document.getElementById('fsPlayerCap');
+    const box = document.getElementById('fsPlayer');
+    if (box) box.style.display = 'flex';
+    if (cap) cap.textContent = '正在从原始视频解帧…';
+    // 同时带上三种参数：新后端按 id_b 精确取"段首→段尾"；旧后端按 span 居中取（近似整段）
+    // span 的单位是【原始帧】：段内 fids.length 个抽样帧在 5:1 抽帧下约跨 length*5 个原始帧。
+    // 新后端会用 id_b 精确按段边界取，这个 span 只在旧后端（未重启）时作为近似兜底。
+    const estSpan = Math.max(60, fids.length * 5);
+    const url = '/api/video_window?project=' + encodeURIComponent(currentProject)
+              + '&image_id=' + center + '&span=' + estSpan
+              + '&id_b=' + fids[fids.length - 1] + '&max_side=1280&t=' + Date.now();
+    let r = null;
+    try { r = await auditFetch(url); } catch (e) { }
+    if (!r || r.code !== 200) {
+        if (box) box.style.display = 'none';
+        return alert((r && r.msg) || '取原始画面失败');
+    }
+    fsPlayStop();
+    if (cap) cap.textContent = '正在加载这一段 ' + r.count + ' 帧原始画面…';
+    const entries = r.urls.map(function (u, i) {
+        const absF = (r.start_frame || 0) + i;
+        const t = r.fps ? (absF / r.fps) : null;
+        return {
+            fid: null,                       // 原帧不是底库帧，不能"回看原帧"
+            url: u,
+            txt: '<b>' + (sg.video || '') + '</b> · 原帧 ' + absF
+                 + (t != null ? ' · ' + t.toFixed(2) + 's' : '')
+                 + (absF === r.center_frame ? ' <span style="color:#f59e0b;">← 本段中心帧</span>' : '')
+        };
+    });
+    // 一段可能有几百个原始帧（这批视频每秒抽 1 帧，30 帧一段≈31 秒），全量预加载要几十 MB。
+    // 只等前 24 帧就开始播，其余边播边预取（浏览器自身缓存后续帧）。
+    if (cap) cap.textContent = '正在加载起始帧…';
+    await Promise.all(entries.slice(0, 24).map(function (e) {
+        return new Promise(function (res) {
+            const im = new Image();
+            im.onload = im.onerror = res;
+            im.src = fullUrl(e.url);
+        });
+    }));
+    fsPlayList = entries;
+    fsPlayI = 0;
+    const sel = document.getElementById('fsPlaySpeed');
+    if (sel) {
+        const want = String(Math.round(1000 / (r.fps || 15)));
+        if ([...sel.options].some(function (o) { return o.value === want; })) sel.value = want;
+    }
+    fsPlayShow();
+    fsPlayPlay();
+}
+
+// 回看当前帧前后 span 帧原始画面（同样交给带完整控制的播放器）
+async function fsPlayAround(fid, span) {
+    if (!fid) return alert('当前不是底库帧，无法回看原帧');
+    const cap = document.getElementById('fsPlayerCap');
+    const box = document.getElementById('fsPlayer');
+    if (box) box.style.display = 'flex';
+    if (cap) cap.textContent = '正在从原始视频解帧…';
+    let r = null;
+    try { r = await auditFetch('/api/video_window?project=' + encodeURIComponent(currentProject)
+        + '&image_id=' + fid + '&span=' + (span || 30) + '&max_side=1280&t=' + Date.now()); } catch (e) { }
+    if (!r || r.code !== 200) {
+        if (box) box.style.display = 'none';
+        return alert((r && r.msg) || '取原帧失败');
+    }
+    fsPlayStop();
+    const entries = r.urls.map(function (u, i) {
+        const absF = (r.start_frame || 0) + i;
+        const t = r.fps ? (absF / r.fps) : null;
+        return {
+            fid: null, url: u,
+            txt: '<b>' + r.video + '</b> · 原帧 ' + absF + (t != null ? ' · ' + t.toFixed(2) + 's' : '')
+        };
+    });
+    await Promise.all(entries.slice(0, 24).map(function (e) {
+        return new Promise(function (res) {
+            const im = new Image();
+            im.onload = im.onerror = res;
+            im.src = fullUrl(e.url);
+        });
+    }));
+    fsPlayList = entries;
+    fsPlayI = 0;
+    const sel = document.getElementById('fsPlaySpeed');
+    if (sel) {
+        const want = String(Math.round(1000 / (r.fps || 15)));
+        if ([...sel.options].some(function (o) { return o.value === want; })) sel.value = want;
+    }
+    fsPlayShow();
+    fsPlayPlay();
+}
+
+// 播放某一段的"视频"（MJPEG 推流，保留备用）。
+// 之前是把抽出来的帧一张张切着放，1:5 稀疏导致一跳一跳，看着不像视频。
+function fsPlaySegmentVideo(idA, idB, capText) {
+    const box = document.getElementById('videoClip');
+    if (!box) return;
+    const img = document.getElementById('videoClipImg');
+    let url = '/api/video_clip?project=' + encodeURIComponent(currentProject)
+            + '&id_a=' + encodeURIComponent(idA) + '&t=' + Date.now();
+    if (idB != null) url += '&id_b=' + encodeURIComponent(idB);
+    img.src = fullUrl(url);
+    document.getElementById('videoClipCap').textContent = capText || '';
+    box.style.display = 'flex';
+}
+function fsHideVideo() {
+    const box = document.getElementById('videoClip');
+    if (box) box.style.display = 'none';
+    const img = document.getElementById('videoClipImg');
+    if (img) img.src = '';          // 断开 MJPEG 流，停止服务端推流
+}
+document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') fsHideVideo();
+});
+
+// 播放某个片段内的帧（旧的逐帧播放路径，保留给"抽帧序列"场景）
+// 播放器右下角的"本段综合标签"（tags 为后端在搜索结果里附上的该段代表帧 ai_tags）
+function fsRenderPlayerTags(tags, repId) {
+    const box = document.getElementById('fsPlayerTags');
+    if (!box) return;
+    const dims = ['traffic_sign', 'vehicle', 'resolution', 'time', 'weather', 'road',
+                  'road_surface', 'objects', 'events', 'risk', 'scene'];
+    const rows = [];
+    const esc = function(x) { return String(x == null ? '' : x).replace(/[<>&]/g, function(c) {
+        return ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' })[c]; }); };
+    dims.forEach(function(d) {
+        const arr = (tags || {})[d];
+        if (!arr || !arr.length) return;
+        const vals = [];
+        const evs = [];
+        arr.forEach(function(t) {
+            const o = (t && typeof t === 'object') ? t : { tag: String(t) };
+            if (!o.tag) return;
+            let s = esc(o.tag);
+            const cf = Number(o.confidence);
+            if (o.confidence != null && !isNaN(cf)) s += '<span style="color:var(--text-muted);"> ' + (Math.round(cf * 100) / 100) + '</span>';
+            vals.push(s);
+            // 证据：模型说的"哪几帧看到了什么"，用来核对这个标签是否真的成立
+            if (o.evidence && o.evidence.length) {
+                evs.push('<div style="color:#94a3b8; padding-left:10px;">· ' + esc(o.tag) + '：'
+                         + o.evidence.map(esc).join(' ｜ ') + '</div>');
+            }
+        });
+        if (!vals.length) return;
+        const cn = ((window.fsOntology || {})[d] || {}).name || d;
+        rows.push('<div><span style="color:var(--text-muted);">' + cn + '</span>：'
+                  + '<span style="color:#e2e8f0;">' + vals.join('、') + '</span></div>');
+        if (evs.length) rows.push('<div style="font-size:11.5px; line-height:1.5;">' + evs.join('') + '</div>');
+    });
+    if (!rows.length) {
+        box.style.display = 'none';
+        box.innerHTML = '';
+        return;
+    }
+    box.innerHTML = '<div style="color:var(--primary); font-weight:700; margin-bottom:4px;">本段综合标签'
+        + (repId != null ? '<span style="color:var(--text-muted); font-weight:400;">（代表帧 #' + repId + '）</span>' : '')
+        + '</div>' + rows.join('');
+    box.style.display = 'block';
+}
+async function fsPlayFrames(frameIds, videoName, tags, repId) {
+    if (!frameIds || !frameIds.length) return alert('这一段没有可播放的帧');
+    const box = document.getElementById('fsPlayer');
+    const cap = document.getElementById('fsPlayerCap');
+    if (box) box.style.display = 'flex';
+    if (cap) cap.textContent = '正在加载本段 ' + frameIds.length + ' 帧…';
+    fsPlayStop();
+    fsRenderPlayerTags(tags, repId);   // 右下角显示本段综合标签（含证据）
+    const entries = frameIds.map(function (fid, i) {
+        return {
+            fid: fid,
+            url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid,
+            txt: '<b>' + (videoName || '') + '</b> · 段内第 ' + (i + 1) + '/' + frameIds.length + ' 帧 · #' + fid
+        };
+    });
+    let _d = 0;
+    await Promise.all(entries.map(function (e) {
+        return new Promise(function (res) {
+            const im = new Image();
+            im.onload = im.onerror = function () {
+                _d++;
+                if (cap && _d % 10 === 0) cap.textContent = '正在加载本段 ' + _d + '/' + frameIds.length + '…';
+                res();
+            };
+            im.src = fullUrl(e.url);
+        });
+    }));
+    fsPlayList = entries;
+    fsPlayI = 0;
+    // 段内是 1:N 抽样帧，按"抽帧间隔"折算成接近原速的观感（默认 8 帧/秒）
+    const sel = document.getElementById('fsPlaySpeed');
+    if (sel) sel.value = '125';
+    fsPlayShow();
+    fsPlayPlay();
+}
+
+// 单帧上下文回放：回到原始视频取该帧前后 span 帧（不抽稀），按视频真实帧率播放。
+// 抽帧是 1:N 稀疏的，搜索命中的帧之间看不到真实运动，这里才看得出"这一瞬间发生了什么"。
+async function fsPlayOriginal(imageId, span) {
+    const n = span || 30;
+    fsRenderPlayerTags(null);
+    const box = document.getElementById('fsPlayer');
+    const cap = document.getElementById('fsPlayerCap');
+    if (box) box.style.display = 'flex';
+    if (cap) cap.textContent = '正在从原始视频解帧…';
+    const r = await auditFetch('/api/video_window?project=' + encodeURIComponent(currentProject)
+        + '&image_id=' + encodeURIComponent(imageId) + '&span=' + n);
+    if (!r || r.code !== 200) {
+        if (box) box.style.display = 'none';
+        return alert((r && r.msg) || '取原帧失败');
+    }
+    fsPlayStop();
+    // 先把整段帧预加载进内存再播：边下边播时每帧 200~300KB，实际只能跑到 1 帧/秒，
+    // 15fps 原速根本跟不上（浏览器会不停取消未完成的加载）。
+    if (cap) cap.textContent = '正在加载 ' + r.count + ' 帧原始画面（约 ' + Math.round(r.count * 0.25) + ' MB）…';
+    let _done = 0;
+    await Promise.all(r.urls.map(function (u) {
+        return new Promise(function (res) {
+            const im = new Image();
+            im.onload = im.onerror = function () {
+                _done++;
+                if (cap && _done % 5 === 0) cap.textContent = '正在加载原始画面 ' + _done + '/' + r.count + '…';
+                res();
+            };
+            im.src = fullUrl(u);
+        });
+    }));
+    fsPlayList = r.urls.map(function (u, i) {
+        const absF = r.start_frame + i;
+        const t = r.fps ? (absF / r.fps) : null;
+        return {
+            url: u,
+            txt: '<b>' + r.video + '</b> · 原帧 ' + absF
+                 + (t != null ? ' · ' + t.toFixed(2) + 's' : '')
+                 + (absF === r.center_frame ? ' <span style="color:#f59e0b;">← 当前帧</span>' : '')
+        };
+    });
+    fsPlayI = 0;
+    const sel = document.getElementById('fsPlaySpeed');
+    if (sel) {
+        const want = String(Math.round(1000 / (r.fps || 8)));
+        if ([...sel.options].some(function (o) { return o.value === want; })) sel.value = want;
+    }
+    fsPlayShow();
+    fsPlayPlay();
+}
+
+function fsPlayStart() {
+    const items = (window._fsLast || []).filter(function (it) { return it && it.id != null; });
+    if (!items.length) return alert('当前没有可播放的检索结果，先搜一次');
+    const sorted = items.slice().sort(function (a, b) {
+        const ka = _fsPlayKey(a), kb = _fsPlayKey(b);
+        if (ka[0] !== kb[0]) return ka[0] < kb[0] ? -1 : 1;
+        if (ka[1] !== kb[1]) return ka[1] - kb[1];
+        return ka[2] - kb[2];
+    });
+    // 结果是"段"，把它展开成段内帧依次播；总量设上限，避免一次预加载上百 MB 图片
+    const CAP = 150;
+    const flat = [];
+    sorted.forEach(function (it) {
+        const fids = (it.segment && it.segment.frame_ids) || [it.id];
+        fids.forEach(function (fid) {
+            if (flat.length < CAP) {
+                flat.push({
+                    url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid,
+                    txt: '<b>' + ((it.segment && it.segment.video) || it.filename || '') + '</b> · #' + fid
+                });
+            }
+        });
+    });
+    if (!flat.length) return alert('没有可播放的帧');
+    if (sorted.length && (sorted.reduce(function (a, it) { return a + ((it.segment && it.segment.frame_count) || 1); }, 0) > CAP)) {
+        const cap0 = document.getElementById('fsPlayerCap');
+        if (cap0) cap0.dataset.trunc = '1';
+    }
+    fsPlayList = flat;
+    fsPlayI = 0;
+    const box = document.getElementById('fsPlayer');
+    if (!box) return;
+    box.style.display = 'flex';
+    fsPlayShow();
+    fsPlayPlay();
+    return false;
+}
+
+function fsPlayShow() {
+    const it = fsPlayList[fsPlayI];
+    if (!it) return;
+    window.cur = it.fid || it.id;      // 当前帧号：给"回看原帧"用
+    document.getElementById('fsPlayerImg').src = it.url
+        ? fullUrl(it.url)
+        : fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id);
+    if (it.txt) {                      // 原帧窗口：说明文字已组织好
+        document.getElementById('fsPlayerCap').innerHTML = it.txt;
+    } else {
+        const vs = it.video_source || {};
+        const vname = String(vs.video_path || it.video_path || '').split('/').pop();
+        document.getElementById('fsPlayerCap').innerHTML = '<b>#' + it.id + '</b>'
+            + (vname ? ' · ' + vname : '')
+            + (vs.frame_index != null ? ' · 原帧 ' + vs.frame_index : '')
+            + (vs.timestamp != null ? ' · ' + Number(vs.timestamp).toFixed(2) + 's' : '')
+            + (it.score != null ? ' · 匹配 ' + it.score : '');
+    }
+    document.getElementById('fsPlayerIdx').textContent = (fsPlayI + 1) + ' / ' + fsPlayList.length;
+    // 向前预取 30 帧，让"第一遍播"也顺（已经加载过的会走浏览器缓存，不重复请求）
+    for (let _k = fsPlayI + 1; _k <= Math.min(fsPlayI + 30, fsPlayList.length - 1); _k++) {
+        const _e = fsPlayList[_k];
+        if (_e && _e.url && !_e._pre) { _e._pre = 1; const _im = new Image(); _im.src = fullUrl(_e.url); }
+    }
+    const seek = document.getElementById('fsPlaySeek');
+    if (seek) {
+        if (parseInt(seek.max, 10) !== fsPlayList.length) seek.max = fsPlayList.length || 1;
+        if (parseInt(seek.value, 10) !== fsPlayI + 1) seek.value = fsPlayI + 1;
+    }
+}
+
+function fsPlayTick() {
+    if (fsPlayI >= fsPlayList.length - 1) {
+        const loop = document.getElementById('fsPlayLoop');
+        if (loop && loop.checked && fsPlayList.length) {   // 循环：回到第一帧继续
+            fsPlayI = 0;
+            fsPlayShow();
+            return;
+        }
+        fsPlayStop();
+        return;
+    }
+    fsPlayI++;
+    fsPlayShow();
+}
+
+// 从头播放：无论暂停/播到哪，都回到第一帧重新开始（快捷键 R）
+function fsPlayRestart() {
+    if (!fsPlayList.length) return;
+    fsPlayI = 0;
+    fsPlayShow();
+    fsPlayPlay();
+}
+
+// 拖动进度条跳帧（拖动期间不打断播放）
+function fsPlaySeek(v) {
+    const k = parseInt(v, 10) - 1;
+    if (k >= 0 && k < fsPlayList.length) {
+        fsPlayI = k;
+        fsPlayShow();
+    }
+}
+
+// 播放器快捷键：空格 播放/暂停、←/→ 上一帧/下一帧、R 从头、Esc 关闭
+document.addEventListener('keydown', function (ev) {
+    const p = document.getElementById('fsPlayer');
+    if (!p || p.style.display === 'none') return;
+    const tag = (ev.target && ev.target.tagName) || '';
+    if (ev.key === ' ') {
+        if (tag !== 'INPUT' && tag !== 'SELECT') { ev.preventDefault(); fsPlayToggle(); }
+    } else if (ev.key === 'ArrowLeft') {
+        ev.preventDefault(); fsPlayPrev();
+    } else if (ev.key === 'ArrowRight') {
+        ev.preventDefault(); fsPlayNext();
+    } else if (ev.key === 'r' || ev.key === 'R') {
+        fsPlayRestart();
+    } else if (ev.key === 'Escape') {
+        fsPlayClose();
+    }
+});
+
+function fsPlayApplySpeed() { if (fsPlayPlaying) { fsPlayStop(); fsPlayPlay(); } }
+
+// 用 requestAnimationFrame + 时间累加驱动，而不是 setInterval：
+// 窗口未聚焦/被遮挡时浏览器会把 setInterval 降到约 1Hz（实测 15fps 的段子只跑出 1 帧/秒），
+// rAF 跟着刷新率走，播放速率才是真的按设定帧率。
+function fsPlayPlay() {
+    const speed = parseInt((document.getElementById('fsPlaySpeed') || {}).value) || 500;
+    fsPlayStop();
+    fsPlayPlaying = true;
+    let last = (window.performance && performance.now) ? performance.now() : Date.now();
+    const step = function (now) {
+        if (!fsPlayPlaying) return;
+        const t = now || ((window.performance && performance.now) ? performance.now() : Date.now());
+        if (t - last >= speed) { last = t; fsPlayLast = t; fsPlayTick(); }
+        if (fsPlayPlaying) fsPlayRaf = requestAnimationFrame(step);
+    };
+    fsPlayRaf = requestAnimationFrame(step);
+    // 看门狗：某些内嵌/未聚焦视图里 rAF 完全不触发（页面不做合成），
+    // 这时用 setInterval 兜底补帧，保证在任何环境都能按设定帧率推进。
+    fsPlayLast = Date.now();
+    const wd = Math.max(60, speed);
+    if (fsPlayTimer) clearInterval(fsPlayTimer);
+    fsPlayTimer = setInterval(function () {
+        if (!fsPlayPlaying) return;
+        const nowMs = Date.now();
+        if (nowMs - fsPlayLast >= wd * 1.5) {   // rAF 停了 -> 自己走
+            fsPlayLast = nowMs;
+            fsPlayTick();
+        }
+    }, wd);
+    const b = document.getElementById('fsPlayerToggle');
+    if (b) b.innerText = '暂停';
+}
+
+function fsPlayStop() {
+    fsPlayPlaying = false;
+    if (fsPlayRaf) { cancelAnimationFrame(fsPlayRaf); fsPlayRaf = null; }
+    if (fsPlayTimer) { clearInterval(fsPlayTimer); fsPlayTimer = null; }
+    const b = document.getElementById('fsPlayerToggle');
+    if (b) b.innerText = '播放';
+}
+
+function fsPlayToggle() { fsPlayPlaying ? fsPlayStop() : fsPlayPlay(); }
+function fsPlayNext() { if (fsPlayI < fsPlayList.length - 1) { fsPlayI++; fsPlayShow(); } }
+function fsPlayPrev() { if (fsPlayI > 0) { fsPlayI--; fsPlayShow(); } }
+function fsPlayClose() {
+    fsPlayStop();
+    fsRenderPlayerTags(null);
+    const box = document.getElementById('fsPlayer');
+    if (box) box.style.display = 'none';
+}
+
 function fsOpen(it) {
 
     const lb = document.getElementById('fsLightbox');
@@ -4940,7 +5622,8 @@ function fsOpen(it) {
 
     img.src = fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id);
 
-    meta.innerHTML = '<b>#' + it.id + '</b> · score ' + it.score + ' · ' + (it.filename || '') + ' <span style="margin-left:12px;">(点击关闭)</span>';
+    meta.innerHTML = '<button class="secondary" style="font-size:11px; padding:2px 8px; margin-right:8px;" onclick="fsPlayOriginal(' + it.id + ', 30)" title="回到原始视频，取这一帧前后 30 帧连续画面、按视频真实帧率播放（抽帧是 1:N 稀疏的，连起来看不出真实运动）">▶ 回看原帧（前后30帧）</button>'
+        + '<b>#' + it.id + '</b> · score ' + it.score + ' · ' + (it.filename || '') + ' <span style="margin-left:12px;">(点击关闭)</span>';
 
     lb.style.display = 'block';
 
@@ -4999,8 +5682,16 @@ function daDownload(eid) {
         const fd = new FormData();
         fd.append('project', currentProject);
         try {
-            const r = await fetch(fullUrl('/api/prune_missing'), { method: 'POST', body: fd });
-            const d = await r.json();
+            let r = await fetch(fullUrl('/api/prune_missing'), { method: 'POST', body: fd });
+            let d = await r.json();
+            if (d.code === 409 && d.need_confirm) {     // 缺失比例过高：要一次显式确认
+                if (!confirm(d.msg + '
+
+确定继续清理吗？')) { if (btn) btn.disabled = false; return; }
+                fd.append('confirm', '1');
+                r = await fetch(fullUrl('/api/prune_missing'), { method: 'POST', body: fd });
+                d = await r.json();
+            }
             if (d.code === 200) {
                 alert('清理完成\n失效记录(黑片): ' + d.missing_files + ' 个已剔除\n现存文件: ' + d.existing_files + ' 个\n索引已重建: ' + (d.index_rebuilt ? '是' : '否') + '\n请重新筛选/刷新查看。');
                 if (typeof daLoadTable === 'function') daLoadTable();
@@ -5360,7 +6051,7 @@ function renderAuditQueue() {
         const statusColor = it.status === 'APPROVED' ? '#10b981' : (it.status === 'FILTERED' ? '#ef4444' : '#f59e0b');
         card.innerHTML = `
 
-            <img src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" onerror="this.style.visibility='hidden'">
+            <img data-nozoom="1" src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" onerror="this.style.visibility='hidden'">
             <div class="audit-card-info">
                 <div><b>#${it.id}</b> <span style="color:${statusColor};">${it.status || ''}</span></div>
                 <div>${reason || ''}</div>
@@ -5427,9 +6118,9 @@ async function auditShowCard(it) {
 
     const finalTags = detail.final_tags || {};
 
-    const dimOrder = ['time', 'weather', 'road', 'road_surface', 'objects', 'events', 'risk', 'scene'];
+    const dimOrder = ['time', 'weather', 'road', 'road_surface', 'objects', 'events', 'risk', 'traffic_sign', 'scene'];
 
-    const dimNames = {time:'时间', weather:'天气', road:'道路', road_surface:'路面', objects:'目标', events:'事件', risk:'风险', scene:'场景'};
+    const dimNames = {time:'时间', weather:'天气', road:'道路', road_surface:'路面', objects:'目标', events:'事件', risk:'风险', traffic_sign:'交通标识信号', scene:'场景'};
 
 
 
@@ -5591,24 +6282,60 @@ function auditNext() {
 }
     // AI检测+场景分析 进度条(轮询 DB 任务中心 RUNNING TAG job)
     let aiJobDoneAt = 0;
+    // 临时终止 / 暂停当前 AI 任务（后端 worker 逐帧检查信号）
+    async function aiCancelBatch() {
+        if (!confirm('临时终止当前 AI 任务？\n\n当前这一帧处理完就停，已经处理好的帧全部保留。\n之后重发时勾选「增量」，会自动从未处理的帧接着跑。')) return;
+        const fd = new FormData();
+        fd.append('project', currentProject);
+        let r = null;
+        try { r = await auditFetch('/api/pipeline/cancel', fd); } catch (e) {}
+        alert((r && r.msg) || '操作失败');
+        aiJobPoll();
+    }
+    async function aiTogglePause() {
+        const btn = document.getElementById('aiPauseBtn');
+        const wantResume = btn && btn.dataset.paused === '1';
+        const fd = new FormData();
+        fd.append('project', currentProject);
+        fd.append('resume', wantResume ? '1' : '0');
+        let r = null;
+        try { r = await auditFetch('/api/pipeline/pause', fd); } catch (e) {}
+        if (!r || r.code !== 200) return alert((r && r.msg) || '操作失败');
+        aiJobPoll();
+    }
+    // 暂停按钮状态同步：单独抽出来，"一键融合流程运行中"也必须调它，
+    // 否则按钮会永远停在启动那一刻的状态（起跑瞬间没有 RUNNING 任务 -> 一直是灰的）
+    function aiSyncPauseBtn(tagJob) {
+        const pbtn = document.getElementById('aiPauseBtn');
+        if (!pbtn) return;
+        pbtn.dataset.paused = (tagJob && tagJob.paused) ? '1' : '0';
+        pbtn.innerText = (tagJob && tagJob.paused) ? '继续' : '暂停';
+        pbtn.disabled = !tagJob;
+        pbtn.style.opacity = tagJob ? '1' : '0.45';
+        pbtn.style.cursor = tagJob ? 'pointer' : 'not-allowed';
+        pbtn.title = !tagJob
+            ? '当前没有正在运行的 AI 分析任务（按钮置灰）'
+            : (tagJob.paused ? '任务已暂停，点一下继续' : '暂停当前 AI 任务：帧间生效，不丢进度、不重载模型');
+    }
     async function aiJobPoll() {
         const box = document.getElementById('aiJobProg');
         if (!box) return;
-        if (window._fusedBusy) return;   // 一键融合流程运行中：进度由 auditRunBatch 自己写，避免被覆盖
         try {
             const d = await auditFetch('/api/pipeline/list?project=' + encodeURIComponent(currentProject || 'default') + '&limit=10');
             const jobs = (d && d.jobs) || [];
             const running = jobs.filter(j => j.job_type === 'TAG' && j.status === 'RUNNING');
             const tagJob = running.length ? running[0] : null;
+            aiSyncPauseBtn(tagJob);          // 按钮状态先同步（含融合流程运行期间）
+            if (window._fusedBusy) return;   // 进度由 auditRunBatch 自己写，避免被覆盖
             if (tagJob) {
                 aiJobDoneAt = 0;
                 box.style.display = 'block';
                 const pct = Math.max(0, Math.min(100, Math.round(tagJob.progress || 0)));
                 document.getElementById('aiJobBar').style.width = pct + '%';
                 document.getElementById('aiJobPct').innerText = pct + '%';
-                document.getElementById('aiJobStage').innerText = tagJob.current_stage || '处理中';
+                document.getElementById('aiJobStage').innerText = (tagJob.paused ? '已暂停 · ' : '') + (tagJob.current_stage || '处理中');
                 const err = tagJob.error || '';
-                document.getElementById('aiJobMsg').innerText = (err ? '' + err : 'job #' + tagJob.job_id);
+                document.getElementById('aiJobMsg').innerText = (err ? '' + err : 'job #' + tagJob.job_id + (tagJob.paused ? ' · 点「继续」恢复' : ''));
             } else {
                 const hasTag = jobs.some(j => j.job_type === 'TAG');
                 const lastDone = jobs.filter(j => j.job_type === 'TAG' && j.status === 'SUCCESS').sort((a,b)=>b.job_id-a.job_id)[0];
@@ -5641,30 +6368,21 @@ function fusedProg(stage, pct, msg) {
 }
 async function auditRunBatch() {
     if (window._fusedBusy) return alert('一键流程正在运行中，请等待完成');
-    const clipSize = parseInt((document.getElementById('clipSizeInput') || {}).value) || 50;
-    if (!confirm('将对当前项目执行一键 AI 分析：\n① 全部已入库帧的 AI检测+场景分析+自动决策\n② 每 ' + clipSize + ' 帧组成 Clip，逐片段 VLM 场景判定\n\n耗时较长，是否继续？')) return;
+    const clipSize = parseInt((document.getElementById('clipSizeInput') || {}).value) || 30;
+    const onlyNew = !!(document.getElementById('aiOnlyNew') || {}).checked;
+    if (!confirm('将对当前项目执行一键 AI 分析：\n① ' + (onlyNew ? '增量：只跑还没做过 AI 分析的帧（已跑过的自动跳过）' : '全量重跑：所有已入库帧都重做一遍') + '\n    （检测 + 场景分析 + 自动决策）\n② 每 ' + clipSize + ' 帧组成 Clip，逐片段 VLM 场景判定（只判未判定的）\n\n耗时较长，是否继续？')) return;
     window._fusedBusy = true;
     try {
-        // 取全部资产 id（走 list_all 分页拿全量）
-        let ids = [];
-        try {
-            let page = 1;
-            for (;;) {
-                const data = await auditFetch('/api/list_all?project=' + encodeURIComponent(currentProject) + '&page=' + page + '&size=200');
-                const items = (data && data.items) || [];
-                ids = ids.concat(items.map(it => it.id));
-                if (!data || page >= (data.total_pages || 1) || !items.length) break;
-                page++;
-            }
-        } catch (e) {}
-
+        // 不再由前端拉全量 id（14403 帧的 id 串既大又慢，而且会把已跑过的帧一起带上）；
+        // image_ids 留空 = 让后端自己挑帧
         // ===== ① 帧级：AI检测 + 场景分析 =====
-        if (ids.length) {
-            fusedProg('① 帧级 AI检测+场景分析', 0, '提交 ' + ids.length + ' 帧…');
+        {
+            fusedProg('① 帧级 AI检测+场景分析', 0, onlyNew ? '正在挑选未处理的帧…' : '全量重跑，提交中…');
             const fd = new FormData();
             fd.append('project', currentProject);
-            fd.append('image_ids', ids.join(','));
+            fd.append('only_unprocessed', onlyNew ? '1' : '0');
             fd.append('preset', 'balanced');
+            fd.append('clip_size', clipSize);   // Clip 段长：与 ② 的 clips/scan 用同一个值
             const fuseEl = document.getElementById('aiFuseDetect');
             fd.append('detect_first', (fuseEl && fuseEl.checked) ? '1' : '0');
             const dinoEl = document.getElementById('aiDinoEnhance');
@@ -5673,7 +6391,11 @@ async function auditRunBatch() {
             try { r = await auditFetch('/api/pipeline/run_ai_batch', fd); } catch (e) { fusedProg('① 启动异常', 0, e.message); }
             if (!r || r.code !== 200) {
                 fusedProg('① 启动失败', 0, (r && r.msg) || '未知错误');
+            } else if (r.pending === 0 || !r.job_id) {
+                // 增量模式下常见：没有待处理的帧，就不建任务，直接进 ② Clip 判定
+                fusedProg('① 无待处理帧（已跳过）', 60, r.msg || '所有帧都已跑过 AI 分析');
             } else {
+                fusedProg('① 帧级 AI检测+场景分析', 3, r.msg || '');
                 // 轮询等 TAG 任务结束（期间 aiJobPoll 由 _fusedBusy 让位，进度由这里写）
                 const t0 = Date.now();
                 for (;;) {
@@ -5693,8 +6415,6 @@ async function auditRunBatch() {
                         (cur.current_stage || '处理中') + ' · job #' + cur.job_id + ' · 已等待 ' + mins + ' 分');
                 }
             }
-        } else {
-            fusedProg('① 跳过（项目暂无帧）', 60, '');
         }
 
         // ===== ② Clip 级：组 Clip + 逐片段 VLM 判定 =====

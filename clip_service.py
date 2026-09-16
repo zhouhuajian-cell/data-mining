@@ -5,8 +5,8 @@ import numpy as np
 
 _clips_lock = threading.Lock()
 
-def build_clips_from_metadata(ctx, clip_size=50):
-    """把底库中已抽帧的图片按 video_source + 时间戳分组成 50 帧窗口。
+def build_clips_from_metadata(ctx, clip_size=30):
+    """把底库中已抽帧的图片按 video_source + 时间戳分组成 30 帧窗口（Clip 统一 30 帧）。
     重建时保留同 clip_id 的已有结果(vlm_result/decision/human_tags)，否则重跑 scan 会冲掉
     全部 AI 判定与人工审核结果。"""
     try:

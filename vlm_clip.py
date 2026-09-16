@@ -16,6 +16,15 @@ for _old, _new in _alias_map().items():
     _DIM_ALIASES.setdefault(_new, []).append(_old)
 
 
+def _ev_hints() -> str:
+    """易混事件判据（与帧级/联合打标共用本体真源，避免两处口径跑偏）。"""
+    try:
+        from ontology import event_hints_text
+        return event_hints_text()
+    except Exception:
+        return ""
+
+
 def build_clip_prompt():
     """枚举全部来自统一本体(scene.json)，维度名与帧级链路一致(road/road_surface/scene)，
     这样帧级与 Clip 级产出的标签可以直接放进同一张分布表聚合。"""
@@ -35,7 +44,8 @@ def build_clip_prompt():
         "{\n"
         f'  "scene": {{"time": ["<从枚举选>"], "weather": ["<从枚举选>"], '
         f'"road": ["<从枚举选>"], "road_surface": ["<从枚举选>"], "scene": ["<从枚举选>"], '
-        f'"lighting": ["<从枚举选>"], "traffic_state": ["<从枚举选>"]}},\n'
+        f'"lighting": ["<从枚举选>"], "traffic_state": ["<从枚举选>"], '
+        f'"traffic_sign": ["<从枚举选>"]}},\n'
         f'  "ego_vehicle": {{"state": ["<从枚举选>"], "confidence": <0.0~1.0真实数值>}},\n'
         f'  "objects": [{{"type": "<从枚举选>", "state": ["<从枚举选>"], "confidence": <0.0~1.0真实数值>}}],\n'
         f'  "events": [{{"type": "<从枚举选>", "confidence": <0.0~1.0真实数值>, '
@@ -65,7 +75,9 @@ def build_clip_prompt():
         "9. 不确定是否有事件时，events 输出空数组 []，宁可少报也不要套一个常见事件；\n"
         "10. 所有维度值必须是数组：即使只有一个值也要写成 [\"值\"]，禁止写成裸字符串；\n"
         "11. objects 和 events 最多各输出 5 条，取最关键的，不要重复罗列同类目标；\n"
-        "12. 输出必须是一个完整闭合的 JSON 对象，最后一个字符是 }。"
+        "12. 输出必须是一个完整闭合的 JSON 对象，最后一个字符是 }；\n"
+        "13. 同一段里的用词要一致，事件判据见下：\n"
+        + _ev_hints()
     )
 
 
