@@ -848,6 +848,7 @@ def create_project(project_name: str = Form(...)):
     if DB_PATCH_AVAILABLE:
         try:
             name = create_project_db(clean_name)
+            _mark_project_deleted(clean_name, False)   # 显式新建 = 解除删除名单
             _cp = get_project_paths(clean_name)
             os.makedirs(_cp[2], exist_ok=True)
             load_project_context(clean_name)
@@ -908,9 +909,12 @@ def delete_project(project_name: str = Form(...)):
             return {"code": 500, "msg": f"数据库清理失败: {str(e)}"}
     if clean_name in project_cache:
         del project_cache[clean_name]
+    # 记入删除名单：网盘目录还在也不许自动补建，否则前端轮询会把它复活（"删不掉"）
+    _mark_project_deleted(clean_name)
     return {
         "code": 200,
-        "msg": f"项目 [{clean_name}] 数据库已清理。数据文件目录保留(未删除), 请手动删除",
+        "msg": f"项目 [{clean_name}] 数据库已清理，并已记入删除名单（不会再自动出现）。"
+               f"数据文件目录保留(未删除), 请手动删除",
     }
 @app.get("/api/image/{project}/{image_id}")
 def get_image(project: str, image_id: int):
@@ -929,10 +933,41 @@ def get_image(project: str, image_id: int):
             if self_heal_path:
                 return FileResponse(self_heal_path)
     return JSONResponse(status_code=404, content={"msg": "图片不存在"})
+_DB_STATS_CACHE = {}      # project -> (ts, raw_count)；网盘目录扫描很慢，缓存 60 秒
+_DB_STATS_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+def _db_stats_scan(img_dir: str) -> int:
+    """递归数一次图片文件（抽帧已分桶到子目录，必须递归；不递归会漏掉新抽的帧）。"""
+    n = 0
+    try:
+        for _root, _dirs, _files in os.walk(img_dir):
+            n += sum(1 for f in _files if f.lower().endswith(_DB_STATS_EXT))
+    except Exception:
+        return 0
+    return n
+def _db_stats_refresh(project: str, img_dir: str):
+    try:
+        _DB_STATS_CACHE[project] = (time.time(), _db_stats_scan(img_dir))
+    except Exception:
+        pass
+def _db_stats_raw_count(project: str, img_dir: str) -> int:
+    """带缓存的原始帧数：命中缓存直接返回；有旧值但过期 -> 先用旧值、后台线程刷新；
+    完全没有缓存（首次）才同步扫一次。这样接口不会因为扫网盘目录卡 20 秒。"""
+    _c = _DB_STATS_CACHE.get(project)
+    if _c and (time.time() - _c[0]) < 60:
+        return _c[1]
+    if _c:
+        try:
+            threading.Thread(target=_db_stats_refresh, args=(project, img_dir), daemon=True).start()
+        except Exception:
+            pass
+        return _c[1]
+    n = _db_stats_scan(img_dir)
+    _DB_STATS_CACHE[project] = (time.time(), n)
+    return n
 @app.get("/api/db_stats")
 def get_db_stats(project: str = Query("default")):
     ctx = load_project_context(project)
-    if not _project_exists_on_disk(ctx["name"]):
+    if ctx["name"] in _deleted_projects() or not _project_exists_on_disk(ctx["name"]):
         # 网盘目录已被删除的项目：绝不能顺手 makedirs 把目录建回来——这个接口是前端
         # 进入工作台/切换项目时必调的，一建就会把删掉的项目在网盘里重新"跳出来"。
         project_cache.pop(ctx["name"], None)  # 顺带丢掉残留缓存，避免显示旧统计
@@ -944,12 +979,9 @@ def get_db_stats(project: str = Query("default")):
             "missing": True,
         }
     os.makedirs(ctx["img_dir"], exist_ok=True)  # 防网盘根缺目录 FileNotFoundError(500)
-    raw_images = [
-        f
-        for f in os.listdir(ctx["img_dir"])
-        if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
-    ]
-    raw_count = len(raw_images)
+    # 抽帧已按视频分桶到子目录（images/<视频名>/），这里必须递归统计，
+    # 否则"原始数据池"会把新抽的帧全部漏掉（平铺时代只数顶层）。
+    raw_count = _db_stats_raw_count(ctx["name"], ctx["img_dir"])
     processed_count = ctx["index"].ntotal if ctx["index"] is not None else 0
     return {
         "project": ctx["name"],
@@ -1398,7 +1430,9 @@ def _extract_entry(path, project):
                 "total_count": 0,
             },
         )
-        if not entry.get("project"):
+        # 项目名必须跟随【本次提交】：同一路径可能先在别的项目下抽过帧，
+        # 记录里留着旧项目名的话，大盘会把这任务归到旧项目（表现为"任务在 MG、进度跑 HS"）。
+        if project and entry.get("project") != project:
             entry["project"] = project
         entry.setdefault("is_cancelled", False)  # 兼容历史记录
         return entry
@@ -1419,7 +1453,8 @@ def _video_entry(video_path, project):
             },
         )
         entry["task_type"] = "video"
-        if not entry.get("project"):
+        # 同上：跟随本次提交的项目，别留着首次登记时的旧项目
+        if project and entry.get("project") != project:
             entry["project"] = project
         entry.setdefault("is_cancelled", False)
         return entry
@@ -1772,6 +1807,15 @@ def _extract_video_frames(
         os.makedirs(ctx["img_dir"], exist_ok=True)
     except Exception as e:
         raise Exception(f"无法创建项目图片目录 {ctx['img_dir']}: {e}")
+    # 分桶：同一视频的帧写进 images/<视频名>/ 子目录。平铺目录堆到几万张后，CIFS 上
+    # 建文件/列目录会退化到秒级（实测 7.5 万文件 listdir 22s，抽帧从几帧/秒掉到 0.1 帧/秒）。
+    _stem = os.path.splitext(os.path.basename(video_path))[0]
+    _bucket_name = re.sub(r"[^0-9A-Za-z_.\-一-鿿]+", "_", _stem)[:64] or name_prefix
+    _out_dir = os.path.join(ctx["img_dir"], _bucket_name)
+    try:
+        os.makedirs(_out_dir, exist_ok=True)
+    except Exception as e:
+        raise Exception(f"无法创建帧输出子目录 {_out_dir}: {e}")
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     if not video_fps or video_fps <= 0:
         video_fps = 30.0
@@ -1822,10 +1866,13 @@ def _extract_video_frames(
     first_frame_saved = False
     def _save_frame(frame):
         nonlocal saved, last_hist, since_last_save, first_frame_saved
-        fn = f"{name_prefix}_{int(time.time() * 1000)}_{saved:06d}.jpg"
+        # 用【源帧号】命名而不是毫秒时间戳：同一视频重跑时同名文件已存在会被跳过，
+        # 既能续做也不会重复抽（原来每次重跑都生成一批新名字的重复帧）。
+        _fno = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+        fn = f"{_bucket_name}_{_fno:06d}.jpg"
         if fn in existing_filenames:
             return False
-        dst = os.path.join(ctx["img_dir"], fn)
+        dst = os.path.join(_out_dir, fn)
         ok = False
         try:
             ok = bool(cv2.imwrite(dst, frame, [cv2.IMWRITE_JPEG_QUALITY, 95]))
@@ -1834,7 +1881,7 @@ def _extract_video_frames(
         if not ok:
             # 目录不可写/磁盘满/网盘掉线：必须报错，否则统计为0帧却提示成功(静默丢数据)
             raise Exception(
-                f"帧写入失败（目录不可写或网盘未挂载）: {ctx['img_dir']}"
+                f"帧写入失败（目录不可写或网盘未挂载）: {_out_dir}"
             )
         if os.path.exists(dst):
             new_saved_paths.append(dst)
@@ -1933,36 +1980,80 @@ def _run_video_list(
     total_saved = 0
     cancelled = False
     errors = []
-    for idx, vp in enumerate(videos, 1):
-        if entry.get("is_cancelled"):
-            cancelled = True
-            break
-        entry["current_path"] = vp
-        entry["msg"] = f"[{idx}/{len(videos)}] 正在抽帧: {os.path.basename(vp)}"
+    # 视频级并行：原来逐个视频串行，20 核机器上只用一个核。cv2 解码会释放 GIL，
+    # 实测单线程解码 164 帧/秒、写网盘 53 源帧/秒，远没吃满，多视频并行能直接提升总吞吐。
+    # 默认 1 = 与原来串行行为完全一致；用 AD_EXTRACT_WORKERS 打开（如 4）。
+    _K = max(1, int(os.environ.get("AD_EXTRACT_WORKERS", "1")))
+    _plock = threading.Lock()
+
+    def _one_video(_idx, _vp):
+        """单视频抽帧：用线程私有缓冲，避免并发写同一容器。"""
+        _lp, _lm = [], {}
         try:
-            saved = _extract_video_frames(
-                ctx,
-                vp,
-                step,
-                unit,
-                entry,
-                existing_filenames,
-                new_saved_paths,
-                f"v{idx}",
-                frame_meta=frame_meta,
-                mode=mode,
-                n_frames=n_frames,
-                ratio=ratio,
+            _sv = _extract_video_frames(
+                ctx, _vp, step, unit, entry, existing_filenames, _lp, f"v{_idx}",
+                frame_meta=_lm, mode=mode, n_frames=n_frames, ratio=ratio,
                 adapt_threshold=adapt_threshold,
             )
-            total_saved += saved
-        except Exception as e:
-            errors.append(f"{os.path.basename(vp)}: {e}")
-            _log(f"✖ 单个视频抽帧失败 {vp}: {str(e)}")
-            entry["msg"] = (
-                f"[{idx}/{len(videos)}] {os.path.basename(vp)} 抽帧失败: {str(e)}"
-            )
-        entry["processed_count"] = idx
+        except Exception as _e:
+            return _idx, _vp, None, [], {}, str(_e)
+        return _idx, _vp, _sv, _lp, _lm, None
+
+    def _merge_done(_idx, _vp, _sv, _lp, _lm, _err, _n):
+        """按【提交顺序】合并：metadata 与向量 id 的对应关系不能被打乱。"""
+        nonlocal total_saved
+        if _err:
+            errors.append(f"{os.path.basename(_vp)}: {_err}")
+            _log(f"✖ 单个视频抽帧失败 {_vp}: {_err}")
+        else:
+            total_saved += _sv
+            new_saved_paths.extend(_lp)
+            if frame_meta is not None:
+                frame_meta.update(_lm)
+        with _plock:
+            entry["processed_count"] = _idx
+            entry["current_path"] = _vp
+            entry["msg"] = (f"[{_idx}/{_n}] 已抽 {total_saved} 张"
+                             + (f"（{_K} 路并行）" if _K > 1 else "")
+                             + f" 最新: {os.path.basename(_vp)}")
+        # 分块向量化：每满一批立刻入库并清空缓冲（大目录不会把几十万条路径堆在内存里）
+        if frame_meta is not None and len(new_saved_paths) >= max(200, int(os.environ.get("AD_VEC_CHUNK", "2000"))):
+            extract_and_index_project(ctx, new_saved_paths, frame_meta=frame_meta)
+            for _p in new_saved_paths:
+                frame_meta.pop(_p, None)
+            new_saved_paths.clear()
+            save_project_context(ctx)
+
+    if _K > 1 and len(videos) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        _n = len(videos)
+        with ThreadPoolExecutor(max_workers=_K) as _ex:
+            _futs = []
+            for idx, vp in enumerate(videos, 1):
+                if entry.get("is_cancelled"):
+                    cancelled = True
+                    break
+                _futs.append(_ex.submit(_one_video, idx, vp))
+            for _f in _futs:
+                _merge_done(*_f.result(), _n)
+    else:
+        for idx, vp in enumerate(videos, 1):
+            if entry.get("is_cancelled"):
+                cancelled = True
+                break
+            entry["current_path"] = vp
+            entry["msg"] = f"[{idx}/{len(videos)}] 正在抽帧: {os.path.basename(vp)}"
+            try:
+                saved = _extract_video_frames(
+                    ctx, vp, step, unit, entry, existing_filenames, new_saved_paths, f"v{idx}",
+                    frame_meta=frame_meta, mode=mode, n_frames=n_frames, ratio=ratio,
+                    adapt_threshold=adapt_threshold,
+                )
+                total_saved += saved
+            except Exception as e:
+                errors.append(f"{os.path.basename(vp)}: {e}")
+                _log(f"✖ 单个视频抽帧失败 {vp}: {str(e)}")
+            entry["processed_count"] = idx
     vec = 0
     if new_saved_paths:
         entry["msg"] = (
@@ -2519,7 +2610,7 @@ async def upload_batch(
 async def build_index_online(project: str = Query("default")):
     _log(f"[向量化] 触发在线向量化 project={project}")
     ctx = load_project_context(project)
-    if not _project_exists_on_disk(ctx["name"]):
+    if ctx["name"] in _deleted_projects() or not _project_exists_on_disk(ctx["name"]):
         return {
             "code": 404,
             "msg": f"项目 [{ctx['name']}] 的目录不存在（已删除的项目不会被重建），无法向量化",
@@ -3745,15 +3836,46 @@ def _find_db_asset(project: str, image_id: int):
         except Exception:
             pass
         return None, None, None
+_DELETED_PROJECTS_PATH = os.path.join(PROJECT_DIR, "_deleted_projects.json")
+def _deleted_projects() -> set:
+    """平台里被【显式删除】过的项目名。
+
+    删项目只清数据库记录、不删网盘文件（平台红线：不自动删用户文件），所以目录还在——
+    只按"目录存在"判断，就会把刚删掉的项目又自动补建回来（前端若还停在旧项目名上轮询，
+    表现为"项目删不掉"）。这里把删除动作记下来，自动补建一律让路；
+    只有显式新建（/api/projects/create）时才解除标记。"""
+    try:
+        with open(_DELETED_PROJECTS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        names = d.get("names") if isinstance(d, dict) else d
+        return set(str(x) for x in (names or []))
+    except Exception:
+        return set()
+def _mark_project_deleted(name: str, deleted: bool = True):
+    """记 / 解除项目的删除标记（best-effort：写不进去也不影响删除本身）。"""
+    try:
+        names = _deleted_projects()
+        if deleted:
+            names.add(name)
+        else:
+            names.discard(name)
+        with open(_DELETED_PROJECTS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"names": sorted(names)}, f, ensure_ascii=False, indent=1)
+        _log(f"[项目] {'记入删除名单' if deleted else '解除删除名单'}: {name}")
+    except Exception as e:
+        _log(f"[项目] 删除标记写入失败(不影响删除): {e}")
 def _ensure_db_project(db, project_name: str):
     """DB 层项目兜底：同名项目目录存在时，自动补建 DB Project 记录（避免双轨 404）。
 
-    目录不存在的项目名【不】补建：那是已删除（或从未存在）的项目，补建会把它在
-    任何带 project 参数的轮询里凭空复活。返回 None 表示项目不存在，调用方按
-    "数据库未就绪/项目不存在"处理（各调用点已判空）。"""
+    两种情况下【不】补建：① 目录不存在（从未存在或网盘里已删）；
+    ② 该项目被平台显式删除过（删除名单）。否则前端还停在旧项目名上的轮询会把它凭空复活。
+    返回 None 表示项目不可用，调用方按"数据库未就绪/项目不存在"处理（各调用点已判空）。"""
     from db_service import get_project, create_project
     proj = get_project(db, project_name)
     if proj is None:
+        if project_name in _deleted_projects():
+            _log(f"[DB] 项目 [{project_name}] 已被显式删除，不自动补建（如需恢复请显式新建）")
+            return None
         if not _project_exists_on_disk(project_name):
             _log(f"[DB] 项目 [{project_name}] 目录不存在，不补建记录（已删除项目不复活）")
             return None
@@ -7638,13 +7760,34 @@ def prune_missing(project: str = Form("default"), confirm: str = Form(None)):
         vid_updated = 0
         if missing:
             with _project_lock(ctx["name"]):
-                ctx["metadata"] = []
-                ctx["index"] = (
-                    faiss.IndexFlatIP(FEAT_DIM)
-                    if (not LITE_MODE and faiss is not None)
-                    else _FakeIndex(FEAT_DIM)
-                )
-                extract_and_index_project(ctx, existing)
+                # 不重新跑 SigLIP：IndexFlat 能按位置把向量取回来，按"现存项"的下标挑出来即可
+                # （原来是清空索引再对全部现存图片重新编码 —— 实测 3 万张图要几十分钟）。
+                # 任何一步不对就退回原来的重新编码路径，保证结果正确优先。
+                _miss = set(missing)
+                _keep = [i for i, m in enumerate(ctx["metadata"])
+                         if m.get("path") and m["path"] not in _miss]
+                _ok = False
+                try:
+                    if (not LITE_MODE) and faiss is not None and ctx.get("index") is not None \
+                            and ctx["index"].ntotal == len(ctx["metadata"]) and _keep:
+                        import numpy as _np
+                        _vecs = _np.vstack([ctx["index"].reconstruct(int(i)) for i in _keep])
+                        _idx = faiss.IndexFlatIP(FEAT_DIM)
+                        _idx.add(_vecs)
+                        ctx["index"] = _idx
+                        ctx["metadata"] = [ctx["metadata"][i] for i in _keep]
+                        _ok = True
+                        _log(f"[清理] 索引按位置复用向量重建: 保留 {len(_keep)} 项（未重新编码）")
+                except Exception as _e:
+                    _log(f"[清理] 向量复用失败，退回重新编码: {_e}")
+                if not _ok:
+                    ctx["metadata"] = []
+                    ctx["index"] = (
+                        faiss.IndexFlatIP(FEAT_DIM)
+                        if (not LITE_MODE and faiss is not None)
+                        else _FakeIndex(FEAT_DIM)
+                    )
+                    extract_and_index_project(ctx, existing)
                 rebuilt = True
             if proj:
                 try:
