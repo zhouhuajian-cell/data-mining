@@ -1009,12 +1009,14 @@ def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = 
             torch.backends.cudnn.benchmark = True
         except Exception:
             pass
-    # 提高 DataLoader 并行解码/预处理线程数，让 CPU 预处理持续喂饱 GPU
-    n_workers = 8 if DEVICE == "cuda" else 0
-    dl_kwargs = dict(batch_size=128, shuffle=False, pin_memory=True)
+    # DataLoader 并行度：原来 batch=128 + 8 workers + prefetch=2，单任务的共享内存峰值就有几 GB；
+    # 多个抽帧任务并发向量化时会叠加，实测把 31GB 机器打爆（OOM 连 VS Code/飞书一起杀）。
+    # 32 张一批 + 2 个解码进程足够喂饱这张 12G 卡，内存峰值降一个数量级，整体更快更稳。
+    n_workers = 2 if DEVICE == "cuda" else 0
+    dl_kwargs = dict(batch_size=32, shuffle=False, pin_memory=True)
     if n_workers > 0:
         dl_kwargs["num_workers"] = n_workers
-        dl_kwargs["prefetch_factor"] = 2
+        dl_kwargs["prefetch_factor"] = 1
     dataset = SigLIPImageDataset(image_paths)
     dataloader = DataLoader(dataset, **dl_kwargs)
     extracted_feats = []
