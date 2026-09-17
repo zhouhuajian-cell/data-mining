@@ -482,6 +482,193 @@ def _vram_log(tag):
     g = _vram_free_gb()
     if g is not None:
         print(f"[VRAM] {tag}: 可用 {g:.2f} GB", flush=True)
+# ----------------- 资源探测与自适应（内存/负载驱动并发与批大小） -----------------
+# 设计：默认全关（AD_VEC_ADAPTIVE/AD_EXTRACT_ADAPTIVE=0）——不打开时行为与历史完全一致。
+# 打开后按"当前可用内存"选档：内存充足上探拿效率，紧张自动下退；跌破地板由看门狗减载。
+# 所有探测都读 /proc，任何失败/非 Linux 一律返回 None，调用方必须能接受 None 并退回固定值。
+def _meminfo():
+    """解析 /proc/meminfo -> {key: MB}；失败返回 None。"""
+    try:
+        out = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts and parts[0].isdigit():
+                    out[k.strip()] = int(parts[0]) / 1024.0     # kB -> MB
+        return out or None
+    except Exception:
+        return None
+def _mem_avail_mb():
+    m = _meminfo()
+    return m.get("MemAvailable") if m else None
+def _mem_total_mb():
+    m = _meminfo()
+    return m.get("MemTotal") if m else None
+def _swap_used_ratio():
+    """swap 已用比例 0~1；无 swap 或读不到返回 None。"""
+    try:
+        m = _meminfo()
+        if not m:
+            return None
+        total = m.get("SwapTotal") or 0.0
+        if total <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (total - (m.get("SwapFree") or 0.0)) / total))
+    except Exception:
+        return None
+def _swap_used_mb():
+    """swap 已用(MB)；读不到返回 None。
+
+    ⚠️ 不要用"swap 使用率绝对值"当警戒线：这台机器 swap 曾被 OOM 时期占满，
+    事后内核不会主动回收（实测长期 100%、而可用内存仍有 20G+），按绝对值会永久误报。
+    判断内存压力要看**增长趋势**（见看门狗里的 prev_swap 增量）。"""
+    try:
+        m = _meminfo()
+        if not m:
+            return None
+        return max(0.0, (m.get("SwapTotal") or 0.0) - (m.get("SwapFree") or 0.0))
+    except Exception:
+        return None
+def _load1():
+    try:
+        with open("/proc/loadavg", "r") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
+def _ncpu():
+    try:
+        return os.cpu_count() or 1
+    except Exception:
+        return 1
+def _proc_rss_mb():
+    """本进程 RSS(MB)；失败返回 None。"""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+_PERF_EVENTS = []           # 最近的自适应事件（降档/告警），供 /api/perf_stats 看
+_PERF_STATE = {"vec": None, "vec_why": "", "force_low": False, "k": None, "k_why": ""}
+def _perf_event(msg):
+    """记一条自适应事件：日志 + 环形表（只留最近 20 条）。"""
+    try:
+        _PERF_EVENTS.append((time.strftime("%H:%M:%S"), str(msg)))
+        del _PERF_EVENTS[:-20]
+        _log(f"[自适应] {msg}")
+    except Exception:
+        pass
+def _adaptive_flag(env_name):
+    return str(os.environ.get(env_name, "0")).strip().lower() in ("1", "true", "yes", "on")
+def _env_int(env_name, default, lo=None, hi=None):
+    try:
+        v = int(os.environ.get(env_name, str(default)))
+    except Exception:
+        v = int(default)
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+def _mem_floor_mb():
+    return _env_int("AD_MEM_FLOOR_MB", 2048, lo=256)
+def _vec_tier(prev=None):
+    """按可用内存选向量化档位 -> (batch, workers, prefetch, 依据)。
+
+    档位表（上探到 batch=64/workers=4 是这次的目标，下限档连解码进程都不起）：
+      >= 12G -> 64/4/2 ；8~12G -> 32/2/1（=历史安全值）；4~8G -> 16/1/1；< 4G -> 8/0/1
+    防抖：降档立即、升档需连续 3 次评估都够（_PERF_STATE["up_hits"]）。
+    另受 AD_VEC_BATCH_MAX / AD_VEC_WORKERS_MAX 封顶、force_low 强制最低档。"""
+    avail = _mem_avail_mb()
+    bmax = _env_int("AD_VEC_BATCH_MAX", 64, lo=8)
+    wmax = _env_int("AD_VEC_WORKERS_MAX", 4, lo=0)
+    hi = _env_int("AD_MEM_TIER_HIGH_MB", 12288, lo=512)
+    mid = _env_int("AD_MEM_TIER_MID_MB", 8192, lo=512)
+    low = _env_int("AD_MEM_TIER_LOW_MB", 4096, lo=256)
+    if _PERF_STATE.get("force_low"):
+        return (8, 0, 1, "看门狗强制最低档")
+    if avail is None:
+        return (32, 2, 1, "读不到 /proc/meminfo，退回历史安全值")
+    if avail >= hi:
+        want, why = (64, 4, 2), "可用 %.0fG>=%.0fG" % (avail / 1024, hi / 1024)
+    elif avail >= mid:
+        want, why = (32, 2, 1), "可用 %.0fG 在 %.0f~%.0fG" % (avail / 1024, mid / 1024, hi / 1024)
+    elif avail >= low:
+        want, why = (16, 1, 1), "可用 %.0fG 在 %.0f~%.0fG" % (avail / 1024, low / 1024, mid / 1024)
+    else:
+        want, why = (8, 0, 1), "可用 %.0fG < %.0fG" % (avail / 1024, low / 1024)
+    b, w, p = min(want[0], bmax), min(want[1], wmax), want[2]
+    if prev is not None:
+        # 降档立即；升档要连续 3 次够格，避免在阈值附近来回抖
+        if b > prev[0] or w > prev[1]:
+            hits = _PERF_STATE.get("up_hits", 0) + 1
+            _PERF_STATE["up_hits"] = hits
+            if hits < 3:
+                return (prev[0], prev[1], prev[2], "升档待确认(%d/3) %s" % (hits, why))
+            _PERF_STATE["up_hits"] = 0
+        else:
+            _PERF_STATE["up_hits"] = 0
+    return (b, w, p, why)
+def _pick_extract_k():
+    """抽帧并行度 K：按可用内存 + load1/核数在 1..AD_EXTRACT_WORKERS_MAX 里选。
+
+    只在任务起点决策（运行中不改 K：并发抽帧必须按提交顺序合并，动 K 会碰 id 映射）。"""
+    kmax = _env_int("AD_EXTRACT_WORKERS_MAX", 8, lo=1)
+    avail = _mem_avail_mb()
+    load = _load1()
+    n = _ncpu()
+    if avail is None or load is None:
+        k = 1
+        why = "读不到 /proc（内存或负载），保守取 1"
+    elif avail >= 12288 and load < 0.5 * n:
+        k, why = kmax, "可用 %.0fG>=12G 且 load1 %.1f<%.1f" % (avail / 1024, load, 0.5 * n)
+    elif avail >= 8192 and load < 0.8 * n:
+        k, why = max(2, kmax // 2), "可用 %.0fG>=8G 且 load1 %.1f<%.1f" % (avail / 1024, load, 0.8 * n)
+    else:
+        k, why = 1, "可用 %.0fG / load1 %.1f 偏紧，取 1" % (avail / 1024, load)
+    k = max(1, min(k, kmax))
+    _PERF_STATE["k"], _PERF_STATE["k_why"] = k, why
+    return k, why
+def _start_perf_watchdog():
+    """看门狗：只减载、绝不加载。可用内存跌破地板、或 swap **增长**超过阈值时：
+    ① 向量化强制最低档；② 暂停自动向量化（touch AUTO_VEC_OFF）；③ 告警。
+    不自动恢复——确认安全后人工 rm 掉 AUTO_VEC_OFF，避免反复横跳。"""
+    every = _env_int("AD_PERF_WATCH_SEC", 30, lo=5)
+    grow_mb = _env_int("AD_SWAP_GROW_MB", 256, lo=16)
+    def _loop():
+        prev_swap = _swap_used_mb()
+        while True:
+            try:
+                time.sleep(every)
+                if _PERF_STATE.get("force_low"):
+                    continue
+                avail = _mem_avail_mb()
+                swap = _swap_used_mb()
+                bob = "可用内存 %.0fMB < 地板 %dMB" % (avail, _mem_floor_mb()) if (avail is not None and avail < _mem_floor_mb()) else ""
+                sob = ""
+                if swap is not None and prev_swap is not None and (swap - prev_swap) >= grow_mb:
+                    sob = "swap 本周期增长 %.0fMB(>=%dMB)" % (swap - prev_swap, grow_mb)
+                if swap is not None:
+                    prev_swap = swap
+                if not bob and not sob:
+                    continue
+                _PERF_STATE["force_low"] = True
+                try:
+                    open(_AUTO_VEC_OFF_FILE, "w").close()          # 暂停自动向量化
+                except Exception:
+                    pass
+                _perf_event("内存警戒(%s)：向量化已压到最低档并暂停自动向量化；"
+                            "处理后需人工 rm workspace/AUTO_VEC_OFF 才恢复" % (bob or sob))
+            except Exception:
+                pass
+    try:
+        threading.Thread(target=_loop, daemon=True).start()
+        _log(f"[自适应] 看门狗已启动（周期 {every}s，内存地板 {_mem_floor_mb()}MB，swap 增长阈值 {grow_mb}MB）")
+    except Exception:
+        pass
 def _free_siglip():
     """真正释放 SigLIP。GPUManager 只持有它自己那份引用，app 的全局不置空则显存不归还
     （这正是之前 make_room_for “腾不动”、SigLIP 与 7B 并存占满 10.2G 的原因）。"""
@@ -694,10 +881,40 @@ class _FakeIndex:
         )
     def reconstruct_n(self, a, b):
         return None
+def _project_cache_evict_oldest(keep: str = ""):
+    """project_cache 上限（AD_PROJECT_CACHE_MAX，默认 3）：超了淘汰最久未用的项目。
+
+    为什么要淘汰：每个访问过的项目都会把 metadata(list[dict]) + FAISS 索引常驻，
+    185k 帧约 0.9GB（索引每帧 4608B）+ 字典几百 MB，多项目切换后全留在内存里。
+    ⚠️ **跳过"正在跑抽帧任务"的项目**——否则会把它正在写的 metadata/索引释放掉。
+    淘汰只是从缓存移除（释放内存），下次使用时从盘上重载，语义不变。"""
+    try:
+        cap = _env_int("AD_PROJECT_CACHE_MAX", 3, lo=1)
+        if len(project_cache) <= cap:
+            return
+        busy = set()
+        try:
+            with _extract_lock:
+                for _e in extract_task_pool.values():
+                    if _e.get("is_running") and _e.get("project"):
+                        busy.add(_e["project"])
+        except Exception:
+            pass
+        for _k in list(project_cache.keys()):
+            if len(project_cache) <= cap:
+                break
+            if _k == keep or _k in busy:
+                continue
+            project_cache.pop(_k, None)
+            _log(f"[缓存] 释放项目上下文 {_k}（project_cache 上限 {cap}，下次用时从盘重载）")
+    except Exception:
+        pass
 def load_project_context(project_name: str):
     p_name, p_dir, img_dir, idx_path, meta_path = get_project_paths(project_name)
     if p_name in project_cache:
-        return project_cache[p_name]
+        _hit = project_cache.pop(p_name)    # 命中就挪到队尾（LRU：最久未用的先出）
+        project_cache[p_name] = _hit
+        return _hit
     metadata = []
     if os.path.exists(meta_path):
         try:
@@ -726,6 +943,7 @@ def load_project_context(project_name: str):
         "metadata": metadata,
     }
     project_cache[p_name] = ctx
+    _project_cache_evict_oldest(keep=p_name)
     return ctx
 def save_project_context(ctx):
     with _project_lock(ctx["name"]):
@@ -746,6 +964,8 @@ def startup_event():
     _start_compression()  # 后台线程每小时压缩
     _load_passwords()  # 读取持久化密码（若有）
     _cleanup_stale_jobs()  # 重启后清理僵尸 RUNNING/PENDING（诚实标 FAILED 可续跑）
+    if _adaptive_flag("AD_VEC_ADAPTIVE"):
+        _start_perf_watchdog()   # 内存地板看门狗（只在自适应开启时跑；只减载不加载）
     # 初始化数据库补丁
     if DB_PATCH_AVAILABLE:
         apply_db_patches()
@@ -963,6 +1183,48 @@ def _db_stats_scan(img_dir: str) -> int:
     except Exception:
         return 0
     return n
+@app.get("/api/perf_stats")
+def perf_stats():
+    """运行状态与自适应档位（只读）：内存/负载/各项目常驻估算/当前 K 与批大小/GPU/最近事件。
+
+    做"动态调并发"必须能看见效果——这个接口就是那把尺子。"""
+    avail = _mem_avail_mb()
+    total = _mem_total_mb()
+    swap = _swap_used_ratio()
+    projs = []
+    idx_bytes = 0
+    for _name, _ctx in list(project_cache.items()):
+        try:
+            _n = len(_ctx.get("metadata") or [])
+            _nt = getattr(_ctx.get("index"), "ntotal", 0) or 0
+            _mb = (_nt * FEAT_DIM * 4) / 1048576.0      # FAISS 索引 float32（每帧 FEAT_DIM*4 字节）
+            idx_bytes += _nt * FEAT_DIM * 4
+            projs.append({"project": _name, "metadata": _n, "indexed": _nt,
+                          "index_mb": round(_mb, 1)})
+        except Exception:
+            pass
+    return {
+        "mem_total_mb": round(total) if total else None,
+        "mem_avail_mb": round(avail) if avail else None,
+        "swap_used_pct": round(swap * 100, 1) if swap is not None else None,
+        "mem_floor_mb": _mem_floor_mb(),
+        "load1": _load1(),
+        "ncpu": _ncpu(),
+        "proc_rss_mb": round(_proc_rss_mb() or 0, 1),
+        "project_cache": projs,
+        "project_cache_max": _env_int("AD_PROJECT_CACHE_MAX", 3, lo=1),
+        "index_resident_mb": round(idx_bytes / 1048576.0, 1),
+        "vec_adaptive": _adaptive_flag("AD_VEC_ADAPTIVE"),
+        "vec_tier": list(_PERF_STATE.get("vec") or (32, 2, 1)),
+        "vec_tier_why": _PERF_STATE.get("vec_why", "未启用自适应（固定 32/2/1）"),
+        "vec_force_low": bool(_PERF_STATE.get("force_low")),
+        "extract_adaptive": _adaptive_flag("AD_EXTRACT_ADAPTIVE"),
+        "extract_k": _PERF_STATE.get("k"),
+        "extract_k_why": _PERF_STATE.get("k_why", ""),
+        "auto_vec_off": os.path.exists(_AUTO_VEC_OFF_FILE),
+        "gpu_free_gb": (round(_vram_free_gb(), 2) if _vram_free_gb() is not None else None),
+        "events": [{"t": t, "msg": m} for t, m in _PERF_EVENTS[-5:]],
+    }
 _DB_STATS_INFLIGHT = set()   # 正在后台刷新的项目：同一项目同时只允许一个扫描线程
 def _db_stats_refresh(project: str, img_dir: str):
     try:
@@ -1044,11 +1306,24 @@ def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = 
     # DataLoader 并行度：原来 batch=128 + 8 workers + prefetch=2，单任务的共享内存峰值就有几 GB；
     # 多个抽帧任务并发向量化时会叠加，实测把 31GB 机器打爆（OOM 连 VS Code/飞书一起杀）。
     # 32 张一批 + 2 个解码进程足够喂饱这张 12G 卡，内存峰值降一个数量级，整体更快更稳。
-    n_workers = 2 if DEVICE == "cuda" else 0
-    dl_kwargs = dict(batch_size=32, shuffle=False, pin_memory=True)
+    # AD_VEC_ADAPTIVE=1 -> 按可用内存选档（每批调用评估一次；降档立即、升档需连续 3 次够格）。
+    # 默认 0 -> 固定 32/2/1，与历史完全一致。
+    _v_b, _v_w, _v_p = 32, (2 if DEVICE == "cuda" else 0), 1
+    if _adaptive_flag("AD_VEC_ADAPTIVE"):
+        _prev_t = _PERF_STATE.get("vec")
+        _b, _w, _p, _why = _vec_tier(prev=_prev_t)
+        if DEVICE != "cuda":
+            _w = 0
+        _v_b, _v_w, _v_p = _b, _w, _p
+        if (_v_b, _v_w, _v_p) != _prev_t:
+            _PERF_STATE["vec"], _PERF_STATE["vec_why"] = (_v_b, _v_w, _v_p), _why
+            _perf_event("向量化档位 %s -> batch=%d workers=%d prefetch=%d（%s）"
+                        % (_prev_t, _v_b, _v_w, _v_p, _why))
+    n_workers = _v_w
+    dl_kwargs = dict(batch_size=_v_b, shuffle=False, pin_memory=True)
     if n_workers > 0:
         dl_kwargs["num_workers"] = n_workers
-        dl_kwargs["prefetch_factor"] = 1
+        dl_kwargs["prefetch_factor"] = _v_p
     dataset = SigLIPImageDataset(image_paths)
     dataloader = DataLoader(dataset, **dl_kwargs)
     extracted_feats = []
@@ -2144,7 +2419,13 @@ def _run_video_list(
     # 视频级并行：原来逐个视频串行，20 核机器上只用一个核。cv2 解码会释放 GIL，
     # 实测单线程解码 164 帧/秒、写网盘 53 源帧/秒，远没吃满，多视频并行能直接提升总吞吐。
     # 默认 1 = 与原来串行行为完全一致；用 AD_EXTRACT_WORKERS 打开（如 4）。
-    _K = max(1, int(os.environ.get("AD_EXTRACT_WORKERS", "1")))
+    # AD_EXTRACT_ADAPTIVE=1 -> 在任务起点按"可用内存 + load1/核数"选 K（1..AD_EXTRACT_WORKERS_MAX）；
+    # 运行中不改 K：并发抽帧必须按提交顺序合并，动 K 会碰 current_id 位置推导这条链路。
+    if _adaptive_flag("AD_EXTRACT_ADAPTIVE"):
+        _K, _kwhy = _pick_extract_k()
+        _log(f"[自适应] 抽帧并行 K={_K}（{_kwhy}）")
+    else:
+        _K = max(1, int(os.environ.get("AD_EXTRACT_WORKERS", "1")))
     _plock = threading.Lock()
 
     def _one_video(_idx, _vp):
