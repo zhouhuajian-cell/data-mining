@@ -1245,12 +1245,12 @@ def _start_health_watchdog():
     为什么需要它：13:44 那次全站卡死（重接口全阻塞→线程池满→首页 5 秒无响应）只能靠人发现，
     期间平台一直不可用。探针用的是**同步**端点，所以"池被占满"这种卡死能被发现；
     正常时 /api/ping 是 0.x 毫秒，绝不会误判。
-    约束：连续 AD_HEALTH_FAILS(3) 次失败才动手、两次自动重启间隔 ≥ AD_HEALTH_COOLDOWN_SEC(900s)、
+    约束：连续 AD_HEALTH_FAILS(3) 次失败才动手、两次自动重启间隔 ≥ AD_HEALTH_COOLDOWN_SEC(120s)、
     启动后前 90 秒不动手（模型加载期）。落盘中的项目会先多等一轮。
     关闭：AD_HEALTH_WATCH=0。"""
     every = _env_int("AD_HEALTH_WATCH_SEC", 20, lo=5)
     need = _env_int("AD_HEALTH_FAILS", 3, lo=2)
-    cooldown = _env_int("AD_HEALTH_COOLDOWN_SEC", 900, lo=60)
+    cooldown = _env_int("AD_HEALTH_COOLDOWN_SEC", 120, lo=60)
     _HEALTH_STATE["boot"] = time.time()
     def _loop():
         time.sleep(90)
@@ -1289,6 +1289,23 @@ def _start_health_watchdog():
                             _HEALTH_STATE["last_restart"] = time.time()
                             _perf_event("整站无响应（/api/ping 连续 %d 次超时）→ 自动重启服务自愈"
                                         "（已抽的帧按源帧号命名，重启后可续做）" % _HEALTH_STATE["fails"])
+                            # 重启前先抓现场：全线程栈（含卡在锁上的线程）。应用卡死后现场就没了，
+                            # 没有这份 dump 只能重启了事、无法定位（13:44 与 15:26 两次都是这样丢的）。
+                            try:
+                                import faulthandler as _fh
+                                _hp = os.path.join(os.getcwd(), "logs", "hang_%s.txt" % time.strftime("%Y%m%d_%H%M%S"))
+                                with open(_hp, "w", encoding="utf-8") as _hf:
+                                    _fh.dump_traceback(file=_hf, all_threads=True)
+                                    _hf.write("\n=== 内核态 wchan（看谁卡在 I/O/锁）===\n")
+                                    for _tid in os.listdir("/proc/self/task"):
+                                        try:
+                                            with open("/proc/self/task/%s/wchan" % _tid) as _wf:
+                                                _hf.write("  tid=%s %s\n" % (_tid, _wf.read().strip()))
+                                        except Exception:
+                                            pass
+                                _log(f"[看护] 已抓卡死现场(全线程栈): {_hp}")
+                            except Exception as _de:
+                                _log(f"[看护] 抓现场失败: {_de}")
                             time.sleep(2)
                             os.system("systemctl restart ad_mining")
                             return      # 重启会终止本进程，线程到此结束
@@ -1570,8 +1587,18 @@ def background_full_pipeline_worker(project: str, source_path: str):
                             # 强行用 PIL 试探一下它到底是不是图，打得开就收编入库！
                             with Image.open(file_path) as img:
                                 img.verify()
-                            # 登记到原始数据池：复制进项目图片目录（文件名即唯一标识）
-                            dst_file = os.path.join(ctx["img_dir"], f)
+                            # 登记到原始数据池：复制进项目图片目录。
+                            # ⚠️ 必须分桶（与抽帧一致）：平铺会把几万张图堆进 images/ 顶层，
+                            # CIFS 上 listdir/建文件退化到秒级（老的 11 万张扁平帧就是这么来的）。
+                            # 桶名取"源目录相对导入根的子路径"（压平分隔符），一个叶子目录一个桶。
+                            _rel = os.path.relpath(root, p)
+                            _bucket = re.sub(
+                                r"[^0-9A-Za-z_.\-一-鿿]+", "_",
+                                os.path.basename(p) if _rel in (".", "") else _rel.replace(os.sep, "_"),
+                            )[:64]
+                            _out_dir = os.path.join(ctx["img_dir"], _bucket or "import")
+                            os.makedirs(_out_dir, exist_ok=True)
+                            dst_file = os.path.join(_out_dir, f)
                             shutil.copy2(file_path, dst_file)
                             new_saved_paths.append(dst_file)
                             src_map[f] = (
@@ -2179,19 +2206,15 @@ def _auto_vec_enabled() -> bool:
     if str(os.environ.get("AD_AUTO_VEC", "1")).strip().lower() in ("0", "false", "no", "off"):
         return False
     return not os.path.exists(_AUTO_VEC_OFF_FILE)
-def _pending_frame_paths(ctx, limit: int = None, bucketed_only: bool = True):
+def _pending_frame_paths(ctx, limit: int = None):
     """递归列出 images 目录下"还没进 metadata(索引)"的帧。
 
-    抽帧已按视频分桶到 images/<视频名>/ 子目录，必须递归；否则顶层几乎看不到帧。
-    去重用 basename：与抽帧"已抽过就跳过"的判断口径一致（那边也是比 basename）。
-    若比绝对路径，项目改名/挂载形式变化后同一帧会被判成"待向量化"而重复入索引。
-
-    bucketed_only=True 时**只补分桶目录里的帧**，跳过顶层的老扁平帧：
-    那些是改动前的产物，与后来重抽的分桶帧内容高度重叠，补进索引会让搜索出现重复结果，
-    而且量级是几十万帧（要数小时 GPU + 大量网盘写）。需要时用 AD_AUTO_VEC_INCLUDE_FLAT=1 放开。"""
-    if str(os.environ.get("AD_AUTO_VEC_INCLUDE_FLAT", "")).strip().lower() in ("1", "true", "yes", "on"):
-        bucketed_only = False
-    _base = os.path.abspath(ctx["img_dir"])
+    统一口径（2026-09-17 起）：**不分平铺/分桶**，递归取所有未入索引的帧。
+    原因是输入侧已统一分桶（抽帧写 images/<视频名>/、直导写 images/<源目录>/），
+    不再产生新的平铺帧；老的平铺帧按用户决定一并纳入索引（数量级大，会跑数小时，
+    需要时用 AD_AUTO_VEC_MAX 限制单次量，或用 workspace/AUTO_VEC_OFF 停止）。
+    去重用 basename：与抽帧"已抽过就跳过"的判断口径一致（那边也是比 basename）；
+    比绝对路径的话，项目改名/挂载形式变化后同一帧会被判成"待向量化"而重复入索引。"""
     have = set()
     for m in ctx.get("metadata") or []:
         p = m.get("path")
@@ -2199,13 +2222,12 @@ def _pending_frame_paths(ctx, limit: int = None, bucketed_only: bool = True):
             have.add(os.path.basename(p))
     out = []
     for root, _dirs, files in os.walk(ctx["img_dir"]):
-        if bucketed_only and os.path.abspath(root) == _base:
-            continue
         for f in files:
-            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) and f not in have:
-                out.append(os.path.join(root, f))
-                if limit and len(out) >= limit:
-                    return out
+            if not f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) or f in have:
+                continue
+            out.append(os.path.join(root, f))
+            if limit and len(out) >= limit:
+                return out
     return out
 def _maybe_auto_vectorize(project: str, reason: str = "", max_frames: int = None):
     """抽帧任务跑完后，自动把该项目里"已抽但没进索引"的帧分批向量化入库。
