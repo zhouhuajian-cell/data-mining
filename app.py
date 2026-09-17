@@ -1891,10 +1891,18 @@ def _collect_videos(root_path: str, entry=None):
     """递归收集 root 下所有视频文件，返回绝对路径列表。
 
     大目录（几万个视频）在网盘上 os.walk 很慢，这里每 200 个目录回报一次进度，
-    免得前端长时间显示 0% 看着像卡死。"""
+    免得前端长时间显示 0% 看着像卡死。
+
+    ⚠️ 中止信号必须在这里就生效：扫描几万个目录要很久，而进度回报每 200 个目录就会
+    把 msg 覆盖回"正在递归扫描…"，用户点了中止看到 msg 又变回扫描中，会以为中止无效
+    （实际要等整个目录树扫完才生效）。收到信号就立刻停止收集并返回空列表。"""
     vids = []
     dirs_seen = 0
     for root, _dirs, files in os.walk(root_path):
+        if entry is not None and entry.get("is_cancelled"):
+            entry["msg"] = f"⚠️ 已中止扫描（扫了 {dirs_seen} 个目录，找到 {len(vids)} 个视频）"
+            _log(f"[任务] 扫描阶段收到中止信号，停止收集: {root_path}")
+            return []
         dirs_seen += 1
         if entry is not None and dirs_seen % 200 == 0:
             try:
@@ -2263,10 +2271,15 @@ def _run_video_job(
     desc = _video_interval_desc(step, unit, mode, n_frames, ratio)
     if os.path.isdir(local):
         entry["msg"] = f"正在递归扫描目录内视频文件 ({desc})..."
+        _vids = _collect_videos(local, entry)
+        if entry.get("is_cancelled"):
+            entry["msg"] = "⚠️ 任务已手动中止"
+            _log(f"[任务] 扫描阶段中止，不再继续抽帧: {local}")
+            return
         _run_video_list(
             entry,
             project,
-            _collect_videos(local, entry),
+            _vids,
             step,
             unit,
             "目录",
