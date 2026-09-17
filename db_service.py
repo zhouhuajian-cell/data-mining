@@ -1006,6 +1006,39 @@ def get_coverage_analysis(
 # 幂等：按 (project_id, vector_id) 判重，已存在则只补路径更新，不重复建源
 # ============================================================
 
+def _probe_image_meta(image_path: str):
+    """网盘探测：file_size / width / height。返回 (size, w, h)，失败给 0。
+
+    ⚠️ 这东西必须放在写事务【之外】。它是逐帧的网盘往返（CIFS 上单次几十毫秒），
+    一旦和写事务混在一起，一个 2000 帧的批次会把 SQLite 的 WAL 写锁连续占住几分钟
+    （实测：补登记 50 分钟写不进一条；抽帧自己下一批也会 database is locked，
+    被 ensure_sync_hook 吞成一行日志 -> 静默丢登记）。"""
+    size = 0
+    w = h = 0
+    try:
+        if os.path.exists(image_path):
+            size = os.path.getsize(image_path)
+            from PIL import Image as _PILImage
+            with _PILImage.open(image_path) as im:
+                w, h = im.size
+    except Exception:
+        pass
+    return size, w, h
+
+
+def _sources_by_basename(db, project_id: int, basenames) -> dict:
+    """按 relative_path 批量取回 Source（分小批，避开 SQLite 变量数上限）。"""
+    found = {}
+    bases = list(basenames)
+    for i in range(0, len(bases), 500):
+        for s in db.query(Source).filter(
+            Source.project_id == project_id,
+            Source.relative_path.in_(bases[i:i + 500]),
+        ).all():
+            found[s.relative_path] = s
+    return found
+
+
 def sync_asset_records_to_db(project_name: str, records: List[dict],
                              img_root: str = None) -> Dict[str, int]:
     """
@@ -1013,6 +1046,10 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
     - Source：以 image_path 目录为 source_root 简化登记（file_hash 由后续 SCAN 任务补齐）
     - Asset：vector_id = 记录 id；已存在则跳过（保持幂等），仅缺 asset 时创建
     返回 {"assets": n, "sources": n, "skipped": n}
+
+    分两段执行：先把逐帧网盘探测全部做完（不持写锁），再开事务做纯 DB 写。
+    写锁占用从分钟级降到毫秒级 —— 否则整库的写入都会被这一批堵住（见 _probe_image_meta）。
+    网盘探测的总次数与原实现一致：尺寸对所有新帧探测，文件大小只对新建 Source 探测。
     """
     if not records:
         return {"assets": 0, "sources": 0, "skipped": 0}
@@ -1022,9 +1059,9 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
         proj = get_or_create_project(db, project_name)
         existing_ids = {v for (v,) in db.query(Asset.vector_id).filter(Asset.project_id == proj.id).all()}
 
-        new_assets = 0
-        new_sources = 0
+        # ---- 第一段：只读 + 网盘探测，不产生写事务 ----
         skipped = 0
+        pending = []            # (vid, image_path, filename, basename, source_root, chain, rec)
         for rec in records:
             vid = rec.get("id")
             if vid is None:
@@ -1041,40 +1078,47 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
                 skipped += 1
                 continue
             filename = rec.get("filename") or os.path.basename(image_path)
-
             # 源登记：优先用原始导入目录(src_dir, 直导时记录)；无则退化为副本目录(幂等)
             _src_dir = (rec.get("src_dir") or "").strip()
             source_root = _src_dir if (_src_dir and os.path.isabs(_src_dir)) else (os.path.dirname(image_path) or (img_root or "."))
-            src = db.query(Source).filter(
-                Source.project_id == proj.id,
-                Source.relative_path == os.path.basename(image_path),
-            ).first()
+            pending.append((vid, image_path, filename, os.path.basename(image_path), source_root,
+                            [c for c in (rec.get("directory_chain") or []) if isinstance(c, str)] or [],
+                            rec))
+        if not pending:
+            return {"assets": 0, "sources": 0, "skipped": skipped}
+        src_map = _sources_by_basename(db, proj.id, set(p[3] for p in pending))
+        probes = {}
+        for p in pending:
+            probes[p[0]] = _probe_image_meta(p[1])      # 逐帧网盘探测，此刻还没有写事务
+
+        # ---- 第二段：纯 DB 写，一次 flush + 一次 commit ----
+        new_sources = 0
+        for (vid, image_path, filename, base, source_root, chain, rec) in pending:
+            if base in src_map:
+                continue
+            src = Source(
+                source_id=str(uuid.uuid4())[:16],
+                project_id=proj.id,
+                source_type=SourceType.IMAGE,
+                source_root=source_root,
+                relative_path=base,
+                directory_chain=chain,
+                file_name=filename,
+                extension=os.path.splitext(filename)[1].lower(),
+                file_size=probes[vid][0],
+                meta={"src_dir": rec.get("src_dir")} if rec.get("src_dir") else {},
+                scan_status="synced",
+            )
+            db.add(src)
+            src_map[base] = src
+            new_sources += 1
+        if new_sources:
+            db.flush()                                  # 一次性拿回新 Source 的 id
+        new_assets = 0
+        for (vid, image_path, _filename, base, _source_root, _chain, rec) in pending:
+            src = src_map.get(base)
             if src is None:
-                src = Source(
-                    source_id=str(uuid.uuid4())[:16],
-                    project_id=proj.id,
-                    source_type=SourceType.IMAGE,
-                    source_root=source_root,
-                    relative_path=os.path.basename(image_path),
-                    directory_chain=[c for c in (rec.get("directory_chain") or []) if isinstance(c, str)] or [],
-                    file_name=filename,
-                    extension=os.path.splitext(filename)[1].lower(),
-                    file_size=os.path.getsize(image_path) if os.path.exists(image_path) else 0,
-                    meta={"src_dir": rec.get("src_dir")} if rec.get("src_dir") else {},
-                    scan_status="synced",
-                )
-                db.add(src)
-                new_sources += 1
-                db.flush()
-            # Asset 登记
-            w = h = 0
-            if os.path.exists(image_path):
-                try:
-                    from PIL import Image as _PILImage
-                    with _PILImage.open(image_path) as im:
-                        w, h = im.size
-                except Exception:
-                    pass
+                continue
             # 血缘元数据: 记录可能携带抽帧来源(frame_index/timestamp/video_source)
             try:
                 frame_index = int(rec.get("frame_index") or 0)
@@ -1090,7 +1134,7 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
                 meta_extra["video_source"] = vinfo
                 src.meta = dict(src.meta or {})
                 src.meta.setdefault("video_source", vinfo)
-            asset = Asset(
+            db.add(Asset(
                 asset_id=str(uuid.uuid4())[:16],
                 project_id=proj.id,
                 source_id=src.id,
@@ -1099,11 +1143,10 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
                 frame_index=frame_index,
                 timestamp=timestamp,
                 vector_id=vid,
-                width=w, height=h,
+                width=probes[vid][1], height=probes[vid][2],
                 status=AssetStatus.EXTRACTED,
                 asset_metadata=meta_extra or None,
-            )
-            db.add(asset)
+            ))
             new_assets += 1
         db.commit()
         return {"assets": new_assets, "sources": new_sources, "skipped": skipped}
