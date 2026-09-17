@@ -601,6 +601,10 @@ def _vec_tier(prev=None):
     else:
         want, why = (8, 0, 1), "可用 %.0fG < %.0fG" % (avail / 1024, low / 1024)
     b, w, p = min(want[0], bmax), min(want[1], wmax), want[2]
+    if p > 1 and (b < want[0] or w < want[1]):
+        # 被上限压过就不要高 prefetch：预取缓冲是内存大头（实测 batch=64/prefetch=2 时多约 2GB），
+        # 档位既然往下压了，缓冲也要一起压。
+        p = 1
     if prev is not None:
         # 降档立即；升档要连续 3 次够格，避免在阈值附近来回抖
         if b > prev[0] or w > prev[1]:
@@ -882,24 +886,35 @@ class _FakeIndex:
     def reconstruct_n(self, a, b):
         return None
 def _project_cache_evict_oldest(keep: str = ""):
-    """project_cache 上限（AD_PROJECT_CACHE_MAX，默认 3）：超了淘汰最久未用的项目。
+    """project_cache 上限（AD_PROJECT_CACHE_MAX，默认 8）：超了淘汰最久未用的项目。
 
     为什么要淘汰：每个访问过的项目都会把 metadata(list[dict]) + FAISS 索引常驻，
     185k 帧约 0.9GB（索引每帧 4608B）+ 字典几百 MB，多项目切换后全留在内存里。
     ⚠️ **跳过"正在跑抽帧任务"的项目**——否则会把它正在写的 metadata/索引释放掉。
     淘汰只是从缓存移除（释放内存），下次使用时从盘上重载，语义不变。"""
     try:
-        cap = _env_int("AD_PROJECT_CACHE_MAX", 3, lo=1)
+        cap = _env_int("AD_PROJECT_CACHE_MAX", 8, lo=1)
         if len(project_cache) <= cap:
             return
         busy = set()
+        got = False
         try:
-            with _extract_lock:
+            # ⚠️ 绝不阻塞：_extract_lock 是非重入的 threading.Lock，而 load_project_context 会被
+            # 持锁路径调用（一旦自锁就是全站线程池被占满、连静态页都打不开的真实事故）。
+            # 拿不到锁就本次不淘汰（下次调用再试），淘汰只是省内存、不是正确性依赖。
+            got = _extract_lock.acquire(timeout=0.5)
+            if got:
                 for _e in extract_task_pool.values():
                     if _e.get("is_running") and _e.get("project"):
                         busy.add(_e["project"])
         except Exception:
             pass
+        finally:
+            if got:
+                try:
+                    _extract_lock.release()
+                except Exception:
+                    pass
         for _k in list(project_cache.keys()):
             if len(project_cache) <= cap:
                 break
@@ -909,12 +924,29 @@ def _project_cache_evict_oldest(keep: str = ""):
             _log(f"[缓存] 释放项目上下文 {_k}（project_cache 上限 {cap}，下次用时从盘重载）")
     except Exception:
         pass
+_project_load_locks = {}
+_project_load_guard = threading.Lock()
+def _project_load_lock(name):
+    with _project_load_guard:
+        if name not in _project_load_locks:
+            _project_load_locks[name] = threading.Lock()
+        return _project_load_locks[name]
 def load_project_context(project_name: str):
     p_name, p_dir, img_dir, idx_path, meta_path = get_project_paths(project_name)
     if p_name in project_cache:
         _hit = project_cache.pop(p_name)    # 命中就挪到队尾（LRU：最久未用的先出）
         project_cache[p_name] = _hit
         return _hit
+    with _project_load_lock(p_name):
+        # ⚠️ 冷启动必须单飞：相册一次并发拉几十张图，每个请求都去读一遍 metadata(37MB)+索引(334MB)
+        # 会把网盘打爆、图片全部加载失败（"前端图片看不了"的真因之一）。
+        # 等锁期间可能已被别的请求加载好，这里再查一次。
+        if p_name in project_cache:
+            _hit = project_cache.pop(p_name)
+            project_cache[p_name] = _hit
+            return _hit
+        return _load_project_context_cold(p_name, p_dir, img_dir, idx_path, meta_path)
+def _load_project_context_cold(p_name, p_dir, img_dir, idx_path, meta_path):
     metadata = []
     if os.path.exists(meta_path):
         try:
@@ -945,15 +977,26 @@ def load_project_context(project_name: str):
     project_cache[p_name] = ctx
     _project_cache_evict_oldest(keep=p_name)
     return ctx
+_SAVE_INFLIGHT = [0]      # 正在落盘的项目数：看护重启前会看一眼（网盘不允许 rename 覆盖，
+                          # 做不到原子落盘，所以只能在"要重启"这一侧避让）
 def save_project_context(ctx):
-    with _project_lock(ctx["name"]):
-        if not LITE_MODE and faiss is not None:
-            try:
-                faiss.write_index(ctx["index"], ctx["idx_path"])
-            except Exception:
-                pass
-        with open(ctx["meta_path"], "w", encoding="utf-8") as f:
-            json.dump(ctx["metadata"], f, ensure_ascii=False)
+    """落盘 metadata + FAISS 索引。
+
+    ⚠️ 实测这挂 CIFS 允许建文件但不允许 rename 覆盖（os.replace 直接 Permission denied），
+    所以做不到"写临时文件再原子替换"。重启若杀在直接写的中途会留下半截文件，
+    因此**落盘期间置 _SAVE_INFLIGHT**，让看护线程重启前先避让、并优先等它写完。"""
+    _SAVE_INFLIGHT[0] += 1
+    try:
+        with _project_lock(ctx["name"]):
+            if not LITE_MODE and faiss is not None:
+                try:
+                    faiss.write_index(ctx["index"], ctx["idx_path"])
+                except Exception:
+                    pass
+            with open(ctx["meta_path"], "w", encoding="utf-8") as f:
+                json.dump(ctx["metadata"], f, ensure_ascii=False)
+    finally:
+        _SAVE_INFLIGHT[0] = max(0, _SAVE_INFLIGHT[0] - 1)
 # ----------------- 模型加载 -----------------
 @app.on_event("startup")
 def startup_event():
@@ -966,6 +1009,8 @@ def startup_event():
     _cleanup_stale_jobs()  # 重启后清理僵尸 RUNNING/PENDING（诚实标 FAILED 可续跑）
     if _adaptive_flag("AD_VEC_ADAPTIVE"):
         _start_perf_watchdog()   # 内存地板看门狗（只在自适应开启时跑；只减载不加载）
+    if str(os.environ.get("AD_HEALTH_WATCH", "1")).strip().lower() not in ("0", "false", "no", "off"):
+        _start_health_watchdog()  # 整站卡死自愈（ping 连续失败即重启）
     # 初始化数据库补丁
     if DB_PATCH_AVAILABLE:
         apply_db_patches()
@@ -1183,6 +1228,78 @@ def _db_stats_scan(img_dir: str) -> int:
     except Exception:
         return 0
     return n
+_HEALTH_STATE = {"fails": 0, "last_restart": 0.0}
+def _health_started_at():
+    return _HEALTH_STATE.get("boot", 0.0)
+@app.get("/api/ping")
+def ping():
+    """健康探针。**故意用同步端点**（占用线程池槽位）：线程池被占满时它也会超时，
+    看护线程才能识别"整站卡死"（事故现场：前端轮询把池占满，连静态首页都打不开）。
+
+    返回正在落盘的项目数，供看护重启前避让（网盘不能 rename 覆盖，做不到原子落盘）。"""
+    return {"ok": True, "save_inflight": _SAVE_INFLIGHT[0],
+            "threads": threading.active_count(), "uptime_s": round(time.time() - _health_started_at(), 1)}
+def _start_health_watchdog():
+    """整站卡死自愈：/api/ping 连续失败 N 次就自动重启服务。
+
+    为什么需要它：13:44 那次全站卡死（重接口全阻塞→线程池满→首页 5 秒无响应）只能靠人发现，
+    期间平台一直不可用。探针用的是**同步**端点，所以"池被占满"这种卡死能被发现；
+    正常时 /api/ping 是 0.x 毫秒，绝不会误判。
+    约束：连续 AD_HEALTH_FAILS(3) 次失败才动手、两次自动重启间隔 ≥ AD_HEALTH_COOLDOWN_SEC(900s)、
+    启动后前 90 秒不动手（模型加载期）。落盘中的项目会先多等一轮。
+    关闭：AD_HEALTH_WATCH=0。"""
+    every = _env_int("AD_HEALTH_WATCH_SEC", 20, lo=5)
+    need = _env_int("AD_HEALTH_FAILS", 3, lo=2)
+    cooldown = _env_int("AD_HEALTH_COOLDOWN_SEC", 900, lo=60)
+    _HEALTH_STATE["boot"] = time.time()
+    def _loop():
+        time.sleep(90)
+        while True:
+            try:
+                ok = False
+                detail = ""
+                try:
+                    import urllib.request as _u
+                    with _u.urlopen("http://127.0.0.1:8009/api/ping", timeout=8) as _r:
+                        if _r.status == 200:
+                            import json as _j
+                            detail = _j.loads(_r.read().decode("utf-8", "replace")).get("save_inflight", 0)
+                            ok = True
+                except Exception as _e:
+                    detail = str(_e)[:60]
+                if ok:
+                    if _HEALTH_STATE["fails"]:
+                        _log(f"[看护] /api/ping 已恢复（此前连续失败 {_HEALTH_STATE['fails']} 次）")
+                    _HEALTH_STATE["fails"] = 0
+                else:
+                    _HEALTH_STATE["fails"] += 1
+                    try:
+                        _sin = int(detail)
+                    except Exception:
+                        _sin = 0
+                    _log(f"[看护] /api/ping 无响应（连续 {_HEALTH_STATE['fails']}/{need} 次，"
+                         f"落盘中 {_sin} 个项目，detail={detail}）")
+                    if _HEALTH_STATE["fails"] >= need:
+                        if _SAVE_INFLIGHT[0] > 0 and _HEALTH_STATE["fails"] < need + 3:
+                            # 正在落盘：网盘不能原子替换，先多等一轮，别杀在半截写上
+                            _log("[看护] 有项目正在落盘，先等一轮再决定是否重启")
+                        elif (time.time() - _HEALTH_STATE.get("last_restart", 0.0)) < cooldown:
+                            _log("[看护] 距上次自动重启不足冷却时间，跳过")
+                        else:
+                            _HEALTH_STATE["last_restart"] = time.time()
+                            _perf_event("整站无响应（/api/ping 连续 %d 次超时）→ 自动重启服务自愈"
+                                        "（已抽的帧按源帧号命名，重启后可续做）" % _HEALTH_STATE["fails"])
+                            time.sleep(2)
+                            os.system("systemctl restart ad_mining")
+                            return      # 重启会终止本进程，线程到此结束
+            except Exception:
+                pass
+            time.sleep(every)
+    try:
+        threading.Thread(target=_loop, daemon=True).start()
+        _log(f"[看护] 健康看护已启动（周期 {every}s，连续失败 {need} 次自动重启，冷却 {cooldown}s）")
+    except Exception:
+        pass
 @app.get("/api/perf_stats")
 def perf_stats():
     """运行状态与自适应档位（只读）：内存/负载/各项目常驻估算/当前 K 与批大小/GPU/最近事件。
@@ -1212,7 +1329,7 @@ def perf_stats():
         "ncpu": _ncpu(),
         "proc_rss_mb": round(_proc_rss_mb() or 0, 1),
         "project_cache": projs,
-        "project_cache_max": _env_int("AD_PROJECT_CACHE_MAX", 3, lo=1),
+        "project_cache_max": _env_int("AD_PROJECT_CACHE_MAX", 8, lo=1),
         "index_resident_mb": round(idx_bytes / 1048576.0, 1),
         "vec_adaptive": _adaptive_flag("AD_VEC_ADAPTIVE"),
         "vec_tier": list(_PERF_STATE.get("vec") or (32, 2, 1)),
@@ -3107,12 +3224,28 @@ async def build_index_online(project: str = Query("default")):
         }
     return {"code": 200, "msg": f"成功向量化 {processed_count} 张图片！"}
 # ----------------- 检索路由 -----------------
+def _clamp_topk(v, where=""):
+    """限定单次检索取回条数上限。
+
+    事故复盘：界面上一次 top_k=20000 的检索，会把两万条结果连同标签一起在内存里组装，
+    同时长时间占着 GPU 闸门 —— 与 DINO 大批量检测/在线向量化/抽帧叠加时把整站拖死。
+    这里给个上限（AD_SEARCH_TOPK_MAX，默认 5000），超了就压下来并记日志。"""
+    try:
+        n = int(v or 0)
+    except Exception:
+        n = 0
+    cap = _env_int("AD_SEARCH_TOPK_MAX", 5000, lo=100)
+    if n > cap:
+        _log(f"[检索] {where} top_k={n} 超过上限，压到 {cap}（防单次检索长时间占卡/吃内存）")
+        return cap
+    return max(1, n)
 @app.get("/api/search")
 def search_text(
     project: str = Query("default"),
     query: str = Query(..., min_length=1),
     top_k: int = 500,
 ):
+    top_k = _clamp_topk(top_k, "文本检索")
     _log(f"[检索] 文本检索 project={project} query={query} top_k={top_k}")
     ctx = load_project_context(project)
     if ctx["index"] is None or ctx["index"].ntotal == 0:
@@ -3161,6 +3294,7 @@ async def search_by_external_image(
     files: List[UploadFile] = File(...),
     top_k: int = 500,
 ):
+    top_k = _clamp_topk(top_k, "以图搜图")
     _log(f"[检索] 以图搜图 project={project} 参考图={len(files)} 张")
     ctx = load_project_context(project)
     if ctx["index"] is None or ctx["index"].ntotal == 0 or not files:
