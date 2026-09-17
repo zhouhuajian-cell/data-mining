@@ -1746,10 +1746,20 @@ VIDEO_EXTS = (
 )
 def _is_video_file(name: str) -> bool:
     return name.lower().endswith(VIDEO_EXTS)
-def _collect_videos(root_path: str):
-    """递归收集 root 下所有视频文件，返回绝对路径列表。"""
+def _collect_videos(root_path: str, entry=None):
+    """递归收集 root 下所有视频文件，返回绝对路径列表。
+
+    大目录（几万个视频）在网盘上 os.walk 很慢，这里每 200 个目录回报一次进度，
+    免得前端长时间显示 0% 看着像卡死。"""
     vids = []
+    dirs_seen = 0
     for root, _dirs, files in os.walk(root_path):
+        dirs_seen += 1
+        if entry is not None and dirs_seen % 200 == 0:
+            try:
+                entry["msg"] = f"正在递归扫描目录…已扫 {dirs_seen} 个目录，找到 {len(vids)} 个视频"
+            except Exception:
+                pass
         for f in files:
             if _is_video_file(f):
                 vids.append(os.path.join(root, f))
@@ -2020,8 +2030,18 @@ def _run_video_list(
                              + f" 最新: {os.path.basename(_vp)}")
         # 分块向量化：每满一批立刻入库并清空缓冲（大目录不会把几十万条路径堆在内存里）
         if frame_meta is not None and len(new_saved_paths) >= max(200, int(os.environ.get("AD_VEC_CHUNK", "2000"))):
-            extract_and_index_project(ctx, new_saved_paths, frame_meta=frame_meta)
-            for _p in new_saved_paths:
+            _chunk_paths = list(new_saved_paths)     # 清空前留一份，下面写库要用
+            _vec = extract_and_index_project(ctx, _chunk_paths, frame_meta=frame_meta)
+            # 关键：向量化后必须把资产写进数据库。原路径抽出帧后会调这里，分块分支一度漏掉，
+            # 结果磁盘上几十万帧、库里只有几千条 —— 数据仓库/明细表面板读库，所以"看不到数据"。
+            if _vec and DB_PATCH_AVAILABLE:
+                try:
+                    from db_service import ensure_sync_hook, sync_metadata_paths
+                    ensure_sync_hook(project, ctx["metadata"])
+                    sync_metadata_paths(project, ctx["metadata"], _chunk_paths)
+                except Exception as _e:
+                    _log(f"[抽帧] 分批写库失败(继续抽帧): {_e}")
+            for _p in _chunk_paths:
                 frame_meta.pop(_p, None)
             new_saved_paths.clear()
             save_project_context(ctx)
@@ -2105,7 +2125,7 @@ def _run_video_job(
         _run_video_list(
             entry,
             project,
-            _collect_videos(local),
+            _collect_videos(local, entry),
             step,
             unit,
             "目录",
