@@ -963,15 +963,21 @@ def _db_stats_scan(img_dir: str) -> int:
     except Exception:
         return 0
     return n
+_DB_STATS_INFLIGHT = set()   # 正在后台刷新的项目：同一项目同时只允许一个扫描线程
 def _db_stats_refresh(project: str, img_dir: str):
     try:
         _DB_STATS_CACHE[project] = (time.time(), _db_stats_scan(img_dir))
         _db_stats_save()
     except Exception:
         pass
+    finally:
+        _DB_STATS_INFLIGHT.discard(project)
 def _db_stats_raw_count(project: str, img_dir: str) -> int:
     """带缓存的原始帧数：命中缓存直接返回；有旧值但过期 -> 先用旧值、后台线程刷新；
-    完全没有缓存（首次）才同步扫一次。这样接口不会因为扫网盘目录卡 20 秒。"""
+    完全没有缓存（首次）才同步扫一次。这样接口不会因为扫网盘目录卡 20 秒。
+
+    刷新必须去重（_DB_STATS_INFLIGHT）：一次全量扫描要 65~380 秒，前端期间每次调用
+    都会再起一个线程，实测会堆出 5~6 个线程同时 os.walk 网盘，把 CIFS 拖到写不进去。"""
     if not _DB_STATS_LOADED[0]:
         _DB_STATS_LOADED[0] = True
         _db_stats_load()
@@ -979,10 +985,12 @@ def _db_stats_raw_count(project: str, img_dir: str) -> int:
     if _c and (time.time() - _c[0]) < 60:
         return _c[1]
     if _c:
-        try:
-            threading.Thread(target=_db_stats_refresh, args=(project, img_dir), daemon=True).start()
-        except Exception:
-            pass
+        if project not in _DB_STATS_INFLIGHT:
+            _DB_STATS_INFLIGHT.add(project)
+            try:
+                threading.Thread(target=_db_stats_refresh, args=(project, img_dir), daemon=True).start()
+            except Exception:
+                _DB_STATS_INFLIGHT.discard(project)
         return _c[1]
     n = _db_stats_scan(img_dir)
     _DB_STATS_CACHE[project] = (time.time(), n)
@@ -1779,12 +1787,19 @@ def _auto_vec_enabled() -> bool:
     if str(os.environ.get("AD_AUTO_VEC", "1")).strip().lower() in ("0", "false", "no", "off"):
         return False
     return not os.path.exists(_AUTO_VEC_OFF_FILE)
-def _pending_frame_paths(ctx, limit: int = None):
+def _pending_frame_paths(ctx, limit: int = None, bucketed_only: bool = True):
     """递归列出 images 目录下"还没进 metadata(索引)"的帧。
 
     抽帧已按视频分桶到 images/<视频名>/ 子目录，必须递归；否则顶层几乎看不到帧。
     去重用 basename：与抽帧"已抽过就跳过"的判断口径一致（那边也是比 basename）。
-    若比绝对路径，项目改名/挂载形式变化后同一帧会被判成"待向量化"而重复入索引。"""
+    若比绝对路径，项目改名/挂载形式变化后同一帧会被判成"待向量化"而重复入索引。
+
+    bucketed_only=True 时**只补分桶目录里的帧**，跳过顶层的老扁平帧：
+    那些是改动前的产物，与后来重抽的分桶帧内容高度重叠，补进索引会让搜索出现重复结果，
+    而且量级是几十万帧（要数小时 GPU + 大量网盘写）。需要时用 AD_AUTO_VEC_INCLUDE_FLAT=1 放开。"""
+    if str(os.environ.get("AD_AUTO_VEC_INCLUDE_FLAT", "")).strip().lower() in ("1", "true", "yes", "on"):
+        bucketed_only = False
+    _base = os.path.abspath(ctx["img_dir"])
     have = set()
     for m in ctx.get("metadata") or []:
         p = m.get("path")
@@ -1792,6 +1807,8 @@ def _pending_frame_paths(ctx, limit: int = None):
             have.add(os.path.basename(p))
     out = []
     for root, _dirs, files in os.walk(ctx["img_dir"]):
+        if bucketed_only and os.path.abspath(root) == _base:
+            continue
         for f in files:
             if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) and f not in have:
                 out.append(os.path.join(root, f))
