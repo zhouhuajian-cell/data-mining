@@ -1770,6 +1770,106 @@ VIDEO_EXTS = (
 )
 def _is_video_file(name: str) -> bool:
     return name.lower().endswith(VIDEO_EXTS)
+_AUTO_VEC_LOCK = threading.Lock()   # 同一时刻只跑一个自动向量化（防多任务叠加 OOM）
+_AUTO_VEC_OFF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace", "AUTO_VEC_OFF")
+def _auto_vec_enabled() -> bool:
+    """自动向量化开关。两种关法都"立刻生效、不影响抽帧"：
+    ① 环境变量 AD_AUTO_VEC=0；② 存在 workspace/AUTO_VEC_OFF 文件（**不用重启**）。
+    留文件开关是为了出问题时能马上掐断：重启服务本身会打断正在跑的抽帧。"""
+    if str(os.environ.get("AD_AUTO_VEC", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return not os.path.exists(_AUTO_VEC_OFF_FILE)
+def _pending_frame_paths(ctx, limit: int = None):
+    """递归列出 images 目录下"还没进 metadata(索引)"的帧。
+
+    抽帧已按视频分桶到 images/<视频名>/ 子目录，必须递归；否则顶层几乎看不到帧。
+    去重用 basename：与抽帧"已抽过就跳过"的判断口径一致（那边也是比 basename）。
+    若比绝对路径，项目改名/挂载形式变化后同一帧会被判成"待向量化"而重复入索引。"""
+    have = set()
+    for m in ctx.get("metadata") or []:
+        p = m.get("path")
+        if p:
+            have.add(os.path.basename(p))
+    out = []
+    for root, _dirs, files in os.walk(ctx["img_dir"]):
+        for f in files:
+            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) and f not in have:
+                out.append(os.path.join(root, f))
+                if limit and len(out) >= limit:
+                    return out
+    return out
+def _maybe_auto_vectorize(project: str, reason: str = "", max_frames: int = None):
+    """抽帧任务跑完后，自动把该项目里"已抽但没进索引"的帧分批向量化入库。
+
+    安全约束：单飞锁 + 分批 + 异常只记不抛 + 开关（AD_AUTO_VEC=0 / workspace/AUTO_VEC_OFF）。
+    单次上限 AD_AUTO_VEC_MAX（0/空=不限）：积压几十万帧时，别让一次触发就占着 GPU 几小时。"""
+    if not _auto_vec_enabled():
+        _log(f"[自动向量化] 已关闭(AD_AUTO_VEC=0 或 workspace/AUTO_VEC_OFF)，跳过 project={project}")
+        return 0
+    if not DB_PATCH_AVAILABLE:
+        return 0
+    if not _AUTO_VEC_LOCK.acquire(blocking=False):
+        _log(f"[自动向量化] 已有自动向量化在跑，本次跳过 project={project}")
+        return 0
+    try:
+        ctx = load_project_context(project)
+        try:
+            cap = int(max_frames if max_frames else (os.environ.get("AD_AUTO_VEC_MAX") or 0))
+        except Exception:
+            cap = 0
+        pend = _pending_frame_paths(ctx, limit=cap if cap > 0 else None)
+        if not pend:
+            _log(f"[自动向量化] project={project} 没有待向量化的帧 ({reason})")
+            return 0
+        _log(f"[自动向量化] 开始 project={project} 待处理 {len(pend)} 帧"
+             + (f"（单次上限 {cap}）" if cap > 0 else "") + f" ({reason})")
+        B = max(500, int(os.environ.get("AD_VEC_BATCH", "5000")))
+        done = 0
+        for i in range(0, len(pend), B):
+            batch = pend[i:i + B]
+            try:
+                n = extract_and_index_project(ctx, batch)
+                if n and DB_PATCH_AVAILABLE:
+                    try:
+                        from db_service import ensure_sync_hook, sync_metadata_paths
+                        ensure_sync_hook(project, ctx["metadata"])
+                        sync_metadata_paths(project, ctx["metadata"], batch)
+                    except Exception as _e2:
+                        _log(f"[自动向量化] 写库失败(继续): {_e2}")
+                save_project_context(ctx)
+                done += n or 0
+                _log(f"[自动向量化] project={project} 进度 {i + len(batch)}/{len(pend)} 已入库 {done}")
+            except Exception as _e:
+                _log(f"[自动向量化] 分批失败(继续下一批): {_e}")
+            try:
+                import gc as _gc
+                _gc.collect()
+            except Exception:
+                pass
+        _log(f"[自动向量化] 结束 project={project} 共入库 {done} 帧")
+        return done
+    except Exception as e:
+        _log(f"[自动向量化] 异常(不影响抽帧): {e}")
+        return 0
+    finally:
+        _AUTO_VEC_LOCK.release()
+@app.post("/api/auto_vec/run")
+def auto_vec_run(
+    project: str = Form("default"),
+    max_frames: int = Form(None),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
+    """手动触发一次"补索引"：把该项目【已抽但没进索引】的帧向量化入库。
+
+    正常链路是抽帧任务跑完自动触发；这个入口用于：① 小样本验证；② 补历史积压。
+    max_frames 限制本次处理帧数（不填则用 AD_AUTO_VEC_MAX，都为空=不限）。"""
+    if not _auto_vec_enabled():
+        return {"code": 400, "msg": "自动向量化已关闭（AD_AUTO_VEC=0 或存在 workspace/AUTO_VEC_OFF），先放开开关再触发"}
+    ctx = load_project_context(project)
+    if not _project_exists_on_disk(ctx["name"]):
+        return {"code": 404, "msg": f"项目不存在: {ctx['name']}"}
+    background_tasks.add_task(_maybe_auto_vectorize, ctx["name"], "手动触发", max_frames)
+    return {"code": 200, "msg": f"已开始补索引: {ctx['name']}（max_frames={max_frames or '不限'}），进度见服务日志"}
 def _collect_videos(root_path: str, entry=None):
     """递归收集 root 下所有视频文件，返回绝对路径列表。
 
@@ -2158,6 +2258,13 @@ def _run_video_job(
             ratio=ratio,
             adapt_threshold=adapt_threshold,
         )
+        # 该目录的视频全部处理完 -> 自动把本项目"已抽但没进索引"的帧排队向量化入库
+        # （单飞锁 + 分批 + 可关；异常只记不抛，绝不带崩抽帧任务）
+        try:
+            if not entry.get("is_cancelled"):
+                _maybe_auto_vectorize(project, reason="目录抽帧完成")
+        except Exception as _e:
+            _log(f"[自动向量化] 触发失败(不影响抽帧): {_e}")
     elif os.path.isfile(local) and _is_video_file(local):
         entry["msg"] = f"正在解析视频并抽帧 ({desc})..."
         _run_video_list(
@@ -2661,9 +2768,11 @@ async def build_index_online(project: str = Query("default")):
             "code": 404,
             "msg": f"项目 [{ctx['name']}] 的目录不存在（已删除的项目不会被重建），无法向量化",
         }
+    # 抽帧已分桶到 images/<视频名>/ 子目录：必须递归列出，否则顶层看不到帧（会误判"都已完成"）
     all_imgs = [
-        os.path.join(ctx["img_dir"], f)
-        for f in os.listdir(ctx["img_dir"])
+        os.path.join(_r, f)
+        for _r, _d, _fs in os.walk(ctx["img_dir"])
+        for f in _fs
         if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
     ]
     indexed_paths = set([m["path"] for m in ctx["metadata"] if "path" in m])
