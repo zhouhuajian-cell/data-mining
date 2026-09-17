@@ -2140,6 +2140,15 @@ async def cancel_task(folder_path: str = Form(...)):
         entry = extract_task_pool.get(key)
         if entry is None and raw != key:
             entry = extract_task_pool.get(raw)  # 原始键容错
+        if entry is None:
+            # 向量化任务的键是 "vectorize:<项目名>"，前端中止时发来的可能是项目名或 images 目录，
+            # 这里按项目名/current_path 兜底匹配，否则大盘上点了中止也停不下来。
+            for _e in extract_task_pool.values():
+                if not _e.get("is_running"):
+                    continue
+                if _e.get("project") == raw or _e.get("current_path") == key:
+                    entry = _e
+                    break
     if entry and entry.get("is_running"):
         entry["is_cancelled"] = True
         entry["msg"] = "正在中止任务，等待当前帧落盘..."
@@ -3209,49 +3218,79 @@ async def upload_batch(
         "msg": f"本次新增并向量化 {processed_count} 张图片",
         "processed_count": ctx["index"].ntotal,
     }
+def _vectorize_worker(entry, project: str):
+    """后台线程：把项目里"未进索引"的帧分批向量化，进度写进任务大盘（可中止）。
+
+    与旧实现的区别：旧的是"一个长请求里一次性跑完全部、最后才入索引"，界面上**全程看不到进度**、
+    浏览器还会超时（看着像失败，其实服务端还在跑）。现在按批（AD_VEC_CHUNK，默认 2000）处理，
+    每批入索引 + 写库 + 刷新 processed_count，任务总览里能看着数字往上走，也能中止。"""
+    try:
+        ctx = load_project_context(project)
+        entry["msg"] = "正在扫描未入索引的帧…"
+        all_imgs = [
+            os.path.join(_r, f)
+            for _r, _d, _fs in os.walk(ctx["img_dir"])
+            for f in _fs
+            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+        ]
+        indexed_paths = set([m["path"] for m in ctx["metadata"] if "path" in m])
+        pend = [p for p in all_imgs if p not in indexed_paths]
+        entry["total_count"] = len(pend)
+        if not pend:
+            entry["msg"] = "✅ 该项目所有图片均已完成向量化"
+            return
+        B = max(200, int(os.environ.get("AD_VEC_CHUNK", "2000")))
+        done = 0
+        for i in range(0, len(pend), B):
+            if entry.get("is_cancelled"):
+                entry["msg"] = f"⚠️ 已手动中止！已处理 {entry.get('processed_count', 0)}/{len(pend)} 帧"
+                return
+            batch = pend[i:i + B]
+            n = extract_and_index_project(ctx, batch)
+            if n and DB_PATCH_AVAILABLE:
+                try:
+                    from db_service import ensure_sync_hook, sync_metadata_paths
+                    ensure_sync_hook(project, ctx["metadata"])
+                    sync_metadata_paths(project, ctx["metadata"], batch)
+                except Exception as _e:
+                    _log(f"[向量化] 分批写库失败(继续): {_e}")
+            done += n or 0
+            entry["processed_count"] = min(i + len(batch), len(pend))
+            entry["msg"] = f"向量化中… 已处理 {entry['processed_count']}/{len(pend)}（本次入索引 {done}）"
+        entry["msg"] = f"✅ 完成：本次新增并向量化 {done} 帧，库内共 {ctx['index'].ntotal} 张"
+    except Exception as e:
+        entry["msg"] = f"❌ 向量化失败: {e}"
+        _log(f"[向量化] 后台向量化异常: {e}")
+    finally:
+        entry["is_running"] = False
 @app.post("/api/build_index_online")
 def build_index_online(project: str = Query("default")):
-    """⚠️ 必须用同步 def（不是 async def）：里面是整段阻塞的向量化（DataLoader+GPU+写盘）。
+    """触发项目向量化（把"已抽但没进索引"的帧补进去）。
 
-    async def 会被 FastAPI 直接放在事件循环上执行 —— 那样一跑就把事件循环堵死，
-    所有 HTTP 请求（连 /api/ping）都得不到处理 = 全站卡死。
-    这正是 13:44 / 15:26 / 15:51 三次"网页打不开"的根因（hang dump 里可见
-    build_index_online -> extract_and_index_project -> DataLoader 跑在主线程的 uvicorn 栈里）。
-    写成 def 后 FastAPI 会在线程池里跑它，事件循环空出来，期间整站照常响应。"""
+    ⚠️ 两条硬约束，都是踩过事故的：
+    1) **必须同步 def、且活儿交给后台线程**：async def 会跑在事件循环上（一跑就把全站堵死，
+       13:44/15:26/15:51 三次"网页打不开"就是这么来的）；而同步接口里直接干几十分钟的活，
+       浏览器会超时、界面全程看不到进度。
+    2) 进度写进 extract_task_pool -> 任务总览里能看到 processed/total，并且能中止。"""
     _log(f"[向量化] 触发在线向量化 project={project}")
     ctx = load_project_context(project)
     if ctx["name"] in _deleted_projects() or not _project_exists_on_disk(ctx["name"]):
-        return {
-            "code": 404,
-            "msg": f"项目 [{ctx['name']}] 的目录不存在（已删除的项目不会被重建），无法向量化",
-        }
-    # 抽帧已分桶到 images/<视频名>/ 子目录：必须递归列出，否则顶层看不到帧（会误判"都已完成"）
-    all_imgs = [
-        os.path.join(_r, f)
-        for _r, _d, _fs in os.walk(ctx["img_dir"])
-        for f in _fs
-        if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
-    ]
-    indexed_paths = set([m["path"] for m in ctx["metadata"] if "path" in m])
-    unprocessed_paths = [p for p in all_imgs if p not in indexed_paths]
-    if not unprocessed_paths:
-        return {"code": 200, "msg": "该项目所有图片均已完成向量化"}
-    processed_count = extract_and_index_project(ctx, unprocessed_paths)
-    if processed_count and DB_PATCH_AVAILABLE:
-        from db_service import ensure_sync_hook, sync_metadata_paths
-        sync_metadata_paths(project, ctx["metadata"], unprocessed_paths)
-    if _vectorize_state["status"] == "unavailable":
-        return {
-            "code": 503,
-            "msg": "向量化未执行：SigLIP 取不到（显存被 AI 任务占用或模型缺失），请等任务跑完再试",
-        }
-    if _vectorize_state["status"] == "evicted":
-        return {
-            "code": 200,
-            "msg": f"已向量化 {processed_count} 张；中途 SigLIP 被其它 AI 任务卸载腾显存，"
-                   f"本轮提前结束（已完成部分已入库），稍后再点一次即可续做",
-        }
-    return {"code": 200, "msg": f"成功向量化 {processed_count} 张图片！"}
+        return {"code": 404, "msg": f"项目 [{ctx['name']}] 的目录不存在（已删除的项目不会被重建），无法向量化"}
+    key = "vectorize:%s" % ctx["name"]
+    with _extract_lock:
+        entry = extract_task_pool.get(key)
+        if entry and entry.get("is_running"):
+            return {"code": 400, "msg": f"项目 [{ctx['name']}] 已有向量化在跑，进度见任务总览"}
+        if entry is None:
+            entry = extract_task_pool.setdefault(key, {
+                "project": ctx["name"], "task_type": "vectorize", "is_running": False,
+                "is_cancelled": False, "msg": "", "current_path": ctx["img_dir"],
+                "processed_count": 0, "total_count": 0,
+            })
+        entry.update({"is_running": True, "is_cancelled": False,
+                      "processed_count": 0, "total_count": 0, "msg": "排队中…"})
+    threading.Thread(target=_vectorize_worker, args=(entry, ctx["name"]), daemon=True).start()
+    return {"code": 200, "msg": f"已开始向量化项目 [{ctx['name']}]，进度见任务总览（可中止）"}
 # ----------------- 检索路由 -----------------
 def _clamp_topk(v, where=""):
     """限定单次检索取回条数上限。
