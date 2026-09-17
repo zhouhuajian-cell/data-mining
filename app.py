@@ -935,6 +935,25 @@ def get_image(project: str, image_id: int):
     return JSONResponse(status_code=404, content={"msg": "图片不存在"})
 _DB_STATS_CACHE = {}      # project -> (ts, raw_count)；网盘目录扫描很慢，缓存 60 秒
 _DB_STATS_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+_DB_STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace", "db_stats_cache.json")
+_DB_STATS_LOADED = [False]
+def _db_stats_load():
+    """从本地文件恢复上次的原始帧数：服务一重启内存缓存就空，而首次统计要同步递归扫网盘
+    （平铺目录十几万文件要 70 秒以上），前端 fetchDbStats 只等 20 秒 -> 大盘三个数字空白。
+    恢复成"有旧值"状态后，接口立刻有数、后台再刷新。"""
+    try:
+        with open(_DB_STATS_FILE, encoding="utf-8") as f:
+            for _k, _v in (json.load(f) or {}).items():
+                _DB_STATS_CACHE[_k] = (0.0, int(_v))   # ts=0 即视为过期，会触发后台刷新
+    except Exception:
+        pass
+def _db_stats_save():
+    try:
+        os.makedirs(os.path.dirname(_DB_STATS_FILE), exist_ok=True)
+        with open(_DB_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(dict((_k, _v[1]) for _k, _v in list(_DB_STATS_CACHE.items())), f)
+    except Exception:
+        pass
 def _db_stats_scan(img_dir: str) -> int:
     """递归数一次图片文件（抽帧已分桶到子目录，必须递归；不递归会漏掉新抽的帧）。"""
     n = 0
@@ -947,11 +966,15 @@ def _db_stats_scan(img_dir: str) -> int:
 def _db_stats_refresh(project: str, img_dir: str):
     try:
         _DB_STATS_CACHE[project] = (time.time(), _db_stats_scan(img_dir))
+        _db_stats_save()
     except Exception:
         pass
 def _db_stats_raw_count(project: str, img_dir: str) -> int:
     """带缓存的原始帧数：命中缓存直接返回；有旧值但过期 -> 先用旧值、后台线程刷新；
     完全没有缓存（首次）才同步扫一次。这样接口不会因为扫网盘目录卡 20 秒。"""
+    if not _DB_STATS_LOADED[0]:
+        _DB_STATS_LOADED[0] = True
+        _db_stats_load()
     _c = _DB_STATS_CACHE.get(project)
     if _c and (time.time() - _c[0]) < 60:
         return _c[1]
@@ -963,6 +986,7 @@ def _db_stats_raw_count(project: str, img_dir: str) -> int:
         return _c[1]
     n = _db_stats_scan(img_dir)
     _DB_STATS_CACHE[project] = (time.time(), n)
+    _db_stats_save()
     return n
 @app.get("/api/db_stats")
 def get_db_stats(project: str = Query("default")):
@@ -7025,6 +7049,7 @@ def _asset_facets(project: str):
         )
     finally:
         db.close()
+_AT_GROUP_CACHE = {}      # "项目id|status" -> (ts, 聚合行)；聚合全量载入很贵，缓存 60 秒
 @app.get("/api/assets/table")
 def assets_table(
     project: str = Query("default"),
@@ -7049,8 +7074,20 @@ def assets_table(
             except Exception:
                 pass
         grouped = str(group or "").lower() == "video"
+        _gkey = None
         if grouped:
-            assets = q.order_by(Asset.vector_id.asc()).all()   # 聚合需要全量，先不分页
+            # 聚合要全量载入，且要取 a.source.file_name/directory_chain —— 而 Asset.source 是
+            # 懒加载，会变成"每帧一条 SQL"（G91 实测 46476 条 SQL 9.5 秒，占整请求 88%）。
+            # 一次性 joinedload 带出（10.8s -> 2.4s），再配 60 秒结果缓存让翻页即时。
+            _gkey = "%s|%s" % (proj.id, (status or "").strip().upper())
+            _ghit = _AT_GROUP_CACHE.get(_gkey)
+            if _ghit and (time.time() - _ghit[0]) < 60:
+                _gout = _ghit[1]
+                return {"code": 200, "total": len(_gout), "page": page, "size": size,
+                        "rows": _gout[(page - 1) * size: page * size], "cached": True}
+            from sqlalchemy.orm import joinedload
+            assets = (q.options(joinedload(Asset.source))
+                      .order_by(Asset.vector_id.asc()).all())   # 聚合需要全量，先不分页
             total = len(assets)
         else:
             total = q.count()
@@ -7171,6 +7208,8 @@ def assets_table(
                     "group_frames": g["frames"],
                 })
             total = len(out)
+            if _gkey:
+                _AT_GROUP_CACHE[_gkey] = (time.time(), out)
             rows = out[(page - 1) * size: page * size]
         return {"code": 200, "total": total, "page": page, "size": size, "rows": rows,
                 "grouped": "video" if grouped else ""}
