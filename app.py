@@ -3210,7 +3210,14 @@ async def upload_batch(
         "processed_count": ctx["index"].ntotal,
     }
 @app.post("/api/build_index_online")
-async def build_index_online(project: str = Query("default")):
+def build_index_online(project: str = Query("default")):
+    """⚠️ 必须用同步 def（不是 async def）：里面是整段阻塞的向量化（DataLoader+GPU+写盘）。
+
+    async def 会被 FastAPI 直接放在事件循环上执行 —— 那样一跑就把事件循环堵死，
+    所有 HTTP 请求（连 /api/ping）都得不到处理 = 全站卡死。
+    这正是 13:44 / 15:26 / 15:51 三次"网页打不开"的根因（hang dump 里可见
+    build_index_online -> extract_and_index_project -> DataLoader 跑在主线程的 uvicorn 栈里）。
+    写成 def 后 FastAPI 会在线程池里跑它，事件循环空出来，期间整站照常响应。"""
     _log(f"[向量化] 触发在线向量化 project={project}")
     ctx = load_project_context(project)
     if ctx["name"] in _deleted_projects() or not _project_exists_on_disk(ctx["name"]):
