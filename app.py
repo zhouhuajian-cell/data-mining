@@ -134,6 +134,12 @@ from settings import data_root as _data_root, config_info as _cfg_info
 WORKSPACE = _data_root()
 PROJECTS_ROOT = os.path.join(WORKSPACE, "projects")
 os.makedirs(PROJECTS_ROOT, exist_ok=True)
+# 索引与 metadata 的本地存放根（媒体帧仍在 NAS 的 projects/ 下）。
+# NAS 是 CIFS：不允许 rename，只能原地覆盖写 —— 重启打断就留半截文件（欧洲索引损坏事故的根因），
+# 且顺序读仅 ~110MB/s。本地 NVMe 实测写 2658MB/s、支持 os.replace 原子替换。
+# 迁移脚本 /tmp/_migrate_index.py 已把存量项目拷到本地并逐项校验（ntotal==metadata 条数）。
+LOCAL_INDEX_STORE = os.environ.get("AD_INDEX_STORE", os.path.join(PROJECT_DIR, "index_store"))
+os.makedirs(LOCAL_INDEX_STORE, exist_ok=True)
 LOG_DIR = os.environ.get("AD_LOG_DIR", os.path.join(PROJECT_DIR, "logs"))
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_RETENTION_DAYS = 30
@@ -183,7 +189,10 @@ def _compression_loop():
 def _start_compression():
     threading.Thread(target=_compression_loop, daemon=True).start()
 # ===== 目标检测持久化缓存（按项目隔离：项目 -> {str(image_id): 检测结果}） =====
-DETECTIONS_CACHE_FILE = os.path.join(WORKSPACE, "detections_cache.json")
+# ⚠️ 检测缓存落本地 NVMe + 原子写（旧版写 NAS 根目录：68MB 每批次全量非原子重写，
+# 重启打断即截断 → 启动迁移无容错直接崩溃循环 —— 2026-09-19 21:20 事故）。
+# NAS 上那份 detections_cache.json 是遗留文件，仅 migrate 兼容读取。
+DETECTIONS_CACHE_FILE = os.path.join(PROJECT_DIR, "workspace", "detections_cache.json")
 detections_cache = {}
 _detections_lock = threading.Lock()
 if os.path.exists(DETECTIONS_CACHE_FILE):
@@ -196,8 +205,12 @@ if os.path.exists(DETECTIONS_CACHE_FILE):
     except Exception:
         detections_cache = {}
 def _persist_detections():
-    with open(DETECTIONS_CACHE_FILE, "w", encoding="utf-8") as f:
+    """原子写本地 NVMe：tmp + os.replace，任何时刻中断都不会产生半截文件。"""
+    os.makedirs(os.path.dirname(DETECTIONS_CACHE_FILE), exist_ok=True)
+    _tmp = DETECTIONS_CACHE_FILE + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
         json.dump(detections_cache, f, ensure_ascii=False)
+    os.replace(_tmp, DETECTIONS_CACHE_FILE)
 def save_detection_record(project: str, image_id: int, result: dict):
     """把单张图片的检测结果按项目写入缓存并落盘（image_id 各项目独立，故按项目隔离存储）。"""
     global detections_cache
@@ -708,8 +721,8 @@ def make_room_for(model: str, need_gb: float = 2.0):
     """显存互斥调度：加载 model 前把与之不能共存的模型全部释放并归还显存。
     12G 卡上 VLM(7B-4bit 约 8G) 与 SigLIP/DINO/YOLO 尽量不共存。
     返回腾完后的可用显存(GB)。"""
-    keep = {"vlm": ("siglip", "dino", "yolo"), "siglip": ("vlm", "dino", "yolo"),
-            "dino": ("vlm", "siglip", "yolo"), "yolo": ("vlm", "siglip", "dino")}.get(model, ("vlm", "siglip", "dino", "yolo"))
+    keep = {"vlm": ("siglip", "dino", "yolo"), "siglip": ("vlm", "dino"),
+            "dino": ("vlm", "yolo"), "yolo": ("vlm", "dino")}.get(model, ("vlm", "siglip", "dino", "yolo"))
     if "vlm" in keep:
         _free_vlm()
     if "siglip" in keep:
@@ -805,6 +818,18 @@ def _project_lock(name):
         if name not in project_locks:
             project_locks[name] = threading.RLock()
         return project_locks[name]
+_index_locks = {}
+def _index_lock(name):
+    """FAISS 索引访问锁：只护住 index.add / index.search 这两小段（各几毫秒）。
+
+    为什么需要：向量化在后台线程往索引里 add 的同时，搜索可能在读同一个索引，
+    而 FAISS 的 add/search 并发并不安全（可能抛异常或结果错乱）。
+    为什么不用 _project_lock：向量化整批都持有它、其中还要拿 _gpu_slot；
+    搜索若按相反顺序拿锁就会死锁。这把锁只在两处各持几毫秒，且不与 _gpu_slot 嵌套。"""
+    with _project_locks_guard:
+        if name not in _index_locks:
+            _index_locks[name] = threading.RLock()
+        return _index_locks[name]
 # ----------------- SigLIP DataLoader -----------------
 class SigLIPImageDataset(
     Dataset if (not LITE_MODE and Dataset is not None) else object
@@ -826,11 +851,19 @@ class SigLIPImageDataset(
         path = self.file_paths[idx]
         try:
             with open(path, "rb") as f:
+                try:
+                    _sz = os.fstat(f.fileno()).st_size   # 顺手拿，省掉入库时再开一次文件
+                except Exception:
+                    _sz = 0
                 img = Image.open(f).convert("RGB")
+                _w, _h = img.size
                 tensor = self.transform(img)
-            return tensor, path, 1
+            # 第 4 个返回值 = 原图宽高与文件大小：入库时本来要逐帧再探测一遍
+            # （exists+getsize+PIL 读头部，CIFS 上每帧几毫秒，2000 帧串行要 19 秒），
+            # 而这里已经打开过同一个文件，顺手带走就不用第二次读盘了。
+            return tensor, path, 1, (_w, _h, _sz)
         except Exception:
-            return torch.zeros((3, 384, 384)), path, 0
+            return torch.zeros((3, 384, 384)), path, 0, (0, 0, 0)
 # ----------------- 项目空间管理器 -----------------
 def sanitize_project_name(name: str) -> str:
     clean = re.sub(r"[^a-zA-Z0-9_\-\u4e00-\u9fa5]", "_", (name or "").strip())
@@ -839,8 +872,10 @@ def get_project_paths(project_name: str):
     p_name = sanitize_project_name(project_name)
     p_dir = os.path.join(PROJECTS_ROOT, p_name)
     img_dir = os.path.join(p_dir, "images")
-    idx_path = os.path.join(p_dir, "index.faiss")
-    meta_path = os.path.join(p_dir, "metadata.json")
+    # 索引/metadata 在本地 NVMe（见 LOCAL_INDEX_STORE 注释）；帧图仍在 NAS
+    idx_dir = os.path.join(LOCAL_INDEX_STORE, p_name)
+    idx_path = os.path.join(idx_dir, "index.faiss")
+    meta_path = os.path.join(idx_dir, "metadata.json")
     # 注意：这里【不再】自动创建目录。只有显式新建项目(create_project)/启动初始化才建目录，
     # 否则读取旧项目名的请求会把“已改名/已删除”的项目重新建出来(空项目复活)。
     return p_name, p_dir, img_dir, idx_path, meta_path
@@ -947,6 +982,20 @@ def load_project_context(project_name: str):
             return _hit
         return _load_project_context_cold(p_name, p_dir, img_dir, idx_path, meta_path)
 def _load_project_context_cold(p_name, p_dir, img_dir, idx_path, meta_path):
+    # 自愈回迁：本地索引缺失而 NAS 上还有旧版（迁移前遗留/本地盘重装），拷回来再用。
+    # 单飞锁内执行（load_project_context 已按项目加锁），拷贝用 tmp+replace 保持原子。
+    if not os.path.exists(meta_path) and not os.path.exists(idx_path):
+        _leg_idx = os.path.join(p_dir, "index.faiss")
+        _leg_meta = os.path.join(p_dir, "metadata.json")
+        if os.path.exists(_leg_meta):
+            try:
+                os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+                if os.path.exists(_leg_idx):
+                    shutil.copy2(_leg_idx, idx_path + ".tmp"); os.replace(idx_path + ".tmp", idx_path)
+                shutil.copy2(_leg_meta, meta_path + ".tmp"); os.replace(meta_path + ".tmp", meta_path)
+                _log(f"[项目] {p_name} 本地索引缺失，已从 NAS 回迁（{_leg_idx}）")
+            except Exception as _e:
+                _log(f"[项目] {p_name} 从 NAS 回迁失败({_e})，按空项目继续")
     metadata = []
     if os.path.exists(meta_path):
         try:
@@ -954,17 +1003,29 @@ def _load_project_context_cold(p_name, p_dir, img_dir, idx_path, meta_path):
                 metadata = json.load(f)
         except Exception:
             metadata = []
+    broken = ""
     if LITE_MODE or faiss is None:
         index = _FakeIndex(FEAT_DIM)
     else:
         try:
             index = faiss.read_index(idx_path)
             if index.d != FEAT_DIM:
+                # 维度不符 = 换了编码模型，老 metadata 的 id 已无意义，只能一起作废
                 index = faiss.IndexFlatIP(FEAT_DIM)
                 metadata = []
-        except Exception:
+        except Exception as _e:
+            # ⚠️ 绝不能静默清空 metadata：索引被写坏（CIFS 不允许 rename，只能直接覆盖，
+            # 重启打断就留半截文件）时清空它，后续"向量化"会从空表重建 → 帧 id 与库里
+            # assets.vector_id 错位，标签/检测会挂到别的帧上（2026-09-17 欧洲事故）。
+            # 这里保留 metadata 不动，只把索引标成空 + 打标记；向量化入口见到标记会拒绝执行。
             index = faiss.IndexFlatIP(FEAT_DIM)
-            metadata = []
+            if metadata:
+                broken = f"索引读取失败({_e})"
+                _log(f"[项目] ⚠️ {p_name} 索引损坏：{broken}；metadata {len(metadata)} 条原样保留，"
+                     f"该项目向量化已禁用（普通向量化会与库里 id 错位，需按恢复流程重建索引）")
+    if not broken and metadata and index.ntotal != len(metadata):
+        broken = f"索引向量数 {index.ntotal} != metadata {len(metadata)}"
+        _log(f"[项目] ⚠️ {p_name} 索引与 metadata 条数不符：{broken}；该项目向量化已禁用")
     ctx = {
         "name": p_name,
         "dir": p_dir,
@@ -974,27 +1035,78 @@ def _load_project_context_cold(p_name, p_dir, img_dir, idx_path, meta_path):
         "index": index,
         "metadata": metadata,
     }
+    if broken:
+        ctx["index_broken"] = broken
     project_cache[p_name] = ctx
     _project_cache_evict_oldest(keep=p_name)
     return ctx
 _SAVE_INFLIGHT = [0]      # 正在落盘的项目数：看护重启前会看一眼（网盘不允许 rename 覆盖，
                           # 做不到原子落盘，所以只能在"要重启"这一侧避让）
-def save_project_context(ctx):
-    """落盘 metadata + FAISS 索引。
+_LAST_BAK = {}            # 项目 -> 上次备份上一版的时间戳（见 _backup_before_save）
+def _backup_before_save(ctx):
+    """写盘前留一份上一版（index.faiss.bak / metadata.json.bak）。
 
-    ⚠️ 实测这挂 CIFS 允许建文件但不允许 rename 覆盖（os.replace 直接 Permission denied），
-    所以做不到"写临时文件再原子替换"。重启若杀在直接写的中途会留下半截文件，
-    因此**落盘期间置 _SAVE_INFLIGHT**，让看护线程重启前先避让、并优先等它写完。"""
+    网盘不允许 rename，做不到"写临时文件再原子替换"，所以覆盖写万一被重启打断，
+    磁盘上就只剩半截文件 —— 上一版备份是唯一能救回来的东西。
+    节流：同一项目 AD_SAVE_BAK_SEC 秒内只备份一次（默认 600，设 0 关闭），
+    否则每批 5000 帧都拷几百 MB，白白压网盘 I/O。"""
+    try:
+        sec = int(os.environ.get("AD_SAVE_BAK_SEC", "600"))
+    except Exception:
+        sec = 600
+    if sec <= 0:
+        return
+    now = time.time()
+    if now - _LAST_BAK.get(ctx["name"], 0) < sec:
+        return
+    _LAST_BAK[ctx["name"]] = now
+    for p in (ctx["idx_path"], ctx["meta_path"]):
+        try:
+            if os.path.exists(p):
+                shutil.copy2(p, p + ".bak")
+        except Exception as _e:
+            _log(f"[落盘] 备份上一版失败 {p}: {_e}")
+def save_project_context(ctx):
+    """落盘 metadata + FAISS 索引（本地 NVMe，**原子写**）。
+
+    ⚠️ 历史事故：文件在 NAS(CIFS) 时不允许 rename，只能原地覆盖写，重启打断就留半截文件
+    （2026-09-17 欧洲索引损坏的根因）。现索引/metadata 已迁本地盘（LOCAL_INDEX_STORE），
+    走 tmp + os.replace 原子替换：**任何时刻磁盘上都只有完整的新版或完整的旧版**。
+    落盘期间仍置 _SAVE_INFLIGHT（看护重启前避让），写前照旧留 .bak（本地拷贝 ~0.3s，便宜）。"""
     _SAVE_INFLIGHT[0] += 1
     try:
         with _project_lock(ctx["name"]):
+            os.makedirs(os.path.dirname(ctx["idx_path"]), exist_ok=True)
+            _backup_before_save(ctx)
             if not LITE_MODE and faiss is not None:
                 try:
-                    faiss.write_index(ctx["index"], ctx["idx_path"])
+                    _t0 = time.time()
+                    _tmp = ctx["idx_path"] + ".tmp"
+                    faiss.write_index(ctx["index"], _tmp)
+                    # IndexFlat 落盘大小 = 头部 + 4*d*ntotal，比理论值小就是写坏了 —— 不替换，保住旧版
+                    _want = 4 * int(ctx["index"].d) * int(ctx["index"].ntotal)
+                    _got = os.path.getsize(_tmp)
+                    if _got >= _want:
+                        os.replace(_tmp, ctx["idx_path"])
+                    else:
+                        _log(f"[落盘] ⚠️ {ctx['name']} 索引写盘不完整：{_got} < 期望 {_want}，"
+                             f"保留旧版不替换")
+                    _t_idx = time.time() - _t0
                 except Exception:
-                    pass
-            with open(ctx["meta_path"], "w", encoding="utf-8") as f:
+                    _t_idx = 0.0
+            _t1 = time.time()
+            _tmp = ctx["meta_path"] + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 json.dump(ctx["metadata"], f, ensure_ascii=False)
+            os.replace(_tmp, ctx["meta_path"])
+            _t_meta = time.time() - _t1
+            # 分环节计时：写盘是"每批都要重写整个索引"的 O(索引) 操作，
+            # 任务跑得慢到底是卡在读帧还是卡在落盘，看这一行就知道（超过 1s 才记，免刷屏）。
+            if _t_idx + _t_meta > 1.0:
+                _nt = int(ctx["index"].ntotal) if ctx.get("index") is not None else 0
+                _log(f"[落盘] {ctx['name']} 索引 {_nt} 向量/{_t_idx:.1f}s"
+                     f"（{4 * _nt * 1152 / 1048576.0 / max(_t_idx, 1e-6):.0f} MB/s）"
+                     f" + metadata {len(ctx.get('metadata') or [])} 条/{_t_meta:.1f}s")
     finally:
         _SAVE_INFLIGHT[0] = max(0, _SAVE_INFLIGHT[0] - 1)
 # ----------------- 模型加载 -----------------
@@ -1007,6 +1119,8 @@ def startup_event():
     _start_compression()  # 后台线程每小时压缩
     _load_passwords()  # 读取持久化密码（若有）
     _cleanup_stale_jobs()  # 重启后清理僵尸 RUNNING/PENDING（诚实标 FAILED 可续跑）
+    if str(os.environ.get("AD_AUTO_RESUME", "1")).strip().lower() not in ("0", "false", "no", "off"):
+        threading.Thread(target=_auto_resume_interrupted, daemon=True).start()   # 自动续跑被重启打断的抽帧
     if _adaptive_flag("AD_VEC_ADAPTIVE"):
         _start_perf_watchdog()   # 内存地板看门狗（只在自适应开启时跑；只减载不加载）
     if str(os.environ.get("AD_HEALTH_WATCH", "1")).strip().lower() not in ("0", "false", "no", "off"):
@@ -1063,12 +1177,10 @@ def startup_event():
 def read_index():
     # 前端唯一入口：front.html（改前端只改这一个文件，无需再同步副本）
     index_html = os.path.join(PROJECT_DIR, "front.html")
-    # 禁缓存：前端是热替换的（改了不用重启），但浏览器一旦缓存住旧页面，用户点了半天
-    # 还是旧交互（"改了怎么没生效"多半是这个）。这里显式告诉浏览器每次都回源取。
+    # 协商缓存：FileResponse 自带 ETag —— 页面没改动时 304 秒回（不再全量下 300KB），
+    # 有改动即时生效，兼顾"热更新"与加载速度。
     _nocache = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
+        "Cache-Control": "no-cache, must-revalidate",
     }
     if os.path.exists(index_html):
         return FileResponse(index_html, headers=_nocache)
@@ -1174,6 +1286,11 @@ def delete_project(project_name: str = Form(...)):
             return {"code": 500, "msg": f"数据库清理失败: {str(e)}"}
     if clean_name in project_cache:
         del project_cache[clean_name]
+    # 本地索引目录可以真删（NAS 才删不掉）；不删的话"同名重建"会看到旧索引/旧 metadata
+    try:
+        shutil.rmtree(os.path.dirname(get_project_paths(clean_name)[3]), ignore_errors=True)
+    except Exception:
+        pass
     # 记入删除名单：网盘目录还在也不许自动补建，否则前端轮询会把它复活（"删不掉"）
     _mark_project_deleted(clean_name)
     return {
@@ -1182,21 +1299,41 @@ def delete_project(project_name: str = Form(...)):
                f"数据文件目录保留(未删除), 请手动删除",
     }
 @app.get("/api/image/{project}/{image_id}")
-def get_image(project: str, image_id: int):
+def get_image(project: str, image_id: int, w: int = Query(0)):
+    """取图。`?w=480` 返回长边缩到 480px 的缩略图（本地磁盘缓存，按 源mtime 失效）——
+    相册/卡片列表用它，字节数降 10-20 倍，浏览器端加载速度数量级提升；详情/回放不带 w 走原图。
+    原图与缩略图都带长缓存头（帧文件按名字=身份不可变，浏览器跨页面秒开）。"""
     ctx = load_project_context(project)
     meta = ctx["metadata"]
+    _cache_hdr = {"Cache-Control": "public, max-age=604800, immutable"}
     if 0 <= image_id < len(meta):
         path = meta[image_id].get("path", "")
         # 优先读取原路径
         if path and os.path.exists(path):
-            return FileResponse(path)
-        # 🔑 自愈：原路径失效（如项目改名后 metadata 未同步）时，
-        #    自动在当前项目 images 目录里【递归按同名】寻找（兼容子目录结构）
-        filename = meta[image_id].get("filename", "")
-        if filename:
-            self_heal_path = _find_file_by_name(ctx["img_dir"], filename)
-            if self_heal_path:
-                return FileResponse(self_heal_path)
+            src = path
+        else:
+            # 🔑 自愈：原路径失效（如项目改名后 metadata 未同步）时，
+            #    自动在当前项目 images 目录里【递归按同名】寻找（兼容子目录结构）
+            filename = meta[image_id].get("filename", "")
+            src = _find_file_by_name(ctx["img_dir"], filename) if filename else None
+        if not src:
+            return JSONResponse(status_code=404, content={"msg": "图片不存在"})
+        if w and 160 <= w <= 1920:
+            try:
+                _tdir = os.path.join(LOCAL_INDEX_STORE, "thumbs",
+                                     sanitize_project_name(project), str(w))
+                os.makedirs(_tdir, exist_ok=True)
+                _tp = os.path.join(_tdir, "%d_%d.jpg" % (image_id, int(os.path.getmtime(src))))
+                if not os.path.exists(_tp):
+                    from PIL import Image as _I
+                    with _I.open(src) as _im:
+                        _im = _im.convert("RGB")
+                        _im.thumbnail((w, w))
+                        _im.save(_tp, "JPEG", quality=82)
+                return FileResponse(_tp, headers=_cache_hdr)
+            except Exception:
+                pass   # 缩略图失败不阻塞：回退原图
+        return FileResponse(src, headers=_cache_hdr)
     return JSONResponse(status_code=404, content={"msg": "图片不存在"})
 _DB_STATS_CACHE = {}      # project -> (ts, raw_count)；网盘目录扫描很慢，缓存 60 秒
 _DB_STATS_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -1239,6 +1376,21 @@ def ping():
     返回正在落盘的项目数，供看护重启前避让（网盘不能 rename 覆盖，做不到原子落盘）。"""
     return {"ok": True, "save_inflight": _SAVE_INFLIGHT[0],
             "threads": threading.active_count(), "uptime_s": round(time.time() - _health_started_at(), 1)}
+@app.get("/api/vlm_status")
+def vlm_status(warm: int = Query(0)):
+    """VLM 打标用的模型是不是 7B。前端在发起「AI场景分析」前先查这里，
+    非 7B 一律先弹人工确认（硬规则，见 AGENTS.md）。
+
+    warm=1 时如果模型还没加载，就先**真的加载一次**再报结果：VLM 是懒加载的，
+    刚重启时 vlm_model 为 None，若直接按"未加载=非 7B"拒绝，正常流程反而跑不起来。
+    （加载本身要几十秒并会腾显存，所以默认不热身，只在查状态时按需触发。）"""
+    if warm:
+        try:
+            if vlm_model is None and LOAD_MODELS:
+                init_vlm_local()
+        except Exception as _e:
+            _log(f"[VLM] 状态查询时热身加载失败: {_e}")
+    return {"code": 200, **vlm_model_info()}
 def _start_health_watchdog():
     """整站卡死自愈：/api/ping 连续失败 N 次就自动重启服务。
 
@@ -1431,6 +1583,13 @@ def extract_and_index_project(ctx, image_paths: List[str], frame_meta: dict = No
 def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = None):
     if LITE_MODE or torch is None or siglip_model is None or not image_paths:
         return 0
+    if ctx.get("index_broken"):
+        # 索引损坏时 metadata 被保留（见 _load_project_context_cold），此时补索引会**追加**到空索引上，
+        # 帧 id 从此与库里 vector_id 错位 —— 宁可什么都不做，也不能把数据挂错。
+        _log(f"[向量化] 拒绝执行：{ctx['name']} 索引损坏（{ctx['index_broken']}），"
+             f"需先按恢复流程重建索引（否则帧 id 会与库里 assets.vector_id 错位）")
+        _vectorize_state["status"] = "broken"
+        return 0
     # 固定 384 分辨率，让 cuDNN 自动挑选最优卷积内核（同形状重复前向显著提速）
     if DEVICE == "cuda" and torch is not None:
         try:
@@ -1462,11 +1621,17 @@ def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = 
     dataloader = DataLoader(dataset, **dl_kwargs)
     extracted_feats = []
     extracted_records = []
+    _t_enc0 = time.time()      # 读网盘 + 解码 + SigLIP 编码 这一段的耗时（分环节计时用）
     with torch.no_grad():
-        for tensors, paths, valids in dataloader:
+        for tensors, paths, valids, metas in dataloader:
             mask = valids == 1
             if not mask.any():
                 continue
+            # metas = 数据集顺手带回的 (宽, 高, 文件大小)，default_collate 把它拆成 3 个张量
+            try:
+                _mw, _mh, _ms = (metas[0].tolist(), metas[1].tolist(), metas[2].tolist())
+            except Exception:
+                _mw = _mh = _ms = None
             valid_tensors = tensors[mask].to(DEVICE, non_blocking=True)
             with _gpu_slot("SigLIP 特征提取"):
                 if siglip_model is None:
@@ -1484,30 +1649,49 @@ def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = 
             feats = feats / feats.norm(dim=-1, keepdim=True)
             extracted_feats.append(feats.cpu().numpy().astype(np.float32))
             valid_paths = [paths[i] for i in range(len(paths)) if valids[i] == 1]
-            for p in valid_paths:
+            valid_idx = [i for i in range(len(paths)) if valids[i] == 1]
+            for _k, p in enumerate(valid_paths):
                 current_id = len(ctx["metadata"]) + len(extracted_records)
-                extracted_records.append(
-                    {
-                        "id": current_id,
-                        "filename": os.path.basename(p),
-                        "path": p,
-                        "url": f"/api/image/{ctx['name']}/{current_id}",
-                        "frame_index": (frame_meta or {})
-                        .get(p, {})
-                        .get("frame_index", 0),
-                        "timestamp": (frame_meta or {})
-                        .get(p, {})
-                        .get("timestamp", 0.0),
-                        "video_source": (frame_meta or {}).get(p) or None,
-                    }
-                )
+                _rec = {
+                    "id": current_id,
+                    "filename": os.path.basename(p),
+                    "path": p,
+                    "url": f"/api/image/{ctx['name']}/{current_id}",
+                    "frame_index": (frame_meta or {})
+                    .get(p, {})
+                    .get("frame_index", 0),
+                    "timestamp": (frame_meta or {})
+                    .get(p, {})
+                    .get("timestamp", 0.0),
+                    "video_source": (frame_meta or {}).get(p) or None,
+                }
+                # 宽高/大小随记录带走：入库时（sync_asset_records_to_db）就不必再逐帧
+                # 开一次网盘文件去探测（那是同一批帧的第二次读盘，实测省 11~19 秒/批）
+                if _mw is not None:
+                    try:
+                        _i = valid_idx[_k]
+                        if _mw[_i] and _mh[_i]:
+                            _rec["width"] = int(_mw[_i])
+                            _rec["height"] = int(_mh[_i])
+                            _rec["file_size"] = int(_ms[_i])
+                    except Exception:
+                        pass
+                extracted_records.append(_rec)
     if extracted_feats:
+        _n_in = len(extracted_records)
+        _t_enc = time.time() - _t_enc0
         all_new_feats = np.vstack(extracted_feats)
         if ctx["index"] is None or ctx["index"].d != FEAT_DIM:
             ctx["index"] = faiss.IndexFlatIP(FEAT_DIM)
-        ctx["index"].add(all_new_feats)
+        with _index_lock(ctx["name"]):
+            ctx["index"].add(all_new_feats)
         ctx["metadata"].extend(extracted_records)
+        _t_before_save = time.time()
         save_project_context(ctx)
+        # 分环节计时：这一批到底卡在"读帧+解码+编码"还是"落盘"，看这一行就分得清
+        _log(f"[向量化] {ctx['name']} 本批 {_n_in} 帧：读+解码+编码 {_t_enc:.1f}s"
+             f"（{_n_in / max(_t_enc, 1e-6):.1f} 帧/秒）"
+             f" → 落盘 {time.time() - _t_before_save:.1f}s")
     return len(extracted_records)
 # ----------------- 数据导入与上传路由 -----------------
 # 🌟 直导(import) 后台任务状态（单槽，独立于打包/抽帧，可与其它任务并行）
@@ -1564,7 +1748,14 @@ def background_full_pipeline_worker(project: str, source_path: str):
                 task_status["msg"] = f"服务器端未找到路径: {p}"
                 continue
             # 1. 自动递归扫描路径并登记到原始数据池（无后缀/时间戳后缀也强行用 PIL 试探）
+            # 📷 数据约定（用户 2026-09-19）：目录里既有视频又有图片时，**图片是视频的重复连拍**，
+            #    只处理视频、跳过图片 —— 否则同一内容入库两份。
             for root, dirs, files in os.walk(p):
+                if any(f.lower().endswith(VIDEO_EXTS) for f in files):
+                    for f in files:
+                        if f.lower().endswith(VIDEO_EXTS) and not task_status.get("is_cancelled"):
+                            videos.append(os.path.join(root, f))
+                    continue   # 该目录的图片不导入（同一内容视频已覆盖）
                 for f in files:
                     # 🛑 刹车点：直导(拷贝登记)过程中可被急停
                     if task_status.get("is_cancelled"):
@@ -1754,6 +1945,27 @@ async def get_all_tasks_status(project: str = Query(None)):
             "processed_count": e.get("processed_count", 0),
             "total_count": e.get("total_count", 0),
         }
+    # 1.5) 段级判定（守护驱动的循环，不在任务池里）—— 读轻量状态文件并入大盘，
+    #      让"所有任务都在总览可见"（用户 2026-09-20 要求）
+    try:
+        _jsp = os.path.join(PROJECT_DIR, "workspace", "clip_judge_status.json")
+        if os.path.exists(_jsp):
+            with open(_jsp, encoding="utf-8") as _f:
+                _js = json.load(_f) or {}
+            _jp = _js.get("project") or ""
+            _fresh = (time.time() - float(_js.get("ts") or 0)) < 300   # 5 分钟内有过动作才算在跑
+            if _js.get("running") and _fresh and ((not project) or project == _jp):
+                _dn, _tt = int(_js.get("done") or 0), int(_js.get("total") or 0)
+                _stop = os.path.exists(os.path.join(PROJECT_DIR, "workspace", "CLIP_JUDGE_STOP"))
+                pool["clip_judge:%s" % _jp] = {
+                    "project": _jp, "task_type": "clip_judge", "is_running": True,
+                    "is_cancelled": _stop,
+                    "msg": "段级判定中… 已判 %d/%d%s" % (_dn, _tt, "（已发中止，本段结束后停）" if _stop else ""),
+                    "current_path": "clip_judge:%s" % _jp,
+                    "processed_count": _dn, "total_count": _tt,
+                }
+    except Exception:
+        pass
     # 2) 直导(import) 与 打包(delivery) 各自独立的单槽状态，并入大盘；同样按项目过滤
     for _st in (task_status, delivery_status):
         if _st.get("is_running") or _st.get("msg"):
@@ -1766,6 +1978,9 @@ async def get_all_tasks_status(project: str = Query(None)):
                     "is_cancelled": _st.get("is_cancelled", False),
                     "msg": _st.get("msg", ""),
                     "current_path": _st.get("current_path", ""),
+                    # 计数一起带上：任务总览所有行都用同一套字段画进度条（导入/打包原来没有）
+                    "processed_count": _st.get("processed_count", 0),
+                    "total_count": _st.get("total_count", 0),
                 }
     return pool
 @app.post("/api/all_tasks/clear")
@@ -2154,6 +2369,16 @@ async def cancel_task(folder_path: str = Form(...)):
         entry["msg"] = "正在中止任务，等待当前帧落盘..."
         _log(f"[任务] 已发送抽帧中止信号: {key}")
         return {"code": 200, "msg": "中止信号已发送"}
+    # 段级判定（守护循环）：写停止标志，守护每段检查后停（不打断正在跑的那一段）
+    if raw.startswith("clip_judge:") or ("clip_judge" in raw):
+        _proj = raw.split(":", 1)[1] if ":" in raw else ""
+        try:
+            with open(os.path.join(PROJECT_DIR, "workspace", "CLIP_JUDGE_STOP"), "w", encoding="utf-8") as _f:
+                _f.write(_proj)
+            _log(f"[任务] 已发送段级判定中止信号: project={_proj or '(全部)'}")
+            return {"code": 200, "msg": "已发中止：当前这段判完即停（进度保留）"}
+        except Exception as _e:
+            return {"code": 500, "msg": f"中止失败: {_e}"}
     # 2) 直导(import)：按类型前缀/路径/项目匹配即视为命中
     if task_status.get("is_running") and task_status.get("task_type") == "import":
         cur = task_status.get("current_path") or task_status.get("project") or ""
@@ -2252,7 +2477,16 @@ def _maybe_auto_vectorize(project: str, reason: str = "", max_frames: int = None
         _log(f"[自动向量化] 已有自动向量化在跑，本次跳过 project={project}")
         return 0
     try:
+        # 打标让路：TAG 持有 VLM 时加载 SigLIP 会驱逐 VLM（换装抖动），延后到打标结束
+        # （打标的 _ai_batch_worker 收尾时会自动补一轮向量化，帧不会丢）
+        if _running_tag_jobs(project):
+            _log(f"[自动向量化] {project} 打标进行中，本轮延后（打标结束自动补跑）")
+            return 0
         ctx = load_project_context(project)
+        if ctx.get("index_broken"):
+            _log(f"[自动向量化] 拒绝执行 {project}：索引损坏（{ctx['index_broken']}），"
+                 f"补索引会让帧 id 与库里错位，需先重建索引")
+            return 0
         try:
             cap = int(max_frames if max_frames else (os.environ.get("AD_AUTO_VEC_MAX") or 0))
         except Exception:
@@ -2263,6 +2497,21 @@ def _maybe_auto_vectorize(project: str, reason: str = "", max_frames: int = None
             return 0
         _log(f"[自动向量化] 开始 project={project} 待处理 {len(pend)} 帧"
              + (f"（单次上限 {cap}）" if cap > 0 else "") + f" ({reason})")
+        # 注册到任务池：自动向量化补跑可能持续几十分钟，必须进任务总览（用户 2026-09-20 要求"所有任务都要进任务总览"）
+        _av_key = "autovec:%s" % project
+        _av_entry = None
+        try:
+            with _extract_lock:
+                _av_entry = extract_task_pool.setdefault(_av_key, {
+                    "project": project, "task_type": "vectorize", "is_running": True,
+                    "is_cancelled": False, "msg": "", "current_path": ctx["img_dir"],
+                    "processed_count": 0, "total_count": 0,
+                })
+                _av_entry.update({"is_running": True, "is_cancelled": False,
+                                  "processed_count": 0, "total_count": len(pend),
+                                  "msg": "自动向量化补跑 %d 帧（%s）" % (len(pend), reason or "抽帧完成")})
+        except Exception:
+            _av_entry = None
         B = max(500, int(os.environ.get("AD_VEC_BATCH", "5000")))
         done = 0
         for i in range(0, len(pend), B):
@@ -2278,6 +2527,13 @@ def _maybe_auto_vectorize(project: str, reason: str = "", max_frames: int = None
                         _log(f"[自动向量化] 写库失败(继续): {_e2}")
                 save_project_context(ctx)
                 done += n or 0
+                if _av_entry is not None:
+                    try:
+                        _av_entry["processed_count"] = min(i + len(batch), len(pend))
+                        _av_entry["msg"] = "自动向量化补跑 %d/%d（已入库 %d）" % (
+                            _av_entry["processed_count"], len(pend), done)
+                    except Exception:
+                        pass
                 _log(f"[自动向量化] project={project} 进度 {i + len(batch)}/{len(pend)} 已入库 {done}")
             except Exception as _e:
                 _log(f"[自动向量化] 分批失败(继续下一批): {_e}")
@@ -2287,11 +2543,28 @@ def _maybe_auto_vectorize(project: str, reason: str = "", max_frames: int = None
             except Exception:
                 pass
         _log(f"[自动向量化] 结束 project={project} 共入库 {done} 帧")
+        if _av_entry is not None:
+            try:
+                _av_entry["msg"] = "✅ 自动向量化补跑完成：入库 %d 帧" % done
+            except Exception:
+                pass
         return done
     except Exception as e:
         _log(f"[自动向量化] 异常(不影响抽帧): {e}")
+        if 'av_entry' in dir() and _av_entry is not None:
+            try:
+                _av_entry["msg"] = "❌ 自动向量化异常：%s" % str(e)[:80]
+            except Exception:
+                pass
         return 0
     finally:
+        # 任务池条目置为已完成（总览会自动隐藏停止的条目，但保留"已完成"提示）
+        try:
+            _e = extract_task_pool.get("autovec:%s" % project)
+            if _e is not None:
+                _e["is_running"] = False
+        except Exception:
+            pass
         _AUTO_VEC_LOCK.release()
 @app.post("/api/auto_vec/run")
 def auto_vec_run(
@@ -2560,6 +2833,7 @@ def _run_video_list(
     )
     new_saved_paths = []
     frame_meta = {}
+    _vec_inline_total = 0   # 抽帧中"流水线向量化"的累计数（原来只统计尾批，报告里看着像没向量化）
     entry["total_count"] = len(videos)
     total_saved = 0
     cancelled = False
@@ -2608,21 +2882,33 @@ def _run_video_list(
                              + f" 最新: {os.path.basename(_vp)}")
         # 分块向量化：每满一批立刻入库并清空缓冲（大目录不会把几十万条路径堆在内存里）
         if frame_meta is not None and len(new_saved_paths) >= max(200, int(os.environ.get("AD_VEC_CHUNK", "2000"))):
-            _chunk_paths = list(new_saved_paths)     # 清空前留一份，下面写库要用
-            _vec = extract_and_index_project(ctx, _chunk_paths, frame_meta=frame_meta)
-            # 关键：向量化后必须把资产写进数据库。原路径抽出帧后会调这里，分块分支一度漏掉，
-            # 结果磁盘上几十万帧、库里只有几千条 —— 数据仓库/明细表面板读库，所以"看不到数据"。
-            if _vec and DB_PATCH_AVAILABLE:
-                try:
-                    from db_service import ensure_sync_hook, sync_metadata_paths
-                    ensure_sync_hook(project, ctx["metadata"])
-                    sync_metadata_paths(project, ctx["metadata"], _chunk_paths)
-                except Exception as _e:
-                    _log(f"[抽帧] 分批写库失败(继续抽帧): {_e}")
-            for _p in _chunk_paths:
-                frame_meta.pop(_p, None)
-            new_saved_paths.clear()
-            save_project_context(ctx)
+            # 内存地板闸门：抽帧+向量化并行是实测安全的（合计峰值 <500MB），但其它任务可能正在吃内存
+            # —— 低于地板就跳过本批，路径留在缓冲里等任务完成后的补跑，绝不为并行牺牲抽帧（9/16 教训）
+            _avail = _mem_avail_mb()
+            # 打标让路：TAG 任务持有 VLM(10.5G)，此时加载 SigLIP 会驱逐 VLM 造成互相换装抖动（9/17 同类）。
+            # 抽帧继续（帧不丢），本批延后 —— 打标结束后 _ai_batch_worker 会自动补一轮向量化。
+            if _running_tag_jobs(ctx["name"]):
+                _log(f"[抽帧] {ctx['name']} 打标进行中，本批 {len(new_saved_paths)} 帧向量化延后（避免驱逐 VLM）")
+            elif _avail is not None and _avail < max(4096, _mem_floor_mb() + 1024):
+                _log(f"[抽帧] 可用内存 {_avail}MB 低于流水线向量化门槛，本批({len(new_saved_paths)}帧)延后补跑")
+            else:
+                _chunk_paths = list(new_saved_paths)     # 清空前留一份，下面写库要用
+                _vec = extract_and_index_project(ctx, _chunk_paths, frame_meta=frame_meta)
+                nonlocal _vec_inline_total
+                _vec_inline_total += _vec or 0
+                # 关键：向量化后必须把资产写进数据库。原路径抽出帧后会调这里，分块分支一度漏掉，
+                # 结果磁盘上几十万帧、库里只有几千条 —— 数据仓库/明细表面板读库，所以"看不到数据"。
+                if _vec and DB_PATCH_AVAILABLE:
+                    try:
+                        from db_service import ensure_sync_hook, sync_metadata_paths
+                        ensure_sync_hook(project, ctx["metadata"])
+                        sync_metadata_paths(project, ctx["metadata"], _chunk_paths)
+                    except Exception as _e:
+                        _log(f"[抽帧] 分批写库失败(继续抽帧): {_e}")
+                for _p in _chunk_paths:
+                    frame_meta.pop(_p, None)
+                new_saved_paths.clear()
+                save_project_context(ctx)
 
     if _K > 1 and len(videos) > 1:
         from concurrent.futures import ThreadPoolExecutor
@@ -2664,9 +2950,10 @@ def _run_video_list(
         if vec and DB_PATCH_AVAILABLE:
             from db_service import ensure_sync_hook, sync_metadata_paths
             sync_metadata_paths(project, ctx["metadata"], new_saved_paths)
+    vec_total = vec + _vec_inline_total   # 流水线批次 + 尾批，一起算进报告（原来漏掉流水线批次）
     if cancelled:
         entry["msg"] = (
-            f"⚠️ 任务已手动中止！已处理 {entry['processed_count']}/{len(videos)} 个视频，抽帧 {total_saved} 张，向量化入库 {vec} 张。"
+            f"⚠️ 任务已手动中止！已处理 {entry['processed_count']}/{len(videos)} 个视频，抽帧 {total_saved} 张，向量化入库 {vec_total} 张。"
         )
     elif errors and not total_saved:
         # 全部失败：必须明确报错，否则"0 张 + 成功"会掩盖真实故障(如签名不匹配/目录不可写)
@@ -2675,13 +2962,96 @@ def _run_video_list(
         )
     elif errors:
         entry["msg"] = (
-            f"⚠️ 部分视频抽帧失败（成功 {len(videos) - len(errors)}/{len(videos)}）：抽帧 {total_saved} 张，向量化 {vec} 张。"
+            f"⚠️ 部分视频抽帧失败（成功 {len(videos) - len(errors)}/{len(videos)}）：抽帧 {total_saved} 张，向量化 {vec_total} 张。"
             f"失败原因: " + " | ".join(errors[:3])
         )
     else:
         entry["msg"] = (
-            f"✅ 视频抽帧与特征入库完成：{kind}共扫描 {len(videos)} 个视频，抽帧 {total_saved} 张，向量化 {vec} 张，库内共 {ctx['index'].ntotal} 张"
+            f"✅ 视频抽帧与特征入库完成：{kind}共扫描 {len(videos)} 个视频，抽帧 {total_saved} 张，向量化 {vec_total} 张（含流水线批次），库内共 {ctx['index'].ntotal} 张"
         )
+# ---- 灵活链路自动接力（2026-09-19）：抽帧→检测→段级判定 零等待串联 ----
+_AUTO_CLIP_LOCK = threading.Lock()
+def _running_tag_jobs_any():
+    """任意项目有 TAG（检测/段级判定）在跑 —— 全局串行依据（共用 YOLO 模型实例，不可并发）。"""
+    try:
+        from models import Job, JobType, JobStatus
+        db = get_db_session()
+        try:
+            n = db.query(Job).filter(Job.job_type == JobType.TAG,
+                                     Job.status.in_([JobStatus.RUNNING, JobStatus.PENDING])).count()
+            return n > 0
+        finally:
+            db.close()
+    except Exception:
+        return True   # 查不到就当忙，宁可不动
+def _pipeline_busy():
+    with _extract_lock:
+        return any(e.get("is_running") and e.get("task_type") in ("video", "extract", "vectorize")
+                   for e in extract_task_pool.values())
+def _maybe_auto_detect(project: str):
+    """抽帧收尾自动提交帧级检测（闸门：开关/无 TAG 在跑/管道空闲/内存）。幂等：无待检帧自动跳过。"""
+    if not _adaptive_flag("AD_AUTO_DETECT"):
+        return
+    if _running_tag_jobs_any() or _pipeline_busy():
+        return
+    try:
+        if (_mem_avail_mb() or 9999) < 4096:
+            _log(f"[自动检测] {project} 可用内存不足，本轮跳过")
+            return
+        r = pipeline_run_ai_batch(project=project, only_unprocessed=1, detect_first=1,
+                                  dino_enhance=0, preset="balanced", clip_size=30)
+        _log(f"[自动检测] {project} → " + json.dumps(r, ensure_ascii=False)[:140])
+    except Exception as _e:
+        _log(f"[自动检测] 提交失败(不影响抽帧): {_e}")
+def _auto_clip_judge_worker(project: str):
+    """段级接地判定循环（45 分钟预算/轮；单飞锁防重叠；闸门同上）。"""
+    t0 = time.time()
+    try:
+        try:
+            if vlm_model is None and LOAD_MODELS:
+                init_vlm_local()   # 含非 7B 自动卸载保护
+        except Exception:
+            pass
+        if VLM_REQUIRE_7B and not vlm_model_info()["is_7b"]:
+            _log(f"[自动判定] {project} 跳过：VLM 非 7B")
+            return
+        try:
+            ctx = load_project_context(project)
+            _clips = build_clips_from_metadata(ctx, 30)
+            save_clips(ctx, _clips)
+        except Exception as _e:
+            _log(f"[自动判定] clips/scan 失败 {project}: {_e}")
+            return
+        judged, page = 0, 1
+        while time.time() - t0 < 45 * 60:
+            if _running_tag_jobs_any() or _pipeline_busy():
+                _log(f"[自动判定] {project} 管道忙，本轮让路（下轮继续）")
+                break
+            d = clips_list(project=project, page=page, size=100, light=1)
+            items = (d or {}).get("items") or []
+            if not items:
+                break
+            for c in items:
+                if not c.get("decision"):
+                    if time.time() - t0 > 45 * 60:
+                        break
+                    try:
+                        clips_analyze_single(project=project, clip_id=c["clip_id"])
+                        judged += 1
+                    except Exception as _e:
+                        _log(f"[自动判定] 段判定失败 {c['clip_id'][:40]}: {_e}")
+            if len(items) < 100:
+                break
+            page += 1
+        _log("[自动判定] %s 本轮完成 %d 段（用时 %.0f 分）" % (project, judged, (time.time() - t0) / 60))
+    finally:
+        _AUTO_CLIP_LOCK.release()
+def _maybe_auto_clip_judge(project: str):
+    if not _adaptive_flag("AD_AUTO_CLIP"):
+        return
+    if not _AUTO_CLIP_LOCK.acquire(blocking=False):
+        return
+    threading.Thread(target=_auto_clip_judge_worker, args=(project,), daemon=True).start()
 def _run_video_job(
     entry,
     project: str,
@@ -2724,6 +3094,11 @@ def _run_video_job(
                 _maybe_auto_vectorize(project, reason="目录抽帧完成")
         except Exception as _e:
             _log(f"[自动向量化] 触发失败(不影响抽帧): {_e}")
+        try:
+            if not entry.get("is_cancelled"):
+                _maybe_auto_detect(project)   # 抽帧完 → 立即接力帧检测（灵活链路）
+        except Exception as _e:
+            _log(f"[自动检测] 触发失败(不影响抽帧): {_e}")
     elif os.path.isfile(local) and _is_video_file(local):
         entry["msg"] = f"正在解析视频并抽帧 ({desc})..."
         _run_video_list(
@@ -2905,6 +3280,7 @@ async def process_video(
                 p0.id,
                 JobType.EXTRACT,
                 {
+                    "project": _proj0,   # ⚠️ 必须记录：续跑时 payload 里没有它会被误归到 default（2026-09-19 事故）
                     "paths": [j[0] for j in jobs],
                     "step": frame_step or 1,
                     "unit": unit,
@@ -3226,6 +3602,12 @@ def _vectorize_worker(entry, project: str):
     每批入索引 + 写库 + 刷新 processed_count，任务总览里能看着数字往上走，也能中止。"""
     try:
         ctx = load_project_context(project)
+        if ctx.get("index_broken"):
+            entry["msg"] = (f"❌ 索引损坏（{ctx['index_broken']}），已拒绝向量化："
+                            f"普通链路按扫描顺序重建，会让帧 id 与库里 assets.vector_id 错位。"
+                            f"请先重建索引（恢复流程），再补索引。")
+            _log(f"[向量化] 拒绝执行 {project}：索引损坏（{ctx['index_broken']}）")
+            return
         entry["msg"] = "正在扫描未入索引的帧…"
         all_imgs = [
             os.path.join(_r, f)
@@ -3246,14 +3628,24 @@ def _vectorize_worker(entry, project: str):
                 entry["msg"] = f"⚠️ 已手动中止！已处理 {entry.get('processed_count', 0)}/{len(pend)} 帧"
                 return
             batch = pend[i:i + B]
+            _t_batch0 = time.time()
             n = extract_and_index_project(ctx, batch)
+            _t_dl = time.time() - _t_batch0
+            _t_sync = 0.0
             if n and DB_PATCH_AVAILABLE:
                 try:
                     from db_service import ensure_sync_hook, sync_metadata_paths
+                    _ts = time.time()
                     ensure_sync_hook(project, ctx["metadata"])
                     sync_metadata_paths(project, ctx["metadata"], batch)
+                    _t_sync = time.time() - _ts
                 except Exception as _e:
                     _log(f"[向量化] 分批写库失败(继续): {_e}")
+            # 批间隔的分环节账：DataLoader 重建(含进程拉起) 与 写库 都在这句账里。
+            # 之前这两块是黑盒，只看到"2000 帧要 58s"而编码只占 33s，查不出剩下 25s 花在哪。
+            _log(f"[向量化] {project} 本批 {len(batch)} 帧账面：编码+落盘 {_t_dl:.1f}s"
+                 f" + 写库 {_t_sync:.1f}s = {time.time() - _t_batch0:.1f}s"
+                 f"（{len(batch) / max(time.time() - _t_batch0, 1e-6):.1f} 帧/秒 端到端）")
             done += n or 0
             entry["processed_count"] = min(i + len(batch), len(pend))
             entry["msg"] = f"向量化中… 已处理 {entry['processed_count']}/{len(pend)}（本次入索引 {done}）"
@@ -3338,7 +3730,8 @@ def search_text(
         text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
         text_np = text_feat.cpu().numpy().astype(np.float32)
     actual_k = min(top_k, ctx["index"].ntotal)
-    scores, indices = ctx["index"].search(text_np, actual_k)
+    with _index_lock(ctx["name"]):
+        scores, indices = ctx["index"].search(text_np, actual_k)
     results = []
     for score, idx in zip(scores[0], indices[0]):
         if 0 <= idx < len(ctx["metadata"]):
@@ -3391,7 +3784,8 @@ async def search_by_external_image(
         img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
         img_np = img_feats.cpu().numpy().astype(np.float32)
     actual_k = min(top_k, ctx["index"].ntotal)
-    scores, indices = ctx["index"].search(img_np, actual_k)
+    with _index_lock(ctx["name"]):
+        scores, indices = ctx["index"].search(img_np, actual_k)
     max_scores = {}
     for q_idx in range(len(pil_imgs)):
         for score, idx in zip(scores[q_idx], indices[q_idx]):
@@ -3628,7 +4022,11 @@ def ground_detect(
         inputs = dino_processor(images=image, text=prompt, return_tensors="pt").to(
             DEVICE
         )
-        with torch.no_grad():
+        # ⚠️ 必须包 autocast：DINO 是 fp16 加载的（gpu_patch dino loader），float 输入直接前向
+        # 会抛 "Input type (float) and bias type (c10::Half)" —— 单帧 ground_detect 曾因此
+        # **每次都静默返回空结果**（异常被 except 吞掉），批量路径有 autocast 所以是好的。
+        # 2026-09-19 实测修复。与批量路径（_run_batch）保持同一推理口径。
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
             outputs = dino_model(**inputs)
         results = dino_processor.post_process_grounded_object_detection(
             outputs,
@@ -3741,11 +4139,17 @@ def _yolo_detect_batch_locked(
     make_room_for("yolo", 6.0)
     if not _ensure_yolo():  # 按需懒加载
         return {"code": 500, "msg": "YOLO 模型加载失败/未启用 (AD_LOAD_MODELS=0?)"}
+    # 检测分辨率可调（AD_YOLO_IMGSZ，默认 640=历史值）。实测 1280 在 30 帧上多检出 38%
+    # （含 person 4->7、56 个 conf>=0.5 的强框），代价是像素量 4 倍、耗时 ~3-4x。
+    # 部署环境用 adaptive.conf 里 AD_YOLO_IMGSZ=1280 生效；删掉该行即回 640。
+    _imgsz = _env_int("AD_YOLO_IMGSZ", 640, lo=320, hi=1536)
     # 批大小按剩余显存自适应：1080p 下批量太大极易 OOM（曾整轮检测因此失败）
     try:
         _free_gb = _vram_free_gb()
         if _free_gb is not None:
             _cap = 16 if _free_gb >= 8 else (8 if _free_gb >= 5 else (4 if _free_gb >= 3 else 2))
+            if _imgsz >= 1024:
+                _cap = max(2, _cap // 2)   # 大分辨率下激活显存 ~4x，批量上限减半防 OOM
             if batch_size > _cap:
                 print(f"[检测] 显存剩余 {_free_gb:.1f}G，YOLO 批大小 {batch_size} -> {_cap}", flush=True)
                 batch_size = _cap
@@ -3791,7 +4195,7 @@ def _yolo_detect_batch_locked(
             try:
                 _res = yolo_model(
                     _arr,
-                    imgsz=640,  # 固定分辨率 → 触发 cudnn.benchmark 最优内核
+                    imgsz=_imgsz,  # AD_YOLO_IMGSZ 可调；1280 提升小目标检出（实测 +38%）
                     device=DEVICE,
                     verbose=False,
                     half=((str(fp16) == "1") and DEVICE == "cuda"),  # FP16 约 2x(仅 CUDA)
@@ -3984,6 +4388,38 @@ def get_all_detections(project: str = Query("default")):
 vlm_model = None
 vlm_processor = None
 vlm_loaded_name = ""  # 实际加载成功的 VLM 模型名（用于确认是否 3B / 回退 2B）
+VLM_REQUIRE_7B = os.environ.get("AD_VLM_REQUIRE_7B", "1") == "1"   # 硬规则：VLM 打标只认 7B
+def vlm_model_info() -> dict:
+    """当前 VLM 的就绪情况 —— 供前端在发起打标前确认"跑的是不是 7B"。
+
+    踩过的坑（2026-09-18）：加载链会静默降级（3B 的 transformers 类不存在 → 回退 7B →
+    显存不够 → 落到 2B），而 ai_tags 里记的仍是"7B"。结果 2B 的判定被当成 7B 在用，
+    实测"行人横穿"占了全部事件的 55%（9,672/17,559）、63% 的事件没有 confidence。
+    所以这里把"实际是不是 7B"变成一个可查询、可拦截的事实，别再靠日志肉眼确认。"""
+    name = vlm_loaded_name or ""
+    is_7b = ("7B" in name) or ("7b" in name)
+    return {
+        "loaded": bool(vlm_model is not None),
+        "model": name or None,
+        "is_7b": bool(is_7b),
+        "required_7b": VLM_REQUIRE_7B,
+        "preferred": VLM_MODEL_NAME,        # 首选名（可能因 transformers 版本不可用）
+        "fallback": VLM_FALLBACK_MODEL,     # 实际会用的 7B
+        "four_bit": bool(VLM_4BIT),
+        "ok": bool(vlm_model is not None and (is_7b or not VLM_REQUIRE_7B)),
+    }
+def _vlm_budget(multi: bool = False) -> int:
+    """VLM 单次生成的 token 预算。
+
+    ⚠️ 这个值曾经偏小（多帧 220 / 单帧 160），而输出 JSON 有 9 个字段、事件还要带
+    F1→FN 的跨帧证据 —— 实测 6 帧联合推理直接吐到 220 截断，输出连结尾的 } 都没有，
+    JSON 解析失败后走关键词兜底，**evidence 与 confidence 就在这一步整批丢掉**
+    （库里 17,559 个事件有 11,023 个 confidence 为空、只有 6,536 个带证据）。
+    宁可多给预算（生成到 EOS 自然停，多给不会变慢多少），也不要截断。
+    可用 AD_VLM_MAX_TOKENS / AD_VLM_MAX_TOKENS_MULTI 覆盖（比如显存吃紧时调回 220）。"""
+    if multi:
+        return _env_int("AD_VLM_MAX_TOKENS_MULTI", 512, lo=128, hi=4096)
+    return _env_int("AD_VLM_MAX_TOKENS", 384, lo=128, hi=4096)
 def _bnb_4bit():
     """4bit 量化配置（12G 卡跑 7B 必须）。视觉塔不量化：VLM 的视觉编码器对量化很敏感，
     量化后远处小目标(行人/非机动车)识别会明显变差。不可用时返回 None(退回 fp16)。"""
@@ -4001,21 +4437,49 @@ def _bnb_4bit():
     except TypeError:
         return BitsAndBytesConfig(**base)
 def _try_load_vlm(name: str, dtype):
-    """按服务器 transformers 版本兼容加载 Qwen2.5-VL；失败自动回退 Qwen2-VL-2B。"""
+    """加载 VLM：优先大模型（默认 7B，走 4bit），不可行才退到 2B(fp16)。
+
+    ⚠️ 历史坑（2026-09-18 查实）：首选名 `AD_VLM_MODEL` 默认是 Qwen2.5-VL-3B，而服务器
+    transformers 是 4.46.3（导不出 Qwen2_5_VLForConditionalGeneration），这一支**必然抛异常**；
+    接着又因为显存判定不够而跳过 7B，最终静默落到 2B —— 而 ai_tags 里记的却是"7B"，
+    于是 2B 的判定质量被当成 7B 的结果在用（实测 9,672 条"行人横穿"占全部事件 55%）。
+    所以这里改成：**先看首选名能不能真加载**（用 try 探测类是否存在），不能就直接上
+    AD_VLM_FALLBACK（7B-4bit），并把"实际用的是哪个"显式打进日志与 ai_tags 的 model 字段。
+    要真正用 Qwen2.5-VL 系列，需把 transformers 升到 >=4.57（那会影响 SigLIP/DINO 加载，另开窗口做）。"""
     from transformers import AutoProcessor
-    # 1) 优先 Qwen2.5-VL（需要 transformers>=4.57）
+    # 1) 首选模型：只有对应的类真能导入时才试（避免注定失败的加载白等、还把回退链带偏）
+    _cls = None
     try:
-        from transformers import Qwen2_5_VLForConditionalGeneration as _ModelCls
-        model = _ModelCls.from_pretrained(name, torch_dtype=dtype, device_map="auto")
-        try:
-            proc = AutoProcessor.from_pretrained(
-                name, min_pixels=256 * 28 * 28, max_pixels=768 * 28 * 28
-            )
-        except Exception:
-            proc = AutoProcessor.from_pretrained(name)
-        return model, proc, name
+        if "2.5" in str(name):
+            from transformers import Qwen2_5_VLForConditionalGeneration as _cls
+        else:
+            from transformers import Qwen2VLForConditionalGeneration as _cls
     except Exception as _e:
-        print(f"[!] Qwen2.5-VL 加载失败({_e})，回退 {VLM_FALLBACK_MODEL}...")
+        print(f"[!] 首选模型 {name} 的 transformers 类不可用({_e})，改用 {VLM_FALLBACK_MODEL}", flush=True)
+        _cls = None
+    if _cls is not None:
+        try:
+            _q0 = _bnb_4bit() if VLM_4BIT else None
+            _kw0 = {"device_map": "auto"}
+            if _q0 is not None:
+                _kw0["quantization_config"] = _q0
+            else:
+                _kw0["torch_dtype"] = dtype
+            model = _cls.from_pretrained(name, **_kw0)
+            try:
+                proc = AutoProcessor.from_pretrained(
+                    name, min_pixels=256 * 28 * 28, max_pixels=VLM_MAX_PX * 28 * 28
+                )
+            except Exception:
+                proc = AutoProcessor.from_pretrained(name)
+            _vram_log(f"{name} 就绪")
+            return model, proc, name
+        except Exception as _e:
+            print(f"[!] 首选模型 {name} 加载失败({_e})，回退 {VLM_FALLBACK_MODEL}", flush=True)
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
     # 2) 回退链：大模型(默认 7B，走 4bit) → 小模型 2B(fp16)
     quant = _bnb_4bit() if VLM_4BIT else None
     free_gb = make_room_for("vlm", 10.5)
@@ -4061,10 +4525,20 @@ def _try_load_vlm(name: str, dtype):
             except Exception:
                 pass
     raise RuntimeError("VLM 候选模型全部加载失败")
+_VLM_LOAD_LOCK = threading.Lock()   # 防并发加载互抢 GPU（2026-09-20 实测两个请求同时
+                                    # init → 2B 加载失败 + meta tensor 报错 → 状态混乱）
 def init_vlm_local():
     global vlm_model, vlm_processor, vlm_loaded_name
     if not LOAD_MODELS:
         raise RuntimeError("VLM 未启用：请将 AD_LOAD_MODELS 置为 1 后再调用")
+    if vlm_model is not None:
+        return
+    with _VLM_LOAD_LOCK:
+        if vlm_model is not None:   # 双检：等锁期间别人可能已加载好
+            return
+        _init_vlm_local_locked()
+def _init_vlm_local_locked():
+    global vlm_model, vlm_processor, vlm_loaded_name
     if vlm_model is None:
         dtype = torch.float16 if DEVICE == "cuda" else torch.float32
         print(f"[*] 正在加载 VLM 场景判定模型: {VLM_MODEL_NAME} ...")
@@ -4084,6 +4558,19 @@ def init_vlm_local():
         except Exception:
             pass
         print(f"[✓] VLM 场景判定引擎就绪 ({used})")
+        # ⚠️ 硬规则执行点（2026-09-19）：要求 7B 而实际加载的不是 7B（显存不足回退 2B）
+        # → **立即卸载，绝不让 2B 常驻**。否则后续每次检查都报"非 7B"，打标永久卡死
+        # （2026-09-19 19:00 实际发生：warm 加载掉进 2B → 守护打标停摆）。
+        if VLM_REQUIRE_7B and not vlm_model_info()["is_7b"]:
+            try:
+                _free_vlm()
+            except Exception:
+                pass
+            vlm_model = None
+            vlm_processor = None
+            vlm_loaded_name = ""
+            _log("[VLM] ⛔ 加载结果非 7B，已按硬规则卸载（防止 2B 常驻导致打标停锁）；"
+                 "请排查显存占用后重试")
 @app.post("/api/vlm_analyze")
 def vlm_analyze_scene(project: str = Form("default"), image_id: int = Form(...)):
     """加锁包装：单帧 VLM 判定与批量任务/Clip 判定排队互斥"""
@@ -4639,9 +5126,11 @@ def _group_frames_joint(db, project_id: int, image_ids, seg_size: int = 30, pick
     没有 video_source 的帧（Clip 链路抽出的图）按 v<N>_<毫秒>_<序号>.jpg 恢复成段，
     实在认不出来的才各自成段走单帧判定。"""
     from models import Asset
+    from clip_service import seq_key as _seq_key, split_seq_runs as _split_seq_runs
     amap = {a.vector_id: a for a in db.query(Asset).filter(Asset.project_id == project_id).all()}
     by_video, order = {}, []
     _clip_pending = []  # [(v<N>, 毫秒, 序号, (毫秒, 序号, 帧id))]，没有 video_source 的帧先攒着
+    _seq_pending = {}   # 直导连续帧：run_id -> [(mode, value, 帧id)]（相机连拍/尾部序号，见 clip_service.seq_key）
     for iid in image_ids:
         a = amap.get(iid)
         vs = ((a.asset_metadata or {}).get("video_source") or {}) if a is not None else {}
@@ -4657,6 +5146,11 @@ def _group_frames_joint(db, project_id: int, image_ids, seg_size: int = 30, pick
                 _clip_pending.append(
                     (_parts[0], _parts[1], _parts[2], (_parts[1], _parts[2], iid)))
                 continue
+            # 直导的图片连续帧（相机连拍/尾部序号）同样按段切，与视频一个逻辑（2026-09-19）
+            _sk = _seq_key((a.image_path if a is not None else "") or "")
+            if _sk:
+                _seq_pending.setdefault(_sk[0], []).append((_sk[1], _sk[2], iid))
+                continue
             key = "__single__%s" % iid
             sort_key = (0, 0)
         if key not in by_video:
@@ -4667,6 +5161,13 @@ def _group_frames_joint(db, project_id: int, image_ids, seg_size: int = 30, pick
     for _ck, _run in _split_clip_runs(_clip_pending):
         _key = "__clip__%s_%d" % _ck
         by_video[_key] = list(_run)
+        order.append(_key)
+    # 直导连续帧：连续性切段（相机连拍按毫秒间隔、尾部序号按号差），再按 seg_size 窗口成组
+    for _run in _split_seq_runs([(_rid, _mode, _val, _iid)
+                                 for _rid, _lst in _seq_pending.items()
+                                 for _mode, _val, _iid in _lst]):
+        _key = "__seq__%d" % len(order)
+        by_video[_key] = [(0, _i, _iid) for _i, _iid in enumerate(_run)]
         order.append(_key)
     groups = []
     for key in order:
@@ -4792,7 +5293,7 @@ def _vlm_predict_text_multi(images) -> str:
             )
             inputs = vlm_processor(text=[text_prompt], images=_small, return_tensors="pt").to(DEVICE)
             with torch.inference_mode():
-                generated_ids = vlm_model.generate(**inputs, max_new_tokens=220, do_sample=False)
+                generated_ids = vlm_model.generate(**inputs, max_new_tokens=_vlm_budget(multi=True), do_sample=False)
             trimmed = [
                 out_ids[len(in_ids):]
                 for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -4843,7 +5344,7 @@ def _vlm_predict_text_locked(image) -> str:
         with torch.inference_mode():
             _vlm_vram("before_gen")
             generated_ids = vlm_model.generate(
-                **inputs, max_new_tokens=160, do_sample=False
+                **inputs, max_new_tokens=_vlm_budget(), do_sample=False
             )
             _vlm_vram("after_gen")
         generated_ids_trimmed = [
@@ -5598,7 +6099,10 @@ def _ai_batch_worker(
         from models import JobStatus as _JS
         _job_set(job_pk, status=_JS.RUNNING, progress=0.0, current_stage="任务启动")
         # ============ 阶段 1: YOLO 全批检测(真实目标置信) ============
-        yolo_hits = {}  # image_id -> [ {label, confidence, box} ]
+        # ⚠️ 只存命中的 image_id（set），不存完整检测结果：检测结果已按批落库
+        # （assets.detections），在内存里再堆几十万条含框坐标的记录会吃 GB 级内存
+        # （2026-09-20 OOM 事故的第二处来源）。VLM 阶段只用成员判断与计数，set 足够。
+        yolo_hits = set()  # 命中的 image_id 集合
         detect_ok = not detect_first   # 未开启检测时不算失败
         if detect_first and image_ids and DEVICE == "cuda":
             try:
@@ -5667,7 +6171,7 @@ def _ai_batch_worker(
                             for lb, cf, bx in zip(r.get("labels") or [], r.get("scores") or [], r.get("boxes") or []):
                                 dets.append({"label": lb, "confidence": float(cf), "box": bx})
                             if dets:
-                                yolo_hits[iid] = dets
+                                yolo_hits.add(iid)
                             a = _dbw.query(Asset).filter(Asset.project_id == _pj.id, Asset.vector_id == iid).first()
                             if a is None:
                                 continue
@@ -5757,7 +6261,23 @@ def _ai_batch_worker(
                     pass
                     if torch is not None:
                         torch.cuda.empty_cache()
-        # ============ 阶段 2: VLM 场景/事件 + 融合 + 决策 ============
+        # ============ 帧级任务到此为止（2026-09-19 重构）============
+        # 帧级只做检测（YOLO + 可选 DINO），不再走 VLM：场景/事件判断迁移至 Clip 段级
+        # （clips_analyze_single，YOLO 检测结果注入提示词 + 事件-目标程序化校验）。
+        # 下面的联合打标代码保留但不可达（历史参考，勿删——回退时整段恢复只需移除本 early return）。
+        _update_job_progress(job_pk, total, total, f"检测完成 {len(yolo_hits)}/{total}")
+        _log(f"[Pipeline] 帧级检测完成 job={job_pk} 命中 {len(yolo_hits)}/{total} 帧"
+             f"（帧级不再走 VLM；场景/事件由 Clip 段级判定）")
+        _finish_job(job_pk, {
+            "detected_frames": len(yolo_hits),
+            "total": total,
+            "detect_first": bool(detect_first),
+            "dino_enhance": bool(dino_enhance),
+            "pipeline": "yolo_detect",
+            "note": "帧级=检测；场景/事件走 Clip 段级 VLM（/api/clips/*）",
+        })
+        return
+        # ============ 阶段 2: VLM 场景/事件 + 融合 + 决策（不可达，历史参考）============
         _log(
             f"[Pipeline] 批量 AI 阶段2(VLM+融合) job={job_pk} project={project} frames={total} detect={detect_first}"
         )
@@ -6004,6 +6524,40 @@ def _ai_batch_worker(
         import traceback
         traceback.print_exc()
         _fail_job(job_pk, str(e))
+    finally:
+        # 打标收尾自动补一轮向量化：打标期间抽帧/向量化会让路（避免驱逐 VLM），
+        # 打标期间新抽的帧在这里补上 —— 帧不丢，闭环（2026-09-19 灵活打标策略）
+        try:
+            _maybe_auto_vectorize(project, reason="打标结束补向量化")
+        except Exception as _e:
+            _log(f"[Pipeline] 打标结束补向量化失败(不影响任务): {_e}")
+        try:
+            _maybe_auto_clip_judge(project)   # 检测完 → 立即接力段级判定（灵活链路）
+        except Exception as _e:
+            _log(f"[Pipeline] 段级判定接力失败(不影响任务): {_e}")
+_JOB_LIVE = {}   # job_pk(str) -> {"processed","total","stage","t"}：批量 worker 的实时 x/y 明细
+def _job_live(pk=None, pos=None, total=None, stage=None):
+    """DB Job 的实时进度明细（读/写同一个函数：传 pos 就是写，不传就是读）。
+
+    jobs 表只有 progress(%)，任务总览画进度条要 x/y，靠这里补。明细只放内存不落库：
+    省一次 ALTER TABLE，而且它没有跨重启的语义 —— 重启本来就会把 RUNNING 标 FAILED。
+    超过 300 秒没更新视为已停（不拿陈旧数字画条）。"""
+    if pk is None:
+        return None
+    k = str(pk)
+    if pos is None and stage is None:
+        e = _JOB_LIVE.get(k)
+        return e if (e and time.time() - e["t"] <= 300) else None
+    _JOB_LIVE[k] = {
+        "processed": int(pos or 0),
+        "total": int(total or 0),
+        "stage": stage or "",
+        "t": time.time(),
+    }
+    if len(_JOB_LIVE) > 200:   # 防泄漏：只留最近 100 条
+        for _k in sorted(_JOB_LIVE, key=lambda x: _JOB_LIVE[x]["t"])[:100]:
+            _JOB_LIVE.pop(_k, None)
+    return _JOB_LIVE[k]
 def _job_set(
     pk,
     status=None,
@@ -6044,6 +6598,7 @@ def _job_set(
         pass
 def _update_job_progress(pk: int, pos: int, total: int, stage: str):
     """更新 DB Job 进度(批量 worker 用)"""
+    _job_live(pk, pos, total, stage)   # 内存明细：任务总览要 x/y，不只百分比
     try:
         _job_set(
             pk,
@@ -6052,6 +6607,110 @@ def _update_job_progress(pk: int, pos: int, total: int, stage: str):
         )
     except Exception:
         pass
+def _auto_resume_interrupted():
+    """重启后自动续跑"被重启打断"的抽帧任务（AD_AUTO_RESUME=0 关闭）。
+
+    只认 _cleanup_stale_jobs 打的标记（error 含「服务重启中断」）——用户没中止过、
+    纯粹被重启打断的 EXTRACT 任务才续；人工中止/失败的不碰（AGENTS 约定：重启前后
+    要确认用户想跑什么，这里只忠实恢复被打断的）。走 HTTP 自提交 = 与手工重提完全
+    同一条生产链路（含全部参数校验）。防抖：1 小时内只自动续跑一次，看护若反复
+    重启不会反复拉起重活。抽帧本身幂等（帧名=身份，已抽的自动跳过）。"""
+    time.sleep(60)   # 等端口就绪、模型加载完，别和启动抢资源
+    try:
+        _mrk = os.path.join(PROJECT_DIR, ".last_auto_resume")
+        if os.path.exists(_mrk) and time.time() - os.path.getmtime(_mrk) < 3600:
+            _log("[续跑] 1 小时内已自动续跑过，跳过（防重启循环反复拉起任务）")
+            return
+        import urllib.parse, urllib.request
+        from db_service import get_db_session
+        from models import Job, JobType, Project
+        from datetime import datetime as _dt, timedelta as _td
+        db = get_db_session()
+        try:
+            cut = _dt.utcnow() - _td(days=7)
+            # ⚠️ 项目名以 jobs.project_id 关联为权威（payload 历史上不存 project，
+            # 曾导致南美的任务被续跑到 default —— 2026-09-19 事故）
+            rows = (db.query(Job, Project.name)
+                    .join(Project, Job.project_id == Project.id)
+                    .filter(Job.job_type.in_([JobType.EXTRACT, JobType.TAG]),
+                            Job.error.like("%服务重启中断%"),
+                            ~Job.error.like("%已自动续跑%"),   # 已续跑过的不重提（防反复触发）
+                            Job.created_at >= cut)
+                    .order_by(Job.created_at.desc()).all())
+            if not rows:
+                _log("[续跑] 无被重启打断的抽帧任务")
+                return
+            seen, todo = set(), []
+            for j, _pname in rows:
+                if j.job_type == JobType.TAG:
+                    continue   # TAG 在下面的专用分支处理
+                p = j.payload or {}
+                _proj = _pname or p.get("project") or "default"
+                for _path in (p.get("paths") or []):
+                    _key = (_proj, _path)
+                    if _key in seen:
+                        continue
+                    seen.add(_key)
+                    todo.append((_key[0], _path, p))
+            _log("[续跑] 发现 %d 个被重启打断的抽帧任务（涉及 %d 条路径），自动重提" % (len(rows), len(todo)))
+            open(_mrk, "w").write(time.strftime("%Y-%m-%d %H:%M:%S"))
+            _ok_paths = set()
+            for proj, path, p in todo:
+                data = urllib.parse.urlencode({
+                    "project": proj,
+                    "video_path": path,
+                    "frame_step": p.get("step"),
+                    "unit": p.get("unit") or "count",
+                    "mode": p.get("mode") or "interval",
+                }).encode("utf-8")
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:8009/api/process_video", data=data, timeout=60) as r:
+                        _log("[续跑] %s %s -> %s" % (proj, path, r.read().decode("utf-8", "replace")[:120]))
+                    _ok_paths.add((proj, path))
+                except Exception as _e:
+                    _log(f"[续跑] {proj} {path} 提交失败: {_e}")
+            # 标记已续跑的源任务：否则这批 FAILED 记录永远带着"服务重启中断"标记，
+            # 以后每次重启（隔 1 小时防抖后）都会把同一条路径反复重提一遍
+            # TAG 类型（帧检测）也要续跑：按项目重发增量检测（run_ai_batch 自选未检帧）
+            _done_tag = set()
+            for j, _pname in rows:
+                if j.job_type != JobType.TAG or j.project_id is None:
+                    continue
+                p = j.payload or {}
+                _proj = _pname or p.get("project") or "default"
+                if _proj in _done_tag:
+                    continue
+                _done_tag.add(_proj)
+                try:
+                    data = urllib.parse.urlencode({
+                        "project": _proj, "only_unprocessed": "1", "detect_first": "1",
+                        "dino_enhance": "0", "preset": "balanced", "clip_size": "30",
+                    }).encode("utf-8")
+                    with urllib.request.urlopen("http://127.0.0.1:8009/api/pipeline/run_ai_batch", data=data, timeout=300) as r:
+                        _log("[续跑] TAG 检测 %s → %s" % (_proj, r.read().decode("utf-8", "replace")[:110]))
+                except Exception as _e:
+                    _log(f"[续跑] TAG 检测 {_proj} 提交失败: {_e}")
+            _marked = 0
+            for j, _pname in rows:
+                p = j.payload or {}
+                _proj = _pname or p.get("project") or "default"
+                if j.job_type == JobType.TAG:
+                    if _proj in _done_tag:
+                        j.error = (j.error or "") + "（已自动续跑）"
+                        _marked += 1
+                    continue
+                _ps = [(_proj, _x) for _x in (p.get("paths") or [])]
+                if _ps and all(_k in _ok_paths for _k in _ps):
+                    j.error = (j.error or "") + "（已自动续跑）"
+                    _marked += 1
+            if _marked:
+                db.commit()
+                _log(f"[续跑] 已标记 {_marked} 个源任务为'已自动续跑'")
+        finally:
+            db.close()
+    except Exception as _e:
+        _log(f"[续跑] 自动续跑检查失败(不影响启动): {_e}")
 def _cleanup_stale_jobs():
     try:
         from db_service import get_db_session
@@ -6102,19 +6761,20 @@ def pipeline_run_ai_batch(
     image_ids: str = Form(None),
     preset: str = Form(None),
     detect_first: int = Form(0),
-    dino_enhance: int = Form(0),
+    dino_enhance: int = Form(0),   # 默认关（2026-09-19 用户拍板：先提升 YOLO 精度/召回，DINO 开销大、按需手选）
     only_unprocessed: int = Form(1),
     joint_frames: int = Form(1),
     clip_size: int = Form(0),
+    vlm_confirm: str = Form(""),   # 已弃用保留兼容：帧级不再走 VLM（2026-09-19 重构），7B 闸门迁至 Clip 判定
 ):
-    """创建批量 AI Pipeline 任务（VLM 结构化 → 维度标签 → Decision Engine 决策）。
+    """创建批量帧级检测任务（2026-09-19 重构：**帧级只跑 YOLO 检测，不再走 VLM**）。
 
     image_ids 逗号分隔；**留空/传 all 表示整个项目**（由后端挑帧，前端不必再把全量 id 塞过来）。
-    only_unprocessed=1（默认）为增量：已有 ai_tags 的帧视为已处理直接跳过，
-    这样新入库的帧不会连带把老帧重跑一遍；勾选检测时，已标但没检测记录的帧仍会补跑。
+    only_unprocessed=1（默认）为增量：**已有 YOLO 检测记录的帧视为已处理直接跳过**
+    （帧级=帧挖掘：哪帧有什么目标；场景/事件判断在 Clip 段级由 VLM 完成，见 /api/clips/*）。
 
-    clip_size 为 Clip 段长（帧），默认 30：前端「Clip帧数」传进来的就是它，
-    这样 Clip 链路与片段联合打标用同一个段长，不会一边 50 一边 30。
+    ⚠️ 硬规则迁移：VLM 必须 7B 的闸门现位于 **Clip 判定**（clips_analyze_single / 守护提交前检查）——
+    帧级检测不经过 VLM，不受此规则约束。
     """
     from db_service import create_job
     from models import JobType, Asset, AssetStatus
@@ -6129,34 +6789,41 @@ def pipeline_run_ai_batch(
         proj = _ensure_db_project(db, project)
         if proj is None:
             return {"code": 500, "msg": "数据库未就绪"}
-        rows = db.query(Asset).filter(Asset.project_id == proj.id).all()
-        if not whole_project:
-            # 在内存里筛：指定 id 可能上千，SQL 的 IN(...) 参数有上限
-            want = set(ids_in)
-            rows = [a for a in rows if a.vector_id in want]
-        picked, skipped_tagged, redetect = [], 0, 0
-        for a in rows:
-            tagged = bool(a.ai_tags)
-            has_det = bool((a.detections or {}).get("yolo"))
-            if only_unprocessed and tagged and (has_det or not detect_first):
-                skipped_tagged += 1
-                continue
-            if only_unprocessed and tagged and detect_first and not has_det:
-                redetect += 1   # 已标但缺检测记录：本次补跑检测，仍计入任务
-            picked.append(a.vector_id)
+        # ⚠️ 绝不能用 db.query(Asset).all() 全量加载 ORM 对象：82.5 万行、每行带 detections
+        # JSON，实测吃 25GB 内存 → OOM Killer 杀掉整个服务（2026-09-20 循环 5 次）。
+        # 改成 SQL 侧只取 vector_id，内存占用从 GB 级降到 MB 级。
+        from sqlalchemy import text as _text
+        _total = db.execute(_text("select count(*) from assets where project_id=:p"),
+                            {"p": proj.id}).scalar() or 0
+        if only_unprocessed:
+            # "检测过"的判据 = 行里出现过 yolo 键（含空数组 = 检测过但无目标，不该重跑）
+            picked = [r[0] for r in db.execute(_text(
+                "select vector_id from assets where project_id=:p and "
+                "(detections is null or detections not like '%\"yolo\"%')"), {"p": proj.id})]
+            if not whole_project:
+                _want = set(ids_in)
+                picked = [v for v in picked if v in _want]
+            skipped_tagged = _total - len(picked)
+        else:
+            skipped_tagged = 0
+            if whole_project:
+                picked = [r[0] for r in db.execute(_text(
+                    "select vector_id from assets where project_id=:p"), {"p": proj.id})]
+            else:
+                picked = list(ids_in)
+        _log(
+            "[Pipeline] 选帧: 候选=%d 已有检测=%d 本次=%d (增量=%s)"
+            % (_total, skipped_tagged, len(picked), bool(only_unprocessed))
+        )
         ids = picked
         if not ids:
             return {
                 "code": 200,
-                "msg": "没有需要处理的帧：%d 帧都已跑过 AI 分析（如需重跑请取消勾选「增量」）" % skipped_tagged,
+                "msg": "没有需要检测的帧：%d 帧都已有 YOLO 检测记录（如需重跑请取消勾选「增量」）" % skipped_tagged,
                 "job_id": None,
                 "skipped": skipped_tagged,
                 "pending": 0,
             }
-        _log(
-            "[Pipeline] 选帧: 候选=%d 跳过已处理=%d 本次=%d (增量=%s 检测=%s)"
-            % (len(rows), skipped_tagged, len(ids), bool(only_unprocessed), bool(detect_first))
-        )
         # 创建 Job 记录
         job = create_job(
             db,
@@ -6168,7 +6835,7 @@ def pipeline_run_ai_batch(
                 "preset": preset,
                 "detect_first": bool(detect_first),
                 "clip_size": int(clip_size or 0),
-                "pipeline": "vlm->tags->decision",
+                "pipeline": "yolo_detect",   # 帧级=检测（2026-09-19 重构：VLM 移至 Clip 段级）
             },
         )
         job_pk = job.id
@@ -6187,8 +6854,6 @@ def pipeline_run_ai_batch(
         f"[Pipeline] 批量 AI 任务已创建 job_pk={job_pk} frames={len(ids)} project={project} preset={preset}"
     )
     extra = "，跳过已处理 %d 帧" % skipped_tagged if skipped_tagged else ""
-    if redetect:
-        extra += "（其中 %d 帧已标但补跑检测）" % redetect
     return {
         "code": 200,
         "msg": f"批量 AI Pipeline 已启动，本次 {len(ids)} 帧{extra}",
@@ -6278,6 +6943,7 @@ def pipeline_list(
         _cancel_set, _pause_set = _pipeline_cancel_signals()
         for j in jobs:
             proj = _gp_id(db, j.project_id)
+            _live = _job_live(j.id) or {}   # 任务总览画条要 x/y（jobs 表只有百分比）
             out.append(
                 {
                     "job_id": str(j.id),
@@ -6285,6 +6951,8 @@ def pipeline_list(
                     "job_type": j.job_type.value if j.job_type else None,
                     "status": j.status.value if j.status else None,
                     "progress": j.progress,
+                    "processed_count": _live.get("processed"),
+                    "total_count": _live.get("total"),
                     "current_stage": j.current_stage,
                     "error": j.error,
                     "paused": j.id in _pause_set,   # 前端据此显示"已暂停/继续"
@@ -7064,15 +7732,18 @@ def ontology_list(project: str = Query("default")):
     from ontology import dimensions as _dims
     D = _dims()
     order = [
-        ("traffic_sign", "交通标识信号"),
-        ("vehicle", "车型"),
-        ("resolution", "分辨率"),
         ("time", "时间"),
         ("weather", "天气"),
         ("road", "道路"),
+        ("road_surface", "路面"),
+        ("scene", "场景"),
+        ("risk", "风险"),
+        ("traffic_sign", "交通标识信号"),
         ("objects", "目标"),
         ("events", "事件"),
-        ("scene", "场景"),
+        # 下面两维是资产元数据派生的（车型/分辨率），由 _asset_facets 动态填值
+        ("vehicle", "车型"),
+        ("resolution", "分辨率"),
     ]
     out = {}
     for dim, cn in order:
@@ -7131,13 +7802,25 @@ def _project_tag_values(project: str) -> list:
                             _bump(dim, v.get("tag") if isinstance(v, dict) else v, a.vector_id)
     finally:
         db.close()
-    # Clip 级 VLM 结果（clips.json）里的标签同样纳入候选
+    # Clip 级标签纳入候选：**优先人工修正后的 final_tags / human_tags**（人工覆盖模型，
+    # 用户 2026-09-20 要求），没有人工作业的段才回退到 vlm_result。
     try:
         from clip_service import load_clips
         ctx = load_project_context(project)
+        _DIMS = ("events", "objects", "scene", "road", "road_surface", "weather", "time")
         for c in (load_clips(ctx) or []):
+            _used = False
+            for _src in (c.get("final_tags"), c.get("human_tags")):
+                if isinstance(_src, dict) and _src:
+                    for dim in _DIMS:
+                        if isinstance(_src.get(dim), list):
+                            for v in _src[dim]:
+                                _bump(dim, v.get("tag") if isinstance(v, dict) else v)
+                            _used = True
+            if _used:
+                continue      # 人工已标注的段：以人工为准，不再计模型标签
             res = c.get("vlm_result") or {}
-            for dim in ("events", "objects", "scene", "road", "road_surface", "weather", "time"):
+            for dim in _DIMS:
                 if isinstance(res.get(dim), list):
                     for v in res[dim]:
                         _bump(dim, v.get("tag") if isinstance(v, dict) else v)
@@ -8001,36 +8684,99 @@ def clips_list(project: str = Query("default"), page: int = 1, size: int = 20, l
     clips = load_clips(ctx)
     total = len(clips)
     start = (page - 1) * size
-    items = clips[start:start + size]
+    # ⚠️ 必须拷贝：clips 来自 load_clips 的**内存缓存**，元素是共享 dict。
+    # 直接 pop 会把缓存里所有段的 frame_paths 永久删掉 —— 之后 analyze_single 取
+    # clip["frame_paths"] 直接 KeyError，判定全量失败（2026-09-20 实测踩坑）。
+    items = [dict(c) for c in clips[start:start + size]]
     # 返回时附带代表帧预览（每clip前1帧的url即可，前端列表用）
     for it in items:
         it["frame_count"] = len(it.get("frame_ids") or [])
-        it["preview_url"] = f"/api/image/{project}/{it['frame_ids'][0]}" if it.get("frame_ids") else None
+        it["preview_url"] = f"/api/image/{project}/{it['frame_ids'][0]}?w=480" if it.get("frame_ids") else None
         # 采样帧 URL：与 vlm_clip.sample_representative 同一套均匀取点，
         # 供审核界面做"模型实际输入的 5 帧 × 判定结果"对照
         fids = it.get("frame_ids") or []
         if fids:
-            _idx = np.linspace(0, len(fids) - 1, min(5, len(fids))).round().astype(int).tolist()
+            _N = int(os.environ.get("AD_CLIP_PICK", "10"))
+            _idx = np.linspace(0, len(fids) - 1, min(_N, len(fids))).round().astype(int).tolist()
             _seen, _pos = set(), []
             for _k in _idx:
                 if _k not in _seen:
                     _seen.add(_k)
                     _pos.append(int(_k))
             it["sample_urls"] = [
-                {"pos": k, "url": f"/api/image/{project}/{fids[k]}"} for k in _pos
+                {"pos": k, "url": f"/api/image/{project}/{fids[k]}?w=480"} for k in _pos
             ]
-        if light:  # 列表/可视化场景不需要逐帧路径，省流量
+        if light:  # 列表/可视化场景裁掉大字段省流量；frame_ids 保留（30 个 int，很小）：
+                   # 前端"播放本段"要用——视频段走 video_window，图片序列段逐帧回放都靠它
             it.pop("frame_paths", None)
-            it.pop("frame_ids", None)
     return {"code": 200, "total": total, "page": page, "size": size, "items": items}
 @app.post("/api/clips/analyze_single")
 def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...)):
-    """P0 同步接口：分析单个 Clip（5帧VLM）。用于先验证效果，批量Job在P0通过后再加"""
+    """P0 同步接口：分析单个 Clip（5帧VLM）。用于先验证效果，批量Job在P0通过后再加
+
+    2026-09-19 重构：段级 VLM 判定以 YOLO 检测结果为依据（detection-grounded）——
+    采样帧的检测摘要注入提示词，事件-目标程序化校验在推理后执行。"""
+    # ⚠️ 硬规则（迁自帧级链路）：段级 VLM 判定必须 7B（非 7B 直接拒绝，不允许静默降级）
+    # 懒加载修正：刚重启时模型未加载，直接查会误判成"非 7B"——先真加载一次再判定
+    try:
+        if vlm_model is None and LOAD_MODELS:
+            init_vlm_local()
+    except Exception:
+        pass
+    _vmi = vlm_model_info()
+    if VLM_REQUIRE_7B and not _vmi["is_7b"]:
+        _log(f"[Clip] ⛔ 拒绝判定 clip={clip_id}：当前 VLM 非 7B（{_vmi['model'] or '未加载'}）")
+        return {"code": 409, "msg": "当前 VLM 不是 7B（实际：%s），按硬规则拒绝段级判定"
+                % (_vmi["model"] or "未加载"), "vlm_model": _vmi["model"]}
     ctx = load_project_context(project)
     clips = load_clips(ctx)
     clip = next((c for c in clips if c["clip_id"] == clip_id), None)
     if not clip:
         return {"code": 404, "msg": "Clip不存在，请先 POST /api/clips/scan"}
+    # 双保险：frame_paths 缺失/为空时，按 frame_ids 从 metadata 重建
+    _fpaths = clip.get("frame_paths") or []
+    if not _fpaths and clip.get("frame_ids"):
+        _meta = ctx.get("metadata") or []
+        _fpaths = [(_meta[f].get("path") if 0 <= f < len(_meta) else "")
+                   for f in clip["frame_ids"]]
+        _fpaths = [p for p in _fpaths if p and os.path.exists(p)]
+        clip = dict(clip, frame_paths=_fpaths)   # 用副本，别改缓存对象
+    # 采样帧（与 predict_clip 内部同一套均匀取点）→ 收集每帧的 YOLO/DINO 检测摘要
+    _fids = clip.get("frame_ids") or []
+    _fpaths = clip.get("frame_paths") or []
+    _N = int(os.environ.get("AD_CLIP_PICK", "10"))
+    _idx = np.linspace(0, len(_fids) - 1, min(_N, len(_fids))).round().astype(int).tolist()
+    _det_by_path = {}
+    for _k in _idx:
+        if _k >= len(_fpaths):
+            continue
+        _p, _fid = _fpaths[_k], _fids[_k]
+        _labels = []
+        try:
+            _rec = (detections_cache.get(project) or {}).get(str(_fid)) or {}
+            _labels = list(_rec.get("labels") or [])
+        except Exception:
+            _labels = []
+        if not _labels:
+            try:
+                _a, _c2, _db2 = _find_db_asset(project, _fid)
+                try:
+                    if _a is not None:
+                        _dd = (_a.detections or {}).get("yolo") or []
+                        _labels = [d.get("label") for d in _dd if d.get("label")]
+                finally:
+                    if _db2 is not None:
+                        _db2.close()
+            except Exception:
+                _labels = []
+        if _labels:
+            from collections import Counter as _Ct
+            _cn = _Ct()
+            for _lb in _labels:
+                _cn[_YOLO_LABEL2OBJ.get(_lb, _lb)] += 1   # 英文类名映射为中文目标词
+            _det_by_path[_p] = "、".join("%s×%d" % (k, v) for k, v in _cn.most_common())
+        else:
+            _det_by_path[_p] = ""
     # 加载与推理放在同一个 GPU 闸门内：12G 卡上模型不能共存，
     # 也避免"加载完->释放锁->被别人卸掉"这种空窗（原来分两段加锁就有这个缝）
     try:
@@ -8040,7 +8786,8 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
                 init_vlm_local()
             if vlm_model is None:
                 return {"code": 500, "msg": "VLM 加载失败（显存不足或权重缺失）"}
-            result, raw = predict_clip(vlm_model, vlm_processor, clip["frame_paths"])
+            result, raw = predict_clip(vlm_model, vlm_processor, clip["frame_paths"],
+                                       det_by_path=_det_by_path)
     except Exception as e:
         # 只记错误不落 decision：异常多为环境/依赖问题，保持可重试，别把 Clip 永久标成需人工
         import traceback as _tb
@@ -8061,13 +8808,343 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
     if result is None:
         update_clip_result(ctx, clip_id, {"error": "parse_failed"}, decision="REVIEW")
         return {"code": 500, "msg": "VLM输出解析失败", "raw": raw[:500]}
-    # 简易决策：有事件且置信>=0.7 且证据齐全 → REVIEW（重点事件必人工）；否则AUTO_PASS
+    # ---- 程序化事件-目标校验（段级版 vlm_event_conflict）----
+    # 事件所需目标在段内任何一帧的 YOLO 检测中都从未出现 → 该事件标记"目标缺失"，整段强制 REVIEW
+    _member_labels = set()
+    for _fid in (clip.get("frame_ids") or []):
+        try:
+            _rec = (detections_cache.get(project) or {}).get(str(_fid)) or {}
+            _member_labels.update(str(x).lower() for x in (_rec.get("labels") or []))
+        except Exception:
+            pass
+    if not _member_labels:
+        try:
+            for _fid in (clip.get("frame_ids") or []):
+                _a3, _c3, _db3 = _find_db_asset(project, _fid)
+                try:
+                    if _a3 is not None:
+                        for _d in (_a3.detections or {}).get("yolo") or []:
+                            if _d.get("label"):
+                                _member_labels.add(str(_d["label"]).lower())
+                finally:
+                    if _db3 is not None:
+                        _db3.close()
+        except Exception:
+            pass
+    _flagged = []
+    for _e in result.get("events") or []:
+        _need = (_EVENT_NEED or {}).get(_e.get("type")) or set()
+        if _need and not (_need & _member_labels):
+            _e["check"] = "目标缺失：段内任何帧的检测都未出现该事件所需目标"
+            _flagged.append(_e.get("type"))
+    if _flagged:
+        _log(f"[Clip] ⚠️ clip={clip_id} 事件目标缺失: {_flagged} → 强制 REVIEW")
+    # 简易决策：有事件且置信>=0.7 且证据齐全 → REVIEW（重点事件必人工）；事件目标缺失 → REVIEW；否则AUTO_PASS
+    try:
+        if torch is not None and DEVICE == "cuda":
+            torch.cuda.empty_cache()   # 批量判定时每段回收，防碎片累积（实测长期跑会）
+    except Exception:
+        pass
     has_event = any(e["confidence"] >= 0.7 and len(e["evidence"]) >= 2
                     for e in result["events"])
-    decision = "REVIEW" if has_event else "AUTO_PASS"
+    decision = "REVIEW" if (has_event or _flagged) else "AUTO_PASS"
+    if _flagged:
+        result["check"] = "事件目标缺失: %s" % ",".join(_flagged)
     update_clip_result(ctx, clip_id, result, decision=decision)
     return {"code": 200, "clip_id": clip_id, "decision": decision,
             "result": result, "raw_output": raw}
+# ============================================================
+# ===== Clip 段级人工对比打标（金标采集 + 人机逐维度自动对比）=====
+# ============================================================
+_CLIP_BENCH_DIR = os.path.join(PROJECT_DIR, "workspace", "clip_benchmark")
+_CLIP_BENCH_DIMS = ("time", "weather", "road", "road_surface", "scene", "risk",
+                    "traffic_sign", "objects", "events")
+
+def _clip_bench_path(project):
+    return os.path.join(_CLIP_BENCH_DIR, sanitize_project_name(project) + ".json")
+
+def _clip_model_sets(vlm_result):
+    """模型判定 → {dim: set(中文值)}，与人工标注同一词表空间（本体枚举）。"""
+    r = vlm_result or {}
+    sc = r.get("scene") or {}
+    sets = {}
+    for dim in ("time", "weather", "road", "road_surface", "scene", "lighting", "traffic_state"):
+        sets[dim] = set(sc.get(dim) or [])
+    sets["risk"] = set(r.get("risk") or [])
+    sets["traffic_sign"] = set(r.get("traffic_sign") or [])
+    sets["objects"] = set((o.get("type") or "") for o in (r.get("objects") or []) if o.get("type"))
+    sets["events"] = set((e.get("type") or "") for e in (r.get("events") or []) if e.get("type"))
+    return sets
+
+def _clip_compare(human, model_sets):
+    out = {}
+    for dim in _CLIP_BENCH_DIMS:
+        h = set(human.get(dim) or [])
+        m = set(model_sets.get(dim) or set())
+        if not h and not m:
+            out[dim] = "both_empty"
+        elif not h:
+            out[dim] = "人工未标"     # 不计入一致率（人工没看的维度不能判不一致）
+        elif not m:
+            out[dim] = "仅模型"
+        elif h == m:
+            out[dim] = "一致"
+        elif h & m:
+            out[dim] = "部分一致"
+        else:
+            out[dim] = "不一致"
+    return out
+
+@app.post("/api/benchmark/clip_label")
+def clip_label_save(project: str = Form("default"), clip_id: str = Form(...),
+                    gt: str = Form(...), note: str = Form("")):
+    """人工标注一个 Clip 的场景/事件维度（金标采集）。保存即自动与该段的模型判定逐维度对比，
+    结果随记录存储（盲标：标注时前端不展示模型结果，避免偏置）。"""
+    try:
+        gt = json.loads(gt) if isinstance(gt, str) and gt.strip() else {}
+    except Exception:
+        return {"code": 400, "msg": "gt 不是合法 JSON"}
+    if not isinstance(gt, dict) or not gt:
+        return {"code": 400, "msg": "gt 不能为空（至少标注一个维度）"}
+    ctx = load_project_context(project)
+    clips = load_clips(ctx)
+    clip = next((c for c in clips if c["clip_id"] == clip_id), None)
+    if not clip:
+        return {"code": 404, "msg": "Clip 不存在"}
+    model_sets = _clip_model_sets(clip.get("vlm_result"))
+    compare = _clip_compare(gt, model_sets)
+    rec = {"gt": gt, "model": {k: sorted(v) for k, v in model_sets.items()},
+           "compare": compare, "note": note,
+           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    os.makedirs(_CLIP_BENCH_DIR, exist_ok=True)
+    path = _clip_bench_path(project)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data.setdefault("labeled", {})[clip_id] = rec
+    _tmp = path + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(_tmp, path)
+    # ---- 人工结果**覆盖模型结果**（用户 2026-09-20 要求）----
+    # 人工标注写入 human_tags，并把 final_tags 设为人工值（最终标签以人工为准）；
+    # vlm_result 保持原样不动 —— 它是对比评测的依据（模型当初判了什么要可追溯）。
+    # 融合搜索 / 前端展示读 final_tags 时自然用上人工修正后的结果。
+    try:
+        from clip_service import apply_human_tags as _aht
+        _aht(ctx, clip_id, gt, decision="APPROVED")
+    except Exception as _e:
+        _log(f"[人机评测] {clip_id} 人工标签落盘失败: {_e}")
+    agree = sum(1 for v in compare.values() if v == "一致")
+    return {"code": 200, "clip_id": clip_id, "compare": compare,
+            "model": rec["model"], "agree": agree, "total": len(compare),
+            "applied": True, "msg": "已保存：人工标签已覆盖模型结果（final_tags）"}
+
+@app.get("/api/benchmark/clip_label/stats")
+def clip_label_stats(project: str = Query("default")):
+    """人工对比打标的聚合统计：每个维度 一致/部分一致/不一致 计数与一致率 + 不一致清单。"""
+    path = _clip_bench_path(project)
+    try:
+        with open(path, encoding="utf-8") as f:
+            labeled = (json.load(f).get("labeled")) or {}
+    except Exception:
+        labeled = {}
+    agg = {dim: {"一致": 0, "部分一致": 0, "不一致": 0, "人工未标": 0, "仅模型": 0, "both_empty": 0}
+           for dim in _CLIP_BENCH_DIMS}
+    dis = []
+    # ---- P/R/F1（以人工标注为真值 GT，micro 按维度聚合；unknown 双侧剔除）----
+    _inter = {dim: 0 for dim in _CLIP_BENCH_DIMS}
+    _m_all = {dim: 0 for dim in _CLIP_BENCH_DIMS}
+    _h_all = {dim: 0 for dim in _CLIP_BENCH_DIMS}
+    _ev = {}   # 事件类别 -> tp/fp/fn（段级多标签）
+    for cid, rec in labeled.items():
+        gt = rec.get("gt") or {}
+        model = rec.get("model") or {}
+        for dim in _CLIP_BENCH_DIMS:
+            h = set(gt.get(dim) or []) - {"unknown"}
+            m = set(model.get(dim) or []) - {"unknown"}
+            _inter[dim] += len(h & m)
+            _m_all[dim] += len(m)
+            _h_all[dim] += len(h)
+        he = set(gt.get("events") or []) - {"unknown"}
+        me = set(model.get("events") or []) - {"unknown"}
+        for e in (he | me):
+            a = _ev.setdefault(e, {"tp": 0, "fp": 0, "fn": 0})
+            if e in he and e in me:
+                a["tp"] += 1
+            elif e in me:
+                a["fp"] += 1
+            else:
+                a["fn"] += 1
+    for cid, rec in labeled.items():
+        for dim, v in (rec.get("compare") or {}).items():
+            if dim in agg and v in agg[dim]:
+                agg[dim][v] += 1
+                if v == "不一致":
+                    dis.append({"clip_id": cid, "dim": dim})
+
+    def _prf(i, m, h):
+        p = round(i / m, 3) if m else None
+        r = round(i / h, 3) if h else None
+        if p is not None and r is not None and (p + r) > 0:
+            f = round(2 * p * r / (p + r), 3)
+        else:
+            f = None
+        return p, r, f
+
+    prf = {}
+    for dim in _CLIP_BENCH_DIMS:
+        p, r, f = _prf(_inter[dim], _m_all[dim], _h_all[dim])
+        prf[dim] = {"precision": p, "recall": r, "f1": f,
+                    "gt_count": _h_all[dim], "pred_count": _m_all[dim], "match": _inter[dim]}
+    ev_out = {}
+    for e, a in _ev.items():
+        p = round(a["tp"] / (a["tp"] + a["fp"]), 3) if (a["tp"] + a["fp"]) else None
+        r = round(a["tp"] / (a["tp"] + a["fn"]), 3) if (a["tp"] + a["fn"]) else None
+        f = round(2 * p * r / (p + r), 3) if (p is not None and r is not None and (p + r) > 0) else None
+        ev_out[e] = {"precision": p, "recall": r, "f1": f, **a}
+    return {"code": 200, "total": len(labeled), "aggregate": agg, "disagreements": dis[:80],
+            "labeled_ids": list(labeled.keys())[:2000],
+            "prf": prf, "events": ev_out}
+
+@app.get("/api/clips/judge_progress")
+def clips_judge_progress(project: str = Query("default")):
+    """段级判定的进度（轻量）：{total, done, pending}。供守护/任务总览用 ——
+    它们不能直接读 136MB 的 clips.json（判定期间每段都会改它，缓存也救不了）。"""
+    ctx = load_project_context(project)
+    clips = load_clips(ctx) or []
+    total = len(clips)
+    done = sum(1 for c in clips if c.get("decision"))
+    return {"code": 200, "project": project, "total": total, "done": done,
+            "pending": max(0, total - done)}
+
+
+@app.get("/api/benchmark/clip_label/report")
+def clip_label_report(project: str = Query("default")):
+    """人机对比报告（用户 2026-09-20 要求）：以人工标注为真值，逐维度评估模型能力，
+    **自动指出模型在哪个维度不行**并给典型错误例子。
+
+    判定口径：F1 ≥0.8 可用 / 0.5~0.8 需改进 / <0.5 不可用；
+    问题类型：漏报（人工有、模型没报 → 召回问题）、误报（模型报了、人工没有 → 精确率问题）。"""
+    path = _clip_bench_path(project)
+    try:
+        with open(path, encoding="utf-8") as f:
+            labeled = (json.load(f).get("labeled")) or {}
+    except Exception:
+        labeled = {}
+    if not labeled:
+        return {"code": 200, "empty": True,
+                "msg": "还没有人工标注数据 —— 先到「人机打标评测」标几段（建议 ≥30 段）"}
+
+    CN = {"time": "时间", "weather": "天气", "road": "道路", "road_surface": "路面",
+          "scene": "场景", "risk": "风险", "traffic_sign": "交通标识",
+          "objects": "目标", "events": "事件"}
+    inter = {d: 0 for d in _CLIP_BENCH_DIMS}
+    m_all = {d: 0 for d in _CLIP_BENCH_DIMS}
+    h_all = {d: 0 for d in _CLIP_BENCH_DIMS}
+    missed = {d: [] for d in _CLIP_BENCH_DIMS}   # 漏报例子
+    wrong = {d: [] for d in _CLIP_BENCH_DIMS}    # 误报例子
+    ev_stat = {}
+    for cid, rec in labeled.items():
+        gt = rec.get("gt") or {}
+        model = rec.get("model") or {}
+        for dim in _CLIP_BENCH_DIMS:
+            h = set(gt.get(dim) or []) - {"unknown"}
+            m = set(model.get(dim) or []) - {"unknown"}
+            inter[dim] += len(h & m)
+            m_all[dim] += len(m)
+            h_all[dim] += len(h)
+            for v in (h - m):
+                if len(missed[dim]) < 8:
+                    missed[dim].append({"clip_id": cid, "human": sorted(h), "model": sorted(m)})
+            for v in (m - h):
+                if len(wrong[dim]) < 8:
+                    wrong[dim].append({"clip_id": cid, "human": sorted(h), "model": sorted(m)})
+        he = set(gt.get("events") or []) - {"unknown"}
+        me = set(model.get("events") or []) - {"unknown"}
+        for e in (he | me):
+            a = ev_stat.setdefault(e, {"tp": 0, "fp": 0, "fn": 0})
+            if e in he and e in me:
+                a["tp"] += 1
+            elif e in me:
+                a["fp"] += 1
+            else:
+                a["fn"] += 1
+
+    def _verdict(f1):
+        if f1 is None:
+            return ("样本不足", "text-muted")
+        if f1 >= 0.8:
+            return ("可用", "success")
+        if f1 >= 0.5:
+            return ("需改进", "warning")
+        return ("不可用", "danger")
+
+    dims_out = []
+    for dim in _CLIP_BENCH_DIMS:
+        i, m, h = inter[dim], m_all[dim], h_all[dim]
+        p_ = round(i / m, 3) if m else None
+        r_ = round(i / h, 3) if h else None
+        f1 = round(2 * p_ * r_ / (p_ + r_), 3) if (p_ and r_) else None
+        v, color = _verdict(f1)
+        dims_out.append({
+            "dim": dim, "cn": CN.get(dim, dim),
+            "precision": p_, "recall": r_, "f1": f1,
+            "gt_count": h, "pred_count": m, "match": i,
+            "verdict": v, "color": color,
+            "missed": missed[dim][:5], "wrong": wrong[dim][:5],
+        })
+    valid = [d for d in dims_out if d["f1"] is not None]
+    valid.sort(key=lambda x: x["f1"])          # 最差的排前面
+    avg_f1 = round(sum(d["f1"] for d in valid) / len(valid), 3) if valid else None
+
+    ev_out = {}
+    for e, a in sorted(ev_stat.items(), key=lambda kv: -(kv[1]["tp"] + kv[1]["fp"] + kv[1]["fn"])):
+        p_ = round(a["tp"] / (a["tp"] + a["fp"]), 3) if (a["tp"] + a["fp"]) else None
+        r_ = round(a["tp"] / (a["tp"] + a["fn"]), 3) if (a["tp"] + a["fn"]) else None
+        f1 = round(2 * p_ * r_ / (p_ + r_), 3) if (p_ and r_) else None
+        v, color = _verdict(f1)
+        ev_out[e] = {"precision": p_, "recall": r_, "f1": f1, "verdict": v, "color": color, **a}
+
+    # ---- 自动结论（模型哪里不行）----
+    weak = [d for d in valid if d["f1"] is not None and d["f1"] < 0.8]
+    lines = []
+    lines.append("### 模型能力评估（真值 = 人工标注 %d 段，平均 F1 %s）"
+                 % (len(labeled), ("%.3f" % avg_f1) if avg_f1 is not None else "-"))
+    if not weak:
+        lines.append("- ✅ 各维度 F1 均 ≥ 0.8，当前样本下模型表现可用。")
+    else:
+        lines.append("**⚠️ 以下维度模型表现不足（F1 < 0.8），按严重程度排序：**")
+        for d in weak:
+            _why = []
+            if d["recall"] is not None and d["recall"] < 0.8:
+                _why.append("漏报（召回 %.2f）" % d["recall"])
+            if d["precision"] is not None and d["precision"] < 0.8:
+                _why.append("误报（精确率 %.2f）" % d["precision"])
+            lines.append("- **%s**：F1=%.2f（%s）%s —— 人工标注 %d 个、模型报出 %d 个、命中 %d 个"
+                         % (d["cn"], d["f1"], d["verdict"], "、".join(_why),
+                            d["gt_count"], d["pred_count"], d["match"]))
+            if d["missed"]:
+                _m = d["missed"][0]
+                lines.append("  - 漏报例：人工=[%s] 模型=[%s]" % ("、".join(_m["human"]), "、".join(_m["model"]) or "空"))
+            if d["wrong"]:
+                _w = d["wrong"][0]
+                lines.append("  - 误报例：人工=[%s] 模型=[%s]" % ("、".join(_w["human"]) or "空", "、".join(_w["model"])))
+    _bad_ev = [(e, a) for e, a in ev_out.items() if a["f1"] is not None and a["f1"] < 0.6]
+    if _bad_ev:
+        lines.append("")
+        lines.append("**事件类别细看（F1 < 0.6）：**")
+        for e, a in _bad_ev[:6]:
+            lines.append("- %s：F1=%.2f（精确率 %s / 召回 %s，TP=%d FP=%d FN=%d）"
+                         % (e, a["f1"], a["precision"], a["recall"], a["tp"], a["fp"], a["fn"]))
+    return {"code": 200, "total_labeled": len(labeled), "avg_f1": avg_f1,
+            "dimensions": dims_out, "events": ev_out,
+            "weak_dimensions": [d["dim"] for d in weak],
+            "conclusion": chr(10).join(lines)}
+
+
 @app.get("/api/clips/video_summary")
 def clips_video_summary(project: str = Query("default")):
     """按“原始视频路径”汇总 Clip 判定结果：同一视频下各片段的场景/事件标签去重合并，

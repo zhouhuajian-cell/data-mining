@@ -278,7 +278,32 @@ def apply_db_patches():
     """
     print("[DB Patch] 初始化数据库...")
     run_migration()
+    _ensure_hot_indexes()
     print("[DB Patch] 数据库补丁已应用")
+
+
+def _ensure_hot_indexes():
+    """最热查询模式的复合索引 (project_id, vector_id) —— 幂等，千万级路线图前置优化。
+
+    assets 表全部高频路径都按这个组合取数：资产点查、按项目分页、sync 的 existing_ids
+    全量捞取、order by vector_id。两个单列索引在大表上会出现"过滤+排序"二段代价，
+    复合索引一次到位（千万级路线图见 STATE.md）。"""
+    from sqlalchemy import text as _text
+    db = get_db_session()
+    try:
+        db.execute(_text(
+            "CREATE INDEX IF NOT EXISTS ix_assets_project_vector "
+            "ON assets (project_id, vector_id)"))
+        db.commit()
+        print("[DB Patch] 复合索引 ix_assets_project_vector 就绪")
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(f"[DB Patch] 复合索引创建失败(可能已存在): {e}")
+    finally:
+        db.close()
 
 
 # ============================================================

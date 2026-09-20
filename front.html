@@ -178,6 +178,8 @@
         .box-label { position: absolute; top: -24px; left: -1px; background: rgba(16, 185, 129, 0.85); color: white; font-size: 11px; padding: 2px 6px; font-weight: 700; border-radius: 3px 3px 3px 0; white-space: nowrap; backdrop-filter: blur(2px); transition: opacity 0.3s ease; }
         .img-wrapper:hover .box-label { opacity: 0; }
         .img-wrapper:hover .box-overlay { background: transparent; border-color: rgba(16, 185, 129, 0.25); }
+        /* 一键隐藏 YOLO 检测框（全局开关：相册卡片/详情弹窗/所有 .box-overlay 一起藏） */
+        body.hide-yolo-boxes .box-overlay, body.hide-yolo-boxes .box-label { display: none !important; }
         .card-info { padding: 18px; flex: 1; display: flex; flex-direction: column; }
         .card-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
         .select-checkbox { width: 18px; height: 18px; cursor: pointer; accent-color: var(--primary); }
@@ -283,7 +285,7 @@
         .audit-detail { flex: 1; min-width: 380px; }
         .audit-detail img.main { width: 100%; max-height: 340px; object-fit: contain; background: #000; border-radius: var(--radius-md); border: 1px solid var(--border); }
         /* 可放大的图片统一给 zoom-in 光标（放大动作由全局委托 imgZoomLayer 接管） */
-        #auditPanel img, #hardCasePanel img, #benchmarkPanel img, #dataAssetPanel img,
+        #auditPanel img, #hardCasePanel img, #dataAssetPanel img,
         #fusionSearchPanel img, #assetTablePanel img, #demandPanel img { cursor: zoom-in; }
         .audit-tag-group { margin: 10px 0 4px; }
         .audit-tag-group .dim { font-size: 12px; color: var(--text-muted); margin-right: 8px; font-weight: 700; min-width: 52px; display: inline-block; }
@@ -428,7 +430,7 @@
                     数据审核 <span id="auditProjectTag" style="color: var(--primary); font-size: 13px;"></span>
                     <span style="flex:1;"></span>
                     <button class="secondary" onclick="auditRefresh()" style="padding:4px 12px; font-size:12px;">刷新队列</button>
-                    <button class="secondary" onclick="auditRunBatch()" style="padding:4px 12px; font-size:12px;" title="一键跑完两段：① 全部已入库帧的 AI检测(融合YOLO/DINO)+场景分析+自动决策；② 帧组成 Clip 后逐片段 VLM 场景判定">AI场景分析</button><button class="secondary" id="aiPauseBtn" onclick="aiTogglePause()" style="padding:4px 10px; font-size:12px; margin-left:6px;" title="暂停当前 AI 任务：帧间生效，不丢进度、不重载模型，点一下继续">暂停</button><button class="secondary" onclick="aiCancelBatch()" style="padding:4px 10px; font-size:12px; margin-left:4px; color:var(--danger); border-color:rgba(239,68,68,0.5);" title="临时终止当前 AI 任务：当前帧处理完即停，已处理的帧全部保留，重发时勾选「增量」即可续跑">终止</button><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiOnlyNew" checked> 增量（跳过已跑过的帧）</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="勾选=只跑还没做 AI 分析的帧（新入库的帧）；取消=全部重跑（改了提示词/本体后需要）"><input type="checkbox" id="aiFuseDetect" checked> 融合YOLO检测</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiDinoEnhance"> 增强DINO开放词</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="② 段：每 N 帧组成一个 Clip 做 VLM 判定">Clip帧数 <input type="number" id="clipSizeInput" value="30" min="5" step="5" style="width:58px; padding:2px 4px;"></label>
+                    <button class="secondary" onclick="auditRunBatch()" style="padding:4px 12px; font-size:12px;" title="一键跑完两段：① 全部已入库帧的 AI检测(融合YOLO/DINO)+场景分析+自动决策；② 帧组成 Clip 后逐片段 VLM 场景判定">AI场景分析</button><button class="secondary" id="aiPauseBtn" onclick="aiTogglePause()" style="padding:4px 10px; font-size:12px; margin-left:6px;" title="暂停当前 AI 任务：帧间生效，不丢进度、不重载模型，点一下继续">暂停</button><button class="secondary" onclick="aiCancelBatch()" style="padding:4px 10px; font-size:12px; margin-left:4px; color:var(--danger); border-color:rgba(239,68,68,0.5);" title="临时终止当前 AI 任务：当前帧处理完即停，已处理的帧全部保留，重发时勾选「增量」即可续跑">终止</button><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiOnlyNew" checked> 增量（跳过已跑过的帧）</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="勾选=只跑还没做 AI 分析的帧（新入库的帧）；取消=全部重跑（改了提示词/本体后需要）"><input type="checkbox" id="aiFuseDetect" checked> 融合YOLO检测</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiDinoEnhance" title="开销较大（逐帧开放词推理），默认关；需要对小目标/长尾目标做第二证据源时手动勾选"> 增强DINO开放词</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="② 段：每 N 帧组成一个 Clip 做 VLM 判定">Clip帧数 <input type="number" id="clipSizeInput" value="30" min="5" step="5" style="width:58px; padding:2px 4px;"></label>
                     </div>
 <div id="aiJobProg" style="display:none; margin-top:10px; padding:8px 12px; background:rgba(0,0,0,0.25); border:1px solid rgba(245,158,11,.4); border-radius:8px;">
                         <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:5px;">
@@ -454,67 +456,64 @@
                         <div id="auditDetailBody" style="display:none;"></div>
                     </div>
                 </div>
-            </div><!-- 👇 Hard Case 闭环分析（PRD 23）👇 -->            <div class="panel" id="hardCasePanel" style="border:2px solid rgba(239,68,68,0.55);">
-                <div class="panel-header" style="color:#ef4444;">
-                    <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg></div>
-                    Hard Case 闭环分析 <span id="hcProjectTag" style="color:var(--primary); font-size:13px;"></span>
+            </div><!-- 👇 人机打标评测（金标采集 + 人机 P/R/F1 对比）—— 替换原 Hard Case 栏 👇 -->
+            <div class="panel" id="hardCasePanel" style="border:2px solid rgba(59,130,246,0.5);">
+                <div class="panel-header" style="color:var(--primary);">
+                    <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg></div>
+                    人机打标评测 <span id="clProj" style="color:var(--primary); font-size:13px;"></span>
                     <span style="flex:1;"></span>
-                    <button class="secondary" onclick="hcRefresh()" style="padding:4px 12px; font-size:12px;">刷新</button>
+                    <span id="clProgress" style="font-size:12px; color:var(--text-muted); margin-right:10px;"></span>
+                    <button class="secondary" onclick="clipLabelReport()" style="padding:4px 12px; font-size:12px;">📋 对比报告</button>
+                    <button class="secondary" onclick="clipLabelShowStats()" style="padding:4px 12px; font-size:12px;">维度 P/R/F1</button>
+                    <button class="secondary" onclick="clipLabelOpen()" style="padding:4px 12px; font-size:12px;">开始 / 刷新</button>
                 </div>
-                <div class="audit-stats" id="hcStats">
-                    <div class="audit-stat">总数 <div class="v" id="hcTotal">-</div></div>
-                    <div class="audit-stat">待分析(open) <div class="v" style="color:#ef4444;" id="hcOpen">-</div></div>
-                    <div class="audit-stat">分析中 <div class="v" style="color:#f59e0b;" id="hcAnalyzed">-</div></div>
-                    <div class="audit-stat" style="cursor:pointer;" onclick="hcSwitch('resolved')">已解决 <div class="v" style="color:#10b981;" id="hcResolved">-</div></div>
-                    <div class="audit-stat" style="cursor:pointer;" onclick="hcSwitch('open')">只看待分析 ▶</div>
-                </div>
-                <div id="hcList" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; margin-top:6px;">
-                    <div class="audit-empty">加载中…</div>
-                </div>
-            </div><!-- 👇 Benchmark 评测（PRD 24-25）👇 -->            <div class="panel" id="benchmarkPanel" style="border:2px solid rgba(245,158,11,0.5);">
-                <div class="panel-header" style="color:#f59e0b;">
-                    <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="7"></circle><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"></polyline></svg></div>
-                    Benchmark 评测 <span id="bmProjectTag" style="color:var(--primary); font-size:13px;"></span>
-                    <span style="flex:1;"></span>
-                    <button class="secondary" onclick="bmRefresh()" style="padding:4px 12px; font-size:12px;">刷新</button>
-                </div>
-                <div class="audit-wrap">
-                    <div style="flex:1; min-width:340px;">
-                        <div style="font-size:13px; font-weight:700; margin-bottom:6px;">添加评测样本（GT 真值）</div>
-                        <div class="audit-actions" style="margin-top:0;">
-                            <label style="font-size:12px;">帧ID <input id="bmImageId" type="number" value="0" style="width:70px; padding:6px;"></label>
-                            <label style="font-size:12px;">split
-                                <select id="bmSplit" style="padding:6px;"><option>val</option><option>test</option><option>train</option></select>
-                            </label>
-                        </div>                        <textarea id="bmGtInput" rows="3" spellcheck="false" placeholder='人工核对后的真值 JSON，例如：&#10;{"time":["夜晚"],"weather":["晴天"],"road":["直路"],"scene":["城市道路"],"objects":["行人"],"events":["行人横穿"],"risk":["低风险"]}&#10;（必须人工判断，禁止直接照抄示例或 AI 结果）' style="width:100%; margin-top:6px; font-family:monospace; font-size:12px; background:rgba(0,0,0,0.5); color:var(--text-main); border:1px solid var(--border); border-radius:6px; padding:6px;"></textarea>                        <div style="margin-top:8px; padding:6px 8px; background:rgba(245,158,11,0.08); border-left:2px solid #f59e0b; border-radius:4px; font-size:11px; line-height:1.7; color:var(--text-muted);">
-                            <b style="color:#f59e0b;">真值口径</b>：真值必须来自人工的独立判断（改过/重标标签）。
-                            只被点过「通过」、人工没改任何标签的帧，其真值等于模型自己的输出，拿它评测会虚高到接近满分。
+                <div id="clStats" style="display:none; margin-bottom:10px; font-size:12px;"></div>
+                <!-- 左右布局：左=画面（可播放）· 右=标签面板（独立滚动）—— 边看边标 -->
+                <div style="display:flex; gap:12px; align-items:stretch; height:max(460px, calc(100vh - 200px));">
+                    <!-- 左：舞台 + 缩略图条 -->
+                    <div style="flex:1; min-width:0; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:8px; background:rgba(148,163,184,0.05); border:1px solid rgba(148,163,184,.2); border-radius:10px; padding:10px;">
+                        <!-- 舞台：按 16:9 定高（与帧画面比例一致，不产生黑边），剩余高度留给缩略图条 -->
+                        <div style="flex:0 0 auto; aspect-ratio:16/9; position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:0;">
+                            <img id="clStageImg" src="" onclick="ivOpen(_cl.bigUrls, _cl.stageIdx)" style="width:100%; height:100%; object-fit:contain; cursor:zoom-in;" title="点击可放大（滚轮缩放 / ←→ 翻页）">
+                            <div style="position:absolute; left:0; right:0; bottom:0; padding:8px 12px; display:flex; gap:10px; align-items:center; background:linear-gradient(transparent, rgba(0,0,0,0.85));">
+                                <button class="secondary" onclick="clStageStep(-5)" style="padding:4px 10px; font-size:13px;" title="快退 5 帧">⏪</button>
+                                <button class="secondary" onclick="clStageStep(-1)" style="padding:4px 10px; font-size:13px;" title="上一帧（←）">⏮</button>
+                                <button id="clPlayBtn" class="secondary" onclick="clStageToggle()" style="padding:4px 14px; font-size:13px; min-width:76px;">▶ 播放</button>
+                                <button class="secondary" onclick="clStageStep(1)" style="padding:4px 10px; font-size:13px;" title="下一帧（→）">⏭</button>
+                                <button class="secondary" onclick="clStageStep(5)" style="padding:4px 10px; font-size:13px;" title="快进 5 帧">⏩</button>
+                                <input id="clSeek" type="range" min="0" max="0" value="0" oninput="clStageSeek(this.value)" style="flex:1; min-width:80px; cursor:pointer;">
+                                <select id="clSpeed" onchange="clStageSetSpeed(this.value)" style="font-size:12px; padding:3px 4px;" title="播放速度（快进）">
+                                    <option value="1000">0.5x</option>
+                                    <option value="500" selected>1x</option>
+                                    <option value="250">2x</option>
+                                    <option value="125">4x</option>
+                                    <option value="60">8x</option>
+                                </select>
+                                <label style="font-size:12px; color:#cbd5e1; display:inline-flex; align-items:center; gap:4px; cursor:pointer;" title="播完自动从头再播（默认关，避免一直占用解码）">
+                                    <input type="checkbox" id="clLoop" style="cursor:pointer;"> 循环
+                                </label>
+                                <span id="clStageInfo" style="font-size:12px; color:#cbd5e1; min-width:80px; text-align:right;"></span>
+                            </div>
                         </div>
-                        <div class="audit-actions" style="margin-top:6px;">
-                            <button class="secondary" onclick="bmImport('modified')" title="把人工改过标签的帧（human_tags 非空）作为样本，真值 = 人工修正后的 final_tags —— 这是最有价值的真值">导入人工改过的</button>
-                            <button class="secondary" onclick="bmImport('reviewed')" title="把人工审核过（点了通过/修改）的帧作为样本，真值 = final_tags">导入人工审核结果</button>
-                            <label style="font-size:12px;">随机抽 <input id="bmRandomN" type="number" value="200" min="10" style="width:64px; padding:4px;"> 帧</label>
-                            <button class="secondary" onclick="bmImport('random')" title="随机抽样加入样本，真值留空 —— 人工在样本清单里核对填写后再评测（评测会自动跳过未填真值的样本）">抽入待标注</button>
-                        </div>
-                        <div class="audit-actions" style="margin-top:6px;">
-                            <button onclick="bmAddSample()">加入 Benchmark</button>
-                            <button class="secondary" onclick="bmEvaluate('all')">运行评测 (all)</button>
-                            <select id="bmCombo" style="padding:6px;" onchange="">
-                                <option value="all">全部来源</option><option value="vlm">仅 VLM</option>
-                                <option value="yolo">仅 YOLO</option><option value="dino">仅 DINO</option><option value="fusion">仅 Fusion</option>
-                            </select>
-                            <button class="secondary" onclick="bmEvaluate(document.getElementById('bmCombo').value)">按组合评测</button>
-                        </div>
-                        <div id="bmResult" style="margin-top:10px;"></div>
+                        <!-- 缩略图条：flex:1 吃掉左栏剩余高度（否则底部留白，与右侧标签区不齐） -->
+                        <div id="clFrames" style="flex:0 0 auto; max-height:118px; display:grid; grid-template-columns:repeat(auto-fill,minmax(74px,1fr)); gap:4px; overflow-y:auto; align-content:start;"></div>
+                        <div id="clMeta" style="font-size:12px; color:var(--text-muted);"></div>
                     </div>
-                    <div style="flex:1; min-width:340px;">
-                        <div style="font-size:13px; font-weight:700; margin-bottom:6px;">样本清单 <span id="bmCount" style="color:var(--text-muted); font-weight:400;"></span></div>
-                        <div id="bmSampleList" style="max-height:200px; overflow-y:auto; display:flex; flex-direction:column; gap:6px;"></div>
-                        <div style="font-size:13px; font-weight:700; margin:10px 0 6px;">历史评测</div>
-                        <div id="bmHistory" style="max-height:120px; overflow-y:auto; display:flex; flex-direction:column; gap:6px;"></div>
+                    <!-- 右：标签面板（小窗，独立滚动，不挤画面） -->
+                    <div style="flex:0 0 430px; display:flex; flex-direction:column; min-height:0; overflow:hidden; background:rgba(148,163,184,0.05); border:1px solid rgba(148,163,184,.2); border-radius:10px; padding:10px;">
+                        <div style="font-size:13px; font-weight:700; margin-bottom:6px;">人工标签
+                            <span style="font-weight:400; font-size:11px; color:var(--text-muted);">9 个维度都要过一遍（没有就留空）</span></div>
+                        <div id="clDims" style="flex:1; overflow-y:auto; padding-right:4px;"></div>
+                        <div style="padding-top:8px; border-top:1px solid rgba(148,163,184,.25); display:flex; gap:8px; align-items:center;">
+                            <button onclick="clipLabelSave()" style="padding:8px 18px; background:var(--primary); color:#fff; border:none; border-radius:6px; font-size:13px;">保存并对比</button>
+                            <button class="secondary" onclick="clipLabelNext()" style="padding:8px 12px; font-size:13px;">跳过</button>
+                            <span id="clSavedMsg" style="font-size:12px;"></span>
+                        </div>
                     </div>
                 </div>
-            </div><!-- 👇 融合搜索（PRD 35：自然语言 + 结构化 + 语义）👇 -->            <div class="panel" id="fusionSearchPanel" style="border:2px solid rgba(0,212,255,0.5);">
+                <div id="clCompare" style="margin-top:10px; font-size:13px;"></div>
+            </div>
+            <!-- 👇 融合搜索（PRD 35：自然语言 + 结构化 + 语义）👇 -->            <div class="panel" id="fusionSearchPanel" style="border:2px solid rgba(0,212,255,0.5);">
                 <div class="panel-header" style="color:var(--primary);">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></div>
                     融合语义搜索 <span id="fsProjectTag" style="font-size:13px;"></span>
@@ -712,6 +711,7 @@
                         <div style="padding: 6px 12px; color: var(--success); user-select: none;">检出目标: <span id="targetCount" class="stats-number">0</span></div>
                         <div id="filterChecked" class="stat-clickable" onclick="setDisplayFilter('checked')" style="color: var(--warning);">已勾选: <span id="checkedCount" class="stats-number">0</span></div>
                         <div id="filterUnchecked" class="stat-clickable" onclick="setDisplayFilter('unchecked')" style="color: var(--text-muted);">未勾选: <span id="uncheckedCount" class="stats-number">0</span></div>
+                        <button class="secondary" id="yoloBoxToggle" onclick="toggleYoloBoxes()" style="padding: 4px 10px; font-size: 12px;" title="一键隐藏/显示图片上的检测框（YOLO 与 DINO 的 bbox 都会隐藏），设置记住偏好">隐藏检测框</button>
                     </div>
                     <div style="font-size: 12px; color: rgba(255,255,255,0.5);">点击上方分类可快速筛选漏检视图</div>
                 </div>
@@ -747,7 +747,7 @@
         <div onclick="event.stopPropagation()" style="background:#1e293b; border:1px solid rgba(0,212,255,0.4); border-radius:10px; padding:16px 18px; width:min(720px,94vw); max-height:88vh; overflow:auto; color:#fff;">
             <div style="display:flex; align-items:center; margin-bottom:10px; gap:8px;">
                 <b>片段详情</b>
-                <button onclick="fsPlayDetailOriginal()" style="font-size:12px; padding:3px 10px;" title="播放这一段对应的原始视频连续画面（不抽稀）">▶ 播放原视频片段</button>
+                <button onclick="fsPlayDetailOriginal()" style="font-size:12px; padding:3px 10px;" title="播放这一段抽出的帧序列（源视频不再使用）">▶ 播放本段</button>
                 <span style="flex:1;"></span>
                 <button class="secondary" onclick="fsHideDetail()" style="font-size:12px; padding:3px 10px;">关闭</button>
             </div>
@@ -3430,7 +3430,7 @@
 
                 card.innerHTML = `
                     <div class="img-wrapper">
-                        <img src="${item.url}" onclick="openModal(${index})">
+                        <img src="${item.url}?w=480" onclick="openModal(${index})" loading="lazy">
                         ${boxesHTML}
                     </div>
                     <div class="card-info">
@@ -4444,6 +4444,9 @@ async function hcSave(caseId) {
 /* ---------- Benchmark ---------- */
 
 async function bmRefresh() {
+    // Benchmark 栏已于 2026-09-20 移除（帧级评测口径已过时：新架构帧级只做检测，
+    // 场景/事件在 Clip 段级 → 统一走「人机打标评测」）。这里留保护避免历史调用报错。
+    if (!document.getElementById('bmResult')) return;
 
     const proj = currentProject || 'default';
 
@@ -4986,10 +4989,12 @@ function fsShowDetail(it) {
 }
 // 详情页里播"原视频"：关掉详情，取这一段的原始连续画面（全帧）交给播放器
 function fsPlayDetailOriginal() {
+    // 2026-09-20 用户要求：源视频不播（访问不了/太慢），一律用**抽出的帧**回放
     const it = window._fsDetailIt;
     if (!it) return;
     fsHideDetail();
-    fsPlaySegmentFrames(it);
+    if (it._kind === 'clip') return fsPlaySeqFrames(it);
+    return fsPlayFrameContext(it.id);
 }
 function fsHideDetail() {
     const box = document.getElementById('fsDetail');
@@ -5005,6 +5010,79 @@ function _fsPlayKey(it) {
     const vp = vs.video_path || it.video_path || '';
     const ts = vs.timestamp != null ? vs.timestamp : (it.timestamp != null ? it.timestamp : 0);
     return [String(vp), Number(ts) || 0, Number(it.id) || 0];
+}
+
+// 图片序列段（直导连续帧，无源视频）的播放：按库内帧号逐帧回放。
+// 帧率用相机的采集节奏（本批 0.5s/帧），可在播放器里调速。
+async function fsPlaySeqFrames(it) {
+    const sg = it.segment || {};
+    const fids = (sg.frame_ids || []);
+    if (!fids.length) return alert('这一段没有可播放的帧');
+    const cap = document.getElementById('fsPlayerCap');
+    const box = document.getElementById('fsPlayer');
+    if (box) box.style.display = 'flex';
+    fsPlayStop();
+    if (cap) cap.textContent = '正在加载 ' + fids.length + ' 帧序列画面…';
+    const urls = fids.map(function (fid) {
+        return '/api/image/' + encodeURIComponent(currentProject) + '/' + fid;
+    });
+    // 先预载前 8 帧就开播，其余边播边取（浏览器自行缓存）
+    await Promise.all(urls.slice(0, 8).map(function (u) {
+        return new Promise(function (res) {
+            const im = new Image();
+            im.onload = im.onerror = res;
+            im.src = fullUrl(u);
+        });
+    }));
+    fsPlayList = urls.map(function (u, i) {
+        return { fid: fids[i], url: u, txt: '<b>图片序列</b> · 第 ' + (i + 1) + '/' + fids.length + ' 帧' };
+    });
+    fsPlayI = 0;
+    const sel = document.getElementById('fsPlaySpeed');
+    if (sel) { const want = '500'; if ([...sel.options].some(function (o) { return o.value === want; })) sel.value = want; }
+    fsPlayShow();
+    fsPlayPlay();
+}
+// 审核详情卡的"播放本段"：视频片段回原始视频（video_window），图片序列段逐帧回放
+function fsPlayClipItem() {
+    // 2026-09-20 用户要求：不再回源视频（播不了/太慢），统一用抽帧序列播放 ——
+    // Clip 播整段 30 帧；单帧播它所在的那一段（找不到段则用相邻帧兜底）。
+    const it = auditCurrentItem;
+    if (!it) return;
+    if (it._kind === 'clip') return fsPlaySeqFrames(it);
+    return fsPlayFrameContext(it.id);
+}
+
+// 单帧的"上下文回放"：优先找它所属的 Clip 段播整段（同一段是连续画面，
+// 语义比"回源视频解帧"更准），找不到段则用相邻库内帧近似。
+async function fsPlayFrameContext(fid) {
+    if (fid == null) return alert('当前不是底库帧，无法播放');
+    try {
+        let clips = (typeof clipCache !== 'undefined' && clipCache && clipCache.length) ? clipCache : null;
+        if (!clips) { try { clips = await clipLoadCache(); } catch (e) { clips = null; } }
+        const hit = (clips || []).find(function (c) {
+            return (c.frame_ids || []).indexOf(fid) >= 0;
+        });
+        if (hit) return fsPlaySeqFrames(clipToItem(hit));
+    } catch (e) { }
+    // 兜底：相邻 id 的库内帧（id 是全局序号，相邻通常同属一段画面）
+    const half = 15, lo = Math.max(0, fid - half);
+    const fids = [], urls = [];
+    for (let i = lo; i <= fid + half; i++) {
+        fids.push(i);
+        urls.push('/api/image/' + encodeURIComponent(currentProject) + '/' + i + '?w=1280');
+    }
+    fsPlayStop();
+    fsPlayList = urls.map(function (u, i) {
+        return { fid: fids[i], url: u, txt: '库内相邻帧 #' + fids[i] };
+    });
+    fsPlayI = fid - lo;
+    const cap = document.getElementById('fsPlayerCap');
+    if (cap) cap.textContent = '正在加载相邻帧…';
+    const sel = document.getElementById('fsPlaySpeed');
+    if (sel) { const want = '500'; if ([...sel.options].some(function (o) { return o.value === want; })) sel.value = want; }
+    fsPlayShow();
+    fsPlayPlay();
 }
 
 // 点卡片播放：回原始视频取【这一段对应的连续帧】（不抽稀），交给带完整控制的播放器
@@ -5444,7 +5522,7 @@ function fsOpen(it) {
 
     img.src = fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id);
 
-    meta.innerHTML = '<button class="secondary" style="font-size:11px; padding:2px 8px; margin-right:8px;" onclick="fsPlayOriginal(' + it.id + ', 30)" title="回到原始视频，取这一帧前后 30 帧连续画面、按视频真实帧率播放（抽帧是 1:N 稀疏的，连起来看不出真实运动）">▶ 回看原帧（前后30帧）</button>'
+    meta.innerHTML = '<button class="secondary" style="font-size:11px; padding:2px 8px; margin-right:8px;" onclick="fsPlayFrameContext(' + it.id + ')" title="播放这一帧所属的那一段（30 帧序列；源视频不再使用）">▶ 播放所在段</button>'
         + '<b>#' + it.id + '</b> · score ' + it.score + ' · ' + (it.filename || '') + ' <span style="margin-left:12px;">(点击关闭)</span>';
 
     lb.style.display = 'block';
@@ -5909,6 +5987,10 @@ async function auditShowCard(it) {
 // 用于人工判断模型到底有没有在看图（而不是套模板）
 let vsHtml = '';
 if (it.sample_urls && it.sample_urls.length) {
+    // 审核卡图片点开 = 与人机评测同一套查看器（滚轮缩放/拖动/←→翻页/0复位/Esc）
+    window._auditViewerUrls = it.sample_urls.map(function (s2) {
+        return String(s2.url).replace(/\?w=\d+/, '') + '?w=1600';
+    });
     const r0 = it.vlm_result || {};
     const evs = (r0.events || []);
     vsHtml = '<div style="background:rgba(0,0,0,0.3); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px; margin-bottom:8px;">' +
@@ -5917,7 +5999,7 @@ if (it.sample_urls && it.sample_urls.length) {
         it.sample_urls.map(function(s, i) {
             return '<div style="text-align:center;">' +
                 '<img src="' + fullUrl(s.url) + '" style="width:118px; height:66px; object-fit:cover; border-radius:4px; background:#000; border:1px solid var(--border); cursor:zoom-in;" ' +
-                'onclick="window.open(this.src)" onerror="this.style.visibility=\'hidden\'">' +
+                'onclick="ivOpen(window._auditViewerUrls, ' + i + ')" title="点击放大（滚轮缩放 / ←→ 翻页 / Esc 关闭）" onerror="this.style.visibility=\'hidden\'">' +
                 '<div style="font-size:10px; color:var(--text-muted); margin-top:2px;">F' + (i + 1) + '（第 ' + s.pos + ' 帧）</div>' +
             '</div>';
         }).join('') +
@@ -5934,7 +6016,7 @@ if (it.sample_urls && it.sample_urls.length) {
             : '<div style="margin-top:6px; font-size:12px; color:var(--text-muted);">该片段无事件证据</div>') +
     '</div>';
 }
-let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" onerror="this.style.visibility='hidden'">`;
+let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" style="cursor:zoom-in;" title="点击放大（滚轮缩放 / ←→ 翻页 / Esc 关闭）" onclick="ivOpen((window._auditViewerUrls && window._auditViewerUrls.length) ? window._auditViewerUrls : ['${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}'], 0)" onerror="this.style.visibility='hidden'">`;
 
 
 
@@ -5988,6 +6070,7 @@ let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url |
             <option value="time">时间</option><option value="objects">目标</option>
             <option value="events">事件</option><option value="risk">风险</option>
         </select>
+        <button class="secondary" onclick="fsPlayClipItem()" title="视频片段回放原始连续画面；图片序列段逐帧回放">▶ 播放本段</button>
         <button class="secondary" onclick="auditAction('add')">添加/修正标签</button>
         <button onclick="auditNext()">下一张</button>
     </div>`;
@@ -6145,19 +6228,36 @@ async function auditRunBatch() {
     if (window._fusedBusy) return alert('一键流程正在运行中，请等待完成');
     const clipSize = parseInt((document.getElementById('clipSizeInput') || {}).value) || 30;
     const onlyNew = !!(document.getElementById('aiOnlyNew') || {}).checked;
-    if (!confirm('将对当前项目执行一键 AI 分析：\n① ' + (onlyNew ? '增量：只跑还没做过 AI 分析的帧（已跑过的自动跳过）' : '全量重跑：所有已入库帧都重做一遍') + '\n    （检测 + 场景分析 + 自动决策）\n② 每 ' + clipSize + ' 帧组成 Clip，逐片段 VLM 场景判定（只判未判定的）\n\n耗时较长，是否继续？')) return;
+    // 硬规则：VLM 打标必须 7B。加载链会静默降级到 2B（2B 判出来的"行人横穿"占全部事件 55%、
+    // 63% 无置信度），这种结果不能当数据用 —— 所以先查实际加载的模型，非 7B 必须人工确认。
+    let vlm = null, vlmConfirm = '';
+    // warm=1：VLM 是懒加载的，刚重启时还没加载；让后端先真加载一次再报"是不是 7B"，
+    // 否则会把"未加载"误判成"非 7B"而拦住正常流程（加载要几十秒，这里等它）。
+    try { vlm = await auditFetch('/api/vlm_status?warm=1'); } catch (e) { }
+    if (vlm && vlm.required_7b && !vlm.is_7b) {
+        const cur = vlm.model || '（未加载）';
+        if (!confirm('⚠️ 当前 VLM 不是 7B，实际是：\n    ' + cur + '\n\n'
+            + '7B 才有可用的判定质量：2B 打出的「行人横穿」曾占全部事件的 55%，'
+            + '且 63% 的事件没有 confidence、证据链整批丢失。\n\n'
+            + '建议先重启服务让它重新按 7B 加载（正常会显示 Qwen/Qwen2-VL-7B-Instruct）。\n\n'
+            + '确定要【用非 7B 模型】继续跑吗？')) return;
+        vlmConfirm = '1';
+    }
+    if (!confirm('将对当前项目执行一键 AI 分析：\n① ' + (onlyNew ? '增量：只跑还没做过 AI 分析的帧（已跑过的自动跳过）' : '全量重跑：所有已入库帧都重做一遍') + '\n    （检测 + 场景分析 + 自动决策）\n② 每 ' + clipSize + ' 帧组成 Clip，逐片段 VLM 场景判定（只判未判定的）\n\n'
+        + '当前 VLM：' + ((vlm && vlm.model) || '未加载') + '\n\n耗时较长，是否继续？')) return;
     window._fusedBusy = true;
     try {
         // 不再由前端拉全量 id（14403 帧的 id 串既大又慢，而且会把已跑过的帧一起带上）；
         // image_ids 留空 = 让后端自己挑帧
         // ===== ① 帧级：AI检测 + 场景分析 =====
         {
-            fusedProg('① 帧级 AI检测+场景分析', 0, onlyNew ? '正在挑选未处理的帧…' : '全量重跑，提交中…');
+            fusedProg('① 帧级 YOLO 检测', 0, onlyNew ? '正在挑选未处理的帧…' : '全量重跑，提交中…');
             const fd = new FormData();
             fd.append('project', currentProject);
             fd.append('only_unprocessed', onlyNew ? '1' : '0');
             fd.append('preset', 'balanced');
             fd.append('clip_size', clipSize);   // Clip 段长：与 ② 的 clips/scan 用同一个值
+            if (vlmConfirm) fd.append('vlm_confirm', vlmConfirm);   // 人工确认过"非 7B 也跑"
             const fuseEl = document.getElementById('aiFuseDetect');
             fd.append('detect_first', (fuseEl && fuseEl.checked) ? '1' : '0');
             const dinoEl = document.getElementById('aiDinoEnhance');
@@ -6170,7 +6270,7 @@ async function auditRunBatch() {
                 // 增量模式下常见：没有待处理的帧，就不建任务，直接进 ② Clip 判定
                 fusedProg('① 无待处理帧（已跳过）', 60, r.msg || '所有帧都已跑过 AI 分析');
             } else {
-                fusedProg('① 帧级 AI检测+场景分析', 3, r.msg || '');
+                fusedProg('① 帧级 YOLO 检测', 3, r.msg || '');
                 // 轮询等 TAG 任务结束（期间 aiJobPoll 由 _fusedBusy 让位，进度由这里写）
                 const t0 = Date.now();
                 for (;;) {
@@ -6186,7 +6286,7 @@ async function auditRunBatch() {
                         break;
                     }
                     const mins = Math.floor((Date.now() - t0) / 60000);
-                    fusedProg('① 帧级 AI检测+场景分析', Math.min(55, Math.round(cur.progress || 0) * 0.55),
+                    fusedProg('① 帧级 YOLO 检测', Math.min(55, Math.round(cur.progress || 0) * 0.55),
                         (cur.current_stage || '处理中') + ' · job #' + cur.job_id + ' · 已等待 ' + mins + ' 分');
                 }
             }
@@ -6250,16 +6350,21 @@ function clipToItem(c) {
     const r = c.vlm_result || {}, sc = r.scene || {};
     const keep = a => (a || []).filter(v => v && v !== 'unknown');
     const confs = (r.events || []).map(e => e.confidence).concat((r.objects || []).map(o => o.confidence)).filter(x => x != null);
+    // seq: 前缀 = 直导图片连续帧切段（无源视频，播放走逐帧回放）；否则是视频片段
+    const isSeq = String(c.video_id || '').indexOf('seq:') === 0;
     return {
         _kind: 'clip',
         id: c.clip_id,
         clip_id: c.clip_id,
+        isSeq: isSeq,
         img_url: c.preview_url || '',
         status: c.decision || 'REVIEW',
-        decision_reason: r.error ? ('异常: ' + r.error) : ('Clip 片段 · ' + (c.frame_count || 0) + ' 帧'),
+        decision_reason: r.error ? ('异常: ' + r.error) : ((isSeq ? '图片序列' : 'Clip 片段') + ' · ' + (c.frame_count || 0) + ' 帧'),
         ai_score: confs.length ? Math.round(Math.max.apply(null, confs) * 100) : null,
         asset_id: c.clip_id,
-        lineage: { source_type: 'video', relative_path: c.video_id || '' },
+        lineage: { source_type: isSeq ? 'image_seq' : 'video', relative_path: c.video_id || '' },
+        // 播放本段用：整段的库内帧号（后端 light 模式保留 frame_ids）
+        segment: { frame_ids: c.frame_ids || [], frame_count: c.frame_count || (c.frame_ids || []).length },
         ai_tags: {
             time: keep(sc.time), weather: keep(sc.weather), road: keep(sc.road_type), road_surface: keep(sc.surface),
             scene: keep(sc.area).concat(keep(sc.traffic_state), keep(sc.lighting)),
@@ -6313,6 +6418,10 @@ function taskOvToggle(ev) {
     if (!p) return;
     window._taskOvOpen = (p.style.display !== 'block');
     p.style.display = window._taskOvOpen ? 'block' : 'none';
+    // 打开瞬间先给反馈：列表要等 3 个接口返回才渲染，否则会像"空面板"
+    if (window._taskOvOpen && !String(p.innerHTML).trim()) {
+        p.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:6px;">加载中…</div>';
+    }
     taskOvRefresh();
 }
 document.addEventListener('click', function (ev) {
@@ -6322,12 +6431,41 @@ document.addEventListener('click', function (ev) {
     p.style.display = 'none';
     window._taskOvOpen = false;
 });
-function _taskOvBar(done, total, running) {
-    if (!total || total <= 0) return '<span style="color:var(--text-muted);">—</span>';
-    const pct = Math.max(0, Math.min(100, Math.round(done * 100 / total)));
+// 一键隐藏/显示 YOLO 检测框：全局 body class + localStorage 记忆偏好
+function toggleYoloBoxes() {
+    document.body.classList.toggle('hide-yolo-boxes');
+    const hidden = document.body.classList.contains('hide-yolo-boxes');
+    try { localStorage.setItem('hideYoloBoxes', hidden ? '1' : '0'); } catch (e) { }
+    const btn = document.getElementById('yoloBoxToggle');
+    if (btn) {
+        btn.innerText = hidden ? '显示检测框' : '隐藏检测框';
+        btn.style.color = hidden ? 'var(--warning)' : '';
+    }
+}
+(function restoreYoloBoxPref() {
+    try {
+        if (localStorage.getItem('hideYoloBoxes') === '1') {
+            document.body.classList.add('hide-yolo-boxes');
+            const btn = document.getElementById('yoloBoxToggle');
+            if (btn) { btn.innerText = '显示检测框'; btn.style.color = 'var(--warning)'; }
+        }
+    } catch (e) { }
+})();
+function _taskOvBar(done, total, running, pct) {
+    // 统一进度条：有 x/y 就用 x/y（抽帧/导入/打包/向量化），只有百分比就用百分比
+    // （VLM 打标等 DB 任务：jobs 表存的就是 progress%）
+    let p = null, label = '';
+    if (total && total > 0) {
+        p = Math.max(0, Math.min(100, Math.round(done * 100 / total)));
+        label = p + '% ' + done + '/' + total;
+    } else if (pct != null && isFinite(pct)) {
+        p = Math.max(0, Math.min(100, Math.round(pct)));
+        label = p + '%';
+    }
+    if (p === null) return '<span style="color:var(--text-muted);">—</span>';
     return '<div style="background:rgba(148,163,184,.25); border-radius:6px; height:10px; width:118px; display:inline-block; vertical-align:middle;">'
-         + '<div style="height:10px; width:' + pct + '%; background:' + (running ? 'var(--primary)' : 'var(--success)') + '; border-radius:6px;"></div></div>'
-         + ' <span style="font-size:11px; color:var(--text-muted);">' + pct + '% ' + done + '/' + total + '</span>';
+         + '<div style="height:10px; width:' + p + '%; background:' + (running ? 'var(--primary)' : 'var(--success)') + '; border-radius:6px;"></div></div>'
+         + ' <span style="font-size:11px; color:var(--text-muted);">' + label + '</span>';
 }
 async function taskOvRefresh() {
     const panel = document.getElementById('taskOvPanel');
@@ -6339,18 +6477,20 @@ async function taskOvRefresh() {
     try { imp = await fetch(fullUrl('/api/import_status')).then(function (r) { return r.json(); }); } catch (e) { }
     const rows = [];
     const seen = {};
-    // 1) 抽帧 / 视频（实时池，带 x/y 计数）
+    // 1) 抽帧 / 视频 / 向量化 / 打包（实时池，带 x/y 计数）
+    const kindOf = { video: '视频抽帧', extract: '视频抽帧', vectorize: '向量化索引', delivery: '数据打包', clip_judge: '段级判定(VLM)', import: '数据导入' };
     Object.keys(pool || {}).forEach(function (k) {
         const v = pool[k] || {};
         if (!v.is_running) return;   // 已完成/已停止的不再展示（任务状态自动清除）
+        if (v.task_type === 'import') return;   // 导入统一由下面 /api/import_status 出一行，别重复
         const proj = v.project || '?';
-        seen[proj + '|extract'] = 1;
+        if (v.task_type === 'extract' || v.task_type === 'video') seen[proj + '|extract'] = 1;
         rows.push({
             proj: proj,
             path: k,          // 供"任务中止"按钮使用（复用 cancelTask）
             canStop: true,
-            // 两种都是从视频抽帧：video=单个视频，extract=按目录整批（目录下是一批视频）
-            kind: (v.task_type === 'video' ? '视频抽帧' : '图片目录导入'),
+            // video=单个视频，extract=按目录整批（目录下是一批视频）
+            kind: kindOf[v.task_type] || v.task_type || '任务',
             run: !!v.is_running,
             done: v.processed_count || 0,
             total: v.total_count || 0,
@@ -6358,7 +6498,7 @@ async function taskOvRefresh() {
         });
     });
     // 2) 数据库里的 AI 任务（只列进行中的）
-    const kindMap = { TAG: 'VLM 打标', EXTRACT: '视频抽帧', IMPORT: '数据导入', BENCHMARK: 'Benchmark', EXPORT: '数据打包' };
+    const kindMap = { TAG: '帧检测(YOLO)', EXTRACT: '视频抽帧', IMPORT: '数据导入', BENCHMARK: 'Benchmark', EXPORT: '数据打包' };   // 2026-09-19 重构：TAG=帧级检测（场景/事件走 Clip 段级）
     (jobs || []).forEach(function (j) {
         const st = String(j.status || '');
         if (st !== 'RUNNING' && st !== 'PENDING') return;
@@ -6372,16 +6512,19 @@ async function taskOvRefresh() {
             paused: !!j.paused,
             canPause: (j.job_type === 'TAG'),   // 只有 AI 打标链路有真正的暂停
             canStop: (j.job_type === 'TAG'),    // 抽帧的中止走实时池那一行
-            done: 0,
-            total: 0,
-            msg: (j.current_stage || '') + (j.progress != null ? '  (' + j.progress + '%)' : '')
+            done: j.processed_count || 0,
+            total: j.total_count || 0,          // 后端内存明细给的 x/y（没进批量阶段时为空）
+            pct: (j.progress == null ? null : j.progress),
+            // 阶段文案末尾的 (x/y) 与进度条重复，去掉，一处数字只说一遍
+            msg: String(j.current_stage || '').replace(/\s*\(\d+\/\d+\)\s*$/, '')
         });
     });
     // 3) 数据导入（单槽）
     if (imp && imp.is_running) {
         rows.push({
             proj: imp.project || '?', kind: '数据导入', run: true,
-            done: imp.processed_count || 0, total: imp.total_count || 0, msg: imp.msg || ''
+            done: imp.processed_count || 0, total: imp.total_count || 0, msg: imp.msg || '',
+            canStop: true, path: 'import:' + (imp.project || '')   // 中止按项目粒度（后端认 import: 前缀）
         });
     }
     const running = rows.filter(function (r) { return r.run; }).length;
@@ -6407,7 +6550,7 @@ async function taskOvRefresh() {
             return '<div class="tov-row">'
                  + '<span class="tov-proj" title="' + _taskOvEsc(r.proj) + '">' + _taskOvEsc(r.proj) + '</span>'
                  + '<span class="tov-kind">' + _taskOvEsc(r.kind) + '</span>'
-                 + '<span class="tov-bar">' + _taskOvBar(r.done, r.total, r.run) + '</span>'
+                 + '<span class="tov-bar">' + _taskOvBar(r.done, r.total, r.run, r.pct) + '</span>'
                  + '<span class="tov-msg" title="' + _taskOvEsc(r.msg) + '">' + _taskOvEsc(r.msg) + '</span>'
                  + '<span class="tov-act">'
                  + (r.canPause ? '<button class="secondary" data-act="' + (r.paused ? 'resume' : 'pause') + '" data-key="' + encodeURIComponent(r.projKey) + '" style="font-size:11px; padding:2px 8px; margin-right:4px;">' + (r.paused ? '继续' : '暂停') + '</button>' : '')
@@ -6436,5 +6579,396 @@ async function taskOvStopJob(projEnc) {
 }
 setInterval(taskOvRefresh, 4000);
 </script>
+
+<!-- ===== Clip 段级人机打标评测（金标采集 + 人机逐维度自动对比）===== -->
+<script>
+const CLIP_BENCH_DIMS = [
+  { key: 'time', cn: '时间' }, { key: 'weather', cn: '天气' }, { key: 'road', cn: '道路' },
+  { key: 'road_surface', cn: '路面' }, { key: 'scene', cn: '场景' }, { key: 'risk', cn: '风险' },
+  { key: 'traffic_sign', cn: '交通标识' }, { key: 'objects', cn: '目标' }, { key: 'events', cn: '事件' }
+];
+let _cl = { dims: [], queue: [], idx: 0, gt: {}, cur: null, labeledIds: {}, labeledTotal: 0, saved: false, showAll: false };
+let _cl_enum_loaded = false;
+async function clipLabelOpen() {
+  if (!_cl_enum_loaded) {
+    try {
+      const o = await auditFetch('/api/ontology');
+      const o2 = (o && o.ontology) || {};
+      _cl.dims = CLIP_BENCH_DIMS.map(d => ({ key: d.key, cn: d.cn, values: (o2[d.key] && o2[d.key].values) || [] }));
+      _cl_enum_loaded = true;
+    } catch (e) { return alert('本体枚举加载失败: ' + e.message); }
+  }
+  let q = [];
+  for (let page = 1; page <= 40; page++) {
+    let d = null;
+    try { d = await auditFetch('/api/clips/list?project=' + encodeURIComponent(currentProject) + '&page=' + page + '&size=100&light=1'); } catch (e) { break; }
+    const items = (d && d.items) || [];
+    if (!items.length) break;
+    q = q.concat(items.filter(c => c.vlm_result));
+    if (items.length < 100) break;
+  }
+  _cl.queue = q; _cl.idx = 0; _cl.gt = {}; _cl.saved = false;
+  try {
+    const st = await auditFetch('/api/benchmark/clip_label/stats?project=' + encodeURIComponent(currentProject));
+    _cl.labeledIds = {}; ((st && st.labeled_ids) || []).forEach(id => _cl.labeledIds[id] = 1);
+    _cl.labeledTotal = (st && st.total) || 0;
+  } catch (e) { _cl.labeledIds = {}; _cl.labeledTotal = 0; }
+  while (_cl.idx < _cl.queue.length && _cl.labeledIds[_cl.queue[_cl.idx].clip_id]) _cl.idx++;
+  if (_cl.idx >= _cl.queue.length) _cl.idx = 0;
+  document.getElementById('clProj').textContent = ' · 项目: ' + currentProject;
+  clipLabelRender();
+}
+function clipLabelCur() { return _cl.queue[_cl.idx] || null; }
+function clipLabelToggleAll() { _cl.showAll = !_cl.showAll; clipLabelRender(); }
+// ===== 面板内嵌播放器：左边看画面（可播）· 右边点标签 —— 边看边标 =====
+function clStageShow(idx) {
+  const urls = _cl.stageUrls || _cl.bigUrls || [];
+  if (!urls.length) return;
+  idx = Math.max(0, Math.min(parseInt(idx) || 0, urls.length - 1));
+  _cl.stageIdx = idx;
+  const img = document.getElementById('clStageImg');
+  if (img) img.src = urls[idx];
+  const seek = document.getElementById('clSeek');
+  if (seek) { seek.max = Math.max(0, urls.length - 1); seek.value = idx; }
+  const info = document.getElementById('clStageInfo');
+  if (info) info.textContent = (idx + 1) + ' / ' + urls.length + ' 帧';
+  document.querySelectorAll('#clFrames img[data-fi]').forEach(function (el) {
+    const on = parseInt(el.dataset.fi) === idx;
+    el.style.outline = on ? '2px solid var(--primary)' : 'none';
+    el.style.opacity = on ? '1' : '0.6';
+  });
+}
+function clStagePlay() {
+  const urls = _cl.stageUrls || _cl.bigUrls || [];
+  if (urls.length < 2) return;
+  if (_cl.stageIdx >= urls.length - 1) clStageShow(0);
+  _cl.playing = true;
+  const b = document.getElementById('clPlayBtn');
+  if (b) b.textContent = '⏸ 暂停';
+  if (_cl.timer) clearInterval(_cl.timer);
+  _cl.timer = setInterval(function () {
+    if (_cl.stageIdx + 1 >= urls.length) {
+      const loop = document.getElementById('clLoop');
+      if (loop && loop.checked) { clStageShow(0); return; }   // 循环（默认关）
+      clStagePause();
+      return;
+    }
+    clStageShow(_cl.stageIdx + 1);
+  }, _cl.speed || 500);
+}
+function clStagePause() {
+  _cl.playing = false;
+  if (_cl.timer) { clearInterval(_cl.timer); _cl.timer = null; }
+  const b = document.getElementById('clPlayBtn');
+  if (b) b.textContent = '▶ 播放';
+}
+function clStageToggle() { if (_cl.playing) clStagePause(); else clStagePlay(); }
+function clStageSeek(v) { clStagePause(); clStageShow(v); }
+// 逐帧/跳帧（⏮⏭ 单帧、⏪⏩ 跳 5 帧）
+function clStageStep(d) { clStagePause(); clStageShow((_cl.stageIdx || 0) + (parseInt(d) || 0)); }
+// 倍速（快进）：改播放间隔；播放中立即按新速度重启
+function clStageSetSpeed(ms) {
+  _cl.speed = parseInt(ms) || 500;
+  if (_cl.playing) { clStagePause(); clStagePlay(); }
+}
+document.addEventListener('keydown', function (e) {
+  const panel = document.getElementById('hardCasePanel');
+  if (!panel || panel.offsetParent === null) return;
+  const vw = document.getElementById('imgViewer');
+  if (vw && vw.style.display === 'block') return;   // 全屏查看器开着时由它处理
+  if (document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+  if (e.key === ' ') { e.preventDefault(); clStageToggle(); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); clStageStep(e.shiftKey ? 5 : 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); clStageStep(e.shiftKey ? -5 : -1); }
+});
+function clipLabelPlay() {
+  const c = clipLabelCur();
+  if (!c) return;
+  // 统一用**抽出的帧**逐帧播放（用户反馈：源视频看不了）—— 段内 30 帧是 1:5 抽稀的
+  // 连续画面，按相机节奏回放即可还原过程，且不依赖源视频可访问性。
+  fsPlaySeqFrames(clipToItem(c));
+}
+function clipLabelRender() {
+  const c = clipLabelCur();
+  const box = document.getElementById('clDims');
+  if (!c) { box.innerHTML = '<div style="padding:20px; color:var(--text-muted);">没有可打标的段（需要有模型判定结果的 Clip）</div>'; return; }
+  const _ptxt = '第 ' + (_cl.idx + 1) + '/' + _cl.queue.length + ' 段 · 已标注 ' + (_cl.labeledTotal || 0) + ' 段' + (_cl.labeledIds[c.clip_id] ? ' · 本段已标过(可修订)' : '');
+  document.getElementById('clProgress').textContent = _ptxt;
+  const _p2 = document.getElementById('clProgress2');
+  if (_p2) _p2.textContent = _ptxt;
+  // 帧 URL：舞台播放大图(w=1280) + 缩略图条(w=240)
+  const _fidList = _cl.showAll ? (c.frame_ids || []) : (c.sample_urls || []).map(function (x) { return x.url; });
+  const _mk = function (w) {
+    return _fidList.map(function (v) {
+      if (typeof v === 'number') return '/api/image/' + encodeURIComponent(currentProject) + '/' + v + '?w=' + w;
+      return String(v).replace(/\?w=\d+/, '') + '?w=' + w;
+    });
+  };
+  _cl.stageUrls = _mk(800);    // 舞台播放：800 够看且切帧流畅
+  _cl.bigUrls = _mk(1600);     // 点开放大：1600 看细节
+  _cl.thumbs = _mk(240);       // 缩略图条
+  (_cl.stageUrls || []).forEach(function (u) { var _im = new Image(); _im.src = u; });   // 预加载（800px 体积小）
+  document.getElementById('clFrames').innerHTML = (_cl.thumbs || []).map(function (u, i) {
+    return '<img data-fi="' + i + '" src="' + u + '" onclick="clStageSeek(' + i + ')" '
+      + 'style="width:100%; border-radius:4px; display:block; cursor:pointer; background:#000;" title="跳到第 ' + (i + 1) + ' 帧">';
+  }).join('');
+  clStageShow(0);
+  document.getElementById('clMeta').innerHTML = 'clip: ' + c.clip_id + '<br>帧数: ' + (c.frame_count || 0)
+    + '<div style="margin-top:6px; display:flex; gap:6px;">'
+    + '<button class="secondary" onclick="clipLabelToggleAll()" style="padding:3px 10px; font-size:11px;">' + (_cl.showAll ? '◀ 只看送模型的 ' + ((c.sample_urls || []).length) + ' 帧' : '看整段 ' + ((c.frame_ids || []).length) + ' 帧 ▶') + '</button>'
+    + '</div>';
+  _cl.compare = null; _cl.saved = false;
+  const _lp = document.getElementById('clLoop'); if (_lp) _lp.checked = false;
+  const _sp = document.getElementById('clSpeed'); if (_sp) _sp.value = '500';
+  _cl.speed = 500;
+  clStagePause();
+  document.getElementById('clSavedMsg').textContent = '';
+  document.getElementById('clCompare').innerHTML = '';
+  // ⚠️ 必须用 _cl.dims（带本体枚举 values）；CLIP_BENCH_DIMS 只有中英文名，
+  // 用它渲染会导致一个标签都显示不出来（2026-09-20 实测踩坑）。
+  const _dimSrc = (_cl.dims && _cl.dims.length) ? _cl.dims : CLIP_BENCH_DIMS;
+  box.innerHTML = _dimSrc.map(function (d) {
+    const vals = d.values || [];
+    const sel = _cl.gt[d.key] || [];
+    const chips = vals.map(function (v) {
+      const on = sel.includes(v);
+      return '<span data-dim="' + d.key + '" data-val="' + v + '" onclick="clipLabelToggle(this)" '
+        + 'style="display:inline-block; padding:4px 12px; margin:3px; font-size:13px; border-radius:14px; cursor:pointer; '
+        + 'border:1px solid ' + (on ? 'var(--primary)' : 'rgba(148,163,184,.35)') + '; '
+        + 'background:' + (on ? 'rgba(59,130,246,.25)' : 'transparent') + '; color:' + (on ? 'var(--primary)' : 'var(--text-muted)') + ';">' + v + '</span>';
+    }).join('');
+    return '<div style="margin-bottom:12px; padding:8px 10px; background:rgba(148,163,184,0.05); border-radius:8px;">'
+      + '<div style="margin-bottom:4px;"><b style="font-size:13px; color:var(--text-main);">' + d.cn + '</b>'
+      + '<span data-dim="' + d.key + '" onclick="clipLabelClear(this)" style="font-size:11px; color:var(--text-muted); margin-left:10px; cursor:pointer;">清空本维</span>'
+      + '<span id="cmp_' + d.key + '" style="margin-left:12px; font-size:12px;"></span></div>'
+      + '<div style="line-height:1.9;">' + (chips || '<span style="font-size:12px; color:var(--text-muted);">（本体无枚举，暂不可标）</span>') + '</div></div>';
+  }).join('');
+}
+function clipLabelToggle(el) {
+  const dim = el.dataset.dim, val = el.dataset.val;
+  const arr = _cl.gt[dim] || (_cl.gt[dim] = []);
+  const i = arr.indexOf(val);
+  if (i >= 0) arr.splice(i, 1); else arr.push(val);
+  const on = arr.indexOf(val) >= 0;
+  el.style.border = '1px solid ' + (on ? 'var(--primary)' : 'rgba(148,163,184,.35)');
+  el.style.background = on ? 'rgba(59,130,246,.25)' : 'transparent';
+  el.style.color = on ? 'var(--primary)' : 'var(--text-muted)';
+}
+function clipLabelClear(el) {
+  const dim = el.dataset.dim;
+  delete _cl.gt[dim];
+  clipLabelRenderChips(dim);
+}
+function clipLabelRenderChips(dim) {
+  const sel = _cl.gt[dim] || [];
+  document.querySelectorAll('#clDims span[data-dim]').forEach(function (sp) {
+    if (sp.dataset.dim !== dim) return;
+    const on = sel.indexOf(sp.dataset.val) >= 0;
+    sp.style.border = '1px solid ' + (on ? 'var(--primary)' : 'rgba(148,163,184,.35)');
+    sp.style.background = on ? 'rgba(59,130,246,.25)' : 'transparent';
+    sp.style.color = on ? 'var(--primary)' : 'var(--text-muted)';
+  });
+}
+async function clipLabelSave() {
+  const c = clipLabelCur();
+  if (!c) return;
+  const gt = {};
+  let any = false;
+  CLIP_BENCH_DIMS.forEach(function (d) { if ((_cl.gt[d.key] || []).length) { gt[d.key] = _cl.gt[d.key]; any = true; } });
+  if (!any) return alert('至少标注一个维度');
+  const fd = new FormData();
+  fd.append('project', currentProject);
+  fd.append('clip_id', c.clip_id);
+  fd.append('gt', JSON.stringify(gt));
+  let r = null;
+  try { r = await auditFetch('/api/benchmark/clip_label', fd); } catch (e) { return alert('保存失败: ' + e.message); }
+  if (!r || r.code !== 200) return alert('保存失败: ' + ((r && r.msg) || '?'));
+  _cl.compare = r.compare; _cl.model = r.model; _cl.saved = true;
+  _cl.labeledIds[c.clip_id] = 1; _cl.labeledTotal = (_cl.labeledTotal || 0) + 1;
+  CLIP_BENCH_DIMS.forEach(function (d) {
+    const el = document.getElementById('cmp_' + d.key);
+    if (!el) return;
+    const v = r.compare[d.key];
+    if (v === 'both_empty') { el.innerHTML = '<span style="color:var(--text-muted);">（双方均无）</span>'; return; }
+    const col = v === '一致' ? 'var(--success)' : (v === '部分一致' ? 'var(--warning)' : 'var(--danger)');
+    el.innerHTML = '<span style="color:' + col + '; font-weight:700;">' + v + '</span>'
+      + ' 人工: <b>' + ((_cl.gt[d.key] || []).join('、') || '无') + '</b>'
+      + ' · 模型: <b>' + ((r.model[d.key] || []).join('、') || '无') + '</b>';
+  });
+  document.getElementById('clSavedMsg').innerHTML = '✅ 已保存：人工标签已<b style="color:var(--success);">覆盖模型结果</b>（final_tags）· 本段 ' + r.agree + '/' + r.total + ' 维一致';
+}
+function clipLabelNext() {
+  _cl.gt = {}; _cl.compare = null; _cl.saved = false;
+  let guard = 0;
+  do { _cl.idx = (_cl.idx + 1) % Math.max(1, _cl.queue.length); guard++; }
+  while (guard < _cl.queue.length && _cl.labeledIds[clipLabelCur() && clipLabelCur().clip_id]);
+  clipLabelRender();
+}
+async function clipLabelReport() {
+  const el = document.getElementById('clStats');
+  el.style.display = 'block';
+  el.innerHTML = '<div style="color:var(--text-muted);">正在汇总人机对比结果…</div>';
+  let d = null;
+  try { d = await auditFetch('/api/benchmark/clip_label/report?project=' + encodeURIComponent(currentProject)); }
+  catch (e) { el.innerHTML = '<span style="color:var(--danger);">报告生成失败: ' + e.message + '</span>'; return; }
+  if (!d || d.code !== 200) { el.innerHTML = '<span style="color:var(--danger);">报告生成失败</span>'; return; }
+  if (d.empty) { el.innerHTML = '<span style="color:var(--warning);">' + d.msg + '</span>'; return; }
+  const colOf = c => c === 'success' ? 'var(--success)' : (c === 'warning' ? 'var(--warning)' : (c === 'danger' ? 'var(--danger)' : 'var(--text-muted)'));
+  const pct = v => v == null ? '-' : Math.round(v * 100) + '%';
+  let h = '<div style="display:flex; justify-content:space-between; align-items:flex-start;">'
+        + '<b>📋 人机对比报告（真值=人工标注 ' + d.total_labeled + ' 段，平均 F1 ' + (d.avg_f1 == null ? '-' : d.avg_f1.toFixed(3)) + '）</b>'
+        + '<button class="secondary" onclick="this.parentNode.parentNode.style.display=&quot;none&quot;" style="padding:2px 10px; font-size:11px;">收起</button></div>';
+  // 弱项结论（最要紧的放最上）
+  h += '<div style="margin-top:6px; padding:8px 12px; background:rgba(239,68,68,0.07); border-left:3px solid var(--danger); border-radius:4px; white-space:pre-wrap; line-height:1.8; font-size:12px;">'
+     + String(d.conclusion || '').replace(/^### /gm, '').replace(/\*\*/g, '') + '</div>';
+  // 维度表
+  h += '<table style="margin-top:10px; font-size:12px; width:100%;"><tr style="color:var(--text-muted);">'
+     + '<td style="padding:2px 10px 2px 0;">维度</td><td style="padding:2px 8px;">精确率</td><td style="padding:2px 8px;">召回</td>'
+     + '<td style="padding:2px 8px;">F1</td><td style="padding:2px 8px;">评价</td><td style="padding:2px 8px;">金标/模型/命中</td></tr>';
+  (d.dimensions || []).forEach(function (x) {
+    h += '<tr><td style="padding:2px 10px 2px 0;">' + x.cn + '</td>'
+       + '<td style="padding:2px 8px;">' + pct(x.precision) + '</td><td style="padding:2px 8px;">' + pct(x.recall) + '</td>'
+       + '<td style="padding:2px 8px; font-weight:700; color:' + colOf(x.color) + ';">' + (x.f1 == null ? '-' : x.f1.toFixed(2)) + '</td>'
+       + '<td style="padding:2px 8px; color:' + colOf(x.color) + ';">' + x.verdict + '</td>'
+       + '<td style="padding:2px 8px; color:var(--text-muted);">' + x.gt_count + ' / ' + x.pred_count + ' / ' + x.match + '</td></tr>';
+  });
+  h += '</table>';
+  // 事件类别（只列有数据的）
+  const evs = Object.keys(d.events || {});
+  if (evs.length) {
+    h += '<b style="font-size:12px; display:block; margin-top:10px;">事件类别明细</b><table style="margin-top:4px; font-size:12px; width:100%;"><tr style="color:var(--text-muted);">'
+       + '<td style="padding:2px 10px 2px 0;">事件</td><td style="padding:2px 8px;">精确率</td><td style="padding:2px 8px;">召回</td><td style="padding:2px 8px;">F1</td><td style="padding:2px 8px;">TP/FP/FN</td><td style="padding:2px 8px;">评价</td></tr>';
+    evs.forEach(function (e) {
+      const a = d.events[e];
+      h += '<tr><td style="padding:2px 10px 2px 0;">' + e + '</td>'
+         + '<td style="padding:2px 8px;">' + pct(a.precision) + '</td><td style="padding:2px 8px;">' + pct(a.recall) + '</td>'
+         + '<td style="padding:2px 8px; font-weight:700; color:' + colOf(a.color) + ';">' + (a.f1 == null ? '-' : a.f1.toFixed(2)) + '</td>'
+         + '<td style="padding:2px 8px; color:var(--text-muted);">' + a.tp + '/' + a.fp + '/' + a.fn + '</td>'
+         + '<td style="padding:2px 8px; color:' + colOf(a.color) + ';">' + a.verdict + '</td></tr>';
+    });
+    h += '</table>';
+  }
+  el.innerHTML = h;
+}
+async function clipLabelShowStats() {
+  const el = document.getElementById('clStats');
+  if (el.style.display === 'block') { el.style.display = 'none'; return; }
+  let st = null;
+  try { st = await auditFetch('/api/benchmark/clip_label/stats?project=' + encodeURIComponent(currentProject)); } catch (e) { return; }
+  const agg = (st && st.aggregate) || {};
+  const prf = (st && st.prf) || {};
+  const evs = (st && st.events) || {};
+  const _pc = function (v) { return v == null ? '<span style="color:var(--text-muted);">-</span>' : '<b style="color:' + (v >= 0.8 ? 'var(--success)' : (v >= 0.5 ? 'var(--warning)' : 'var(--danger)')) + ';">' + Math.round(v * 100) + '%</b>'; };
+  el.innerHTML = '<b>各维度 Precision / Recall / F1（真值=人工标注，共 ' + ((st && st.total) || 0) + ' 段）</b>'
+    + '<table style="margin-top:6px; font-size:12px;"><tr style="color:var(--text-muted);"><td style="padding:2px 12px 2px 0;">维度</td><td style="padding:2px 8px;">精确率</td><td style="padding:2px 8px;">召回</td><td style="padding:2px 8px;">F1</td><td style="padding:2px 8px;">金标数</td><td style="padding:2px 8px;">模型报出</td></tr>'
+    + CLIP_BENCH_DIMS.map(function (d) {
+        const a = prf[d.key] || {};
+        return '<tr><td style="padding:2px 12px 2px 0;">' + d.cn + '</td><td style="padding:2px 8px;">' + _pc(a.precision) + '</td><td style="padding:2px 8px;">' + _pc(a.recall) + '</td><td style="padding:2px 8px;">' + _pc(a.f1) + '</td><td style="padding:2px 8px;">' + (a.gt_count || 0) + '</td><td style="padding:2px 8px;">' + (a.pred_count || 0) + '</td></tr>';
+      }).join('') + '</table>'
+    + '<b style="font-size:13px;">事件类别 P/R/F1（段级多标签）</b>'
+    + '<table style="margin-top:6px; font-size:12px;"><tr style="color:var(--text-muted);"><td style="padding:2px 12px 2px 0;">事件</td><td style="padding:2px 8px;">精确率</td><td style="padding:2px 8px;">召回</td><td style="padding:2px 8px;">F1</td><td style="padding:2px 8px;">TP</td><td style="padding:2px 8px;">FP</td><td style="padding:2px 8px;">FN</td></tr>'
+    + (Object.keys(evs).length ? Object.keys(evs).map(function (e) {
+        const a = evs[e];
+        return '<tr><td style="padding:2px 12px 2px 0;">' + e + '</td><td style="padding:2px 8px;">' + _pc(a.precision) + '</td><td style="padding:2px 8px;">' + _pc(a.recall) + '</td><td style="padding:2px 8px;">' + _pc(a.f1) + '</td><td style="padding:2px 8px;">' + a.tp + '</td><td style="padding:2px 8px; color:var(--warning);">' + a.fp + '</td><td style="padding:2px 8px; color:var(--danger);">' + a.fn + '</td></tr>';
+      }).join('') : '<tr><td style="color:var(--text-muted);">暂无事件标注</td></tr>') + '</table>'
+    + '<div style="color:var(--text-muted); margin-top:4px;">真值=人工标注 · 模型=被测 · 不一致明细见 workspace/clip_benchmark 文件</div>';
+  el.style.display = 'block';
+}
+</script>
+
+
+<!-- ===== 通用图片查看器：滚轮缩放 / 拖动平移 / ←→ 翻页 / 0 复位 / Esc 关闭 ===== -->
+<div id="imgViewer" style="display:none; position:fixed; inset:0; z-index:10070; background:rgba(0,0,0,0.95);">
+  <div id="ivStage" style="position:absolute; inset:0; overflow:hidden; display:flex; align-items:center; justify-content:center; cursor:grab;">
+    <img id="ivImg" src="" draggable="false" style="max-width:100%; max-height:100%; transform-origin:0 0; user-select:none; pointer-events:none;">
+  </div>
+  <button onclick="ivClose()" style="position:absolute; top:14px; right:18px; padding:6px 14px; font-size:14px; background:rgba(30,41,59,.9); color:#e2e8f0; border:1px solid rgba(148,163,184,.4); border-radius:6px; cursor:pointer;">✕ 关闭 (Esc)</button>
+  <div id="ivBar" style="position:absolute; bottom:0; left:0; right:0; padding:12px 16px; text-align:center; color:#cbd5e1; font-size:13px; background:linear-gradient(transparent, rgba(0,0,0,.8)); pointer-events:none;">
+    <b id="ivInfo"></b>
+    <span style="margin-left:16px; color:#94a3b8;">滚轮/±缩放 · 拖动平移 · ← → 翻页 · 0 复位 · Esc 关闭</span>
+  </div>
+</div>
+<script>
+let _iv = { urls: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0 };
+function ivOpen(urls, idx) {
+  _iv.urls = (urls || []).filter(Boolean);
+  if (!_iv.urls.length) return;
+  _iv.i = Math.max(0, Math.min(idx || 0, _iv.urls.length - 1));
+  document.getElementById('imgViewer').style.display = 'block';
+  ivShow();
+}
+function ivShow() {
+  const img = document.getElementById('ivImg');
+  img.style.opacity = '0.4';
+  img.onload = function () { img.style.opacity = '1'; };
+  img.src = _iv.urls[_iv.i];
+  _iv.scale = 1; _iv.tx = 0; _iv.ty = 0;
+  ivApply();
+  const info = document.getElementById('ivInfo');
+  if (info) info.textContent = '第 ' + (_iv.i + 1) + ' / ' + _iv.urls.length + ' 张';
+}
+function ivApply() {
+  const img = document.getElementById('ivImg');
+  img.style.transform = 'translate(' + _iv.tx + 'px,' + _iv.ty + 'px) scale(' + _iv.scale + ')';
+  img.style.maxWidth = _iv.scale > 1 ? 'none' : '100%';
+  img.style.maxHeight = _iv.scale > 1 ? 'none' : '100%';
+  const st = document.getElementById('ivStage');
+  if (st) st.style.cursor = _iv.scale > 1 ? 'grab' : 'default';
+}
+function ivStep(d) {
+  if (!_iv.urls.length) return;
+  _iv.i = (_iv.i + d + _iv.urls.length) % _iv.urls.length;
+  ivShow();
+}
+function ivZoomAt(factor, cx, cy) {
+  const ns = Math.min(20, Math.max(0.2, _iv.scale * factor));
+  _iv.tx = cx - (cx - _iv.tx) * (ns / _iv.scale);
+  _iv.ty = cy - (cy - _iv.ty) * (ns / _iv.scale);
+  _iv.scale = ns;
+  ivApply();
+}
+function ivClose() {
+  document.getElementById('imgViewer').style.display = 'none';
+  _iv.urls = [];
+}
+(function initImageViewer() {
+  const stage = document.getElementById('ivStage');
+  if (!stage) return;
+  stage.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    const r = stage.getBoundingClientRect();
+    ivZoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  stage.addEventListener('mousedown', function (e) {
+    if (_iv.scale <= 1) return;
+    _iv.drag = true; _iv.sx = e.clientX - _iv.tx; _iv.sy = e.clientY - _iv.ty;
+    stage.style.cursor = 'grabbing';
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (!_iv.drag) return;
+    _iv.tx = e.clientX - _iv.sx; _iv.ty = e.clientY - _iv.sy;
+    ivApply();
+  });
+  window.addEventListener('mouseup', function () {
+    if (_iv.drag) {
+      _iv.drag = false;
+      const st = document.getElementById('ivStage');
+      if (st) st.style.cursor = _iv.scale > 1 ? 'grab' : 'default';
+    }
+  });
+  stage.addEventListener('dblclick', function () { _iv.scale = 1; _iv.tx = 0; _iv.ty = 0; ivApply(); });
+})();
+window.addEventListener('keydown', function (e) {
+  const v = document.getElementById('imgViewer');
+  if (!v || v.style.display !== 'block') return;
+  if (e.key === 'ArrowRight') { e.preventDefault(); ivStep(1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); ivStep(-1); }
+  else if (e.key === 'Escape') { e.preventDefault(); ivClose(); }
+  else if (e.key === '0') { _iv.scale = 1; _iv.tx = 0; _iv.ty = 0; ivApply(); }
+  else if (e.key === '+' || e.key === '=') { ivZoomAt(1.2, 400, 300); }
+  else if (e.key === '-') { ivZoomAt(1 / 1.2, 400, 300); }
+});
+</script>
+
 </body>
 </html>

@@ -1087,9 +1087,42 @@ def sync_asset_records_to_db(project_name: str, records: List[dict],
         if not pending:
             return {"assets": 0, "sources": 0, "skipped": skipped}
         src_map = _sources_by_basename(db, proj.id, set(p[3] for p in pending))
+        # ⚠️ 逐帧网盘探测是**延迟受限**的（CIFS 上每次 exists + getsize + PIL 读头部要几到几十毫秒），
+        # 串行做 2000 帧实测要 19.1 秒 —— 这正是"向量化每批 58s 里编码只占 33s"的那十几秒，
+        # 而每批的探测其实是同一批帧的**第二次读盘**（刚被向量化读过一遍）。
+        # 所以：① 向量化写入的记录已自带 width/height/file_size（编码时顺手带的）→ 直接免掉探测；
+        #       ② 确实要探测的（直导/补登记等老路径）改成并发，只把等待叠起来，结果完全不变。
         probes = {}
+        _need = []
         for p in pending:
-            probes[p[0]] = _probe_image_meta(p[1])      # 逐帧网盘探测，此刻还没有写事务
+            _r = p[6]
+            try:
+                _w0 = int(_r.get("width") or 0)
+                _h0 = int(_r.get("height") or 0)
+                _s0 = int(_r.get("file_size") or 0)
+            except Exception:
+                _w0 = _h0 = _s0 = 0
+            if _w0 and _s0:
+                probes[p[0]] = (_s0, _w0, _h0)      # 编码时已带回，免探测
+            else:
+                _need.append(p)
+        try:
+            _pw = int(os.environ.get("AD_PROBE_WORKERS", "8"))
+        except Exception:
+            _pw = 8
+        if _need and _pw > 1 and len(_need) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            try:
+                with ThreadPoolExecutor(max_workers=min(_pw, 32)) as _ex:
+                    for _item, _res in zip(_need, _ex.map(lambda x: _probe_image_meta(x[1]), _need)):
+                        probes[_item[0]] = _res
+            except Exception as _e:
+                print(f"[sync] 并发探测失败，退回串行: {_e}")
+                for p in _need:
+                    probes.setdefault(p[0], _probe_image_meta(p[1]))
+        elif _need:
+            for p in _need:
+                probes[p[0]] = _probe_image_meta(p[1])      # 逐帧网盘探测，此刻还没有写事务
 
         # ---- 第二段：纯 DB 写，一次 flush + 一次 commit ----
         new_sources = 0

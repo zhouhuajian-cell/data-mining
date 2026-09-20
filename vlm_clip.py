@@ -35,7 +35,7 @@ def build_clip_prompt():
         return "/".join((dims.get(dim) or {}).get("values") or [])
 
     return (
-        "你是自动驾驶场景分析专家。以下5张图片是从同一段视频按固定间隔抽取的帧"
+        "你是自动驾驶场景分析专家。以下多张图片是从同一段视频按固定间隔抽取的帧"
         "（原始帧号递增，彼此可能相隔若干帧，不是相邻帧），"
         "按时间顺序为 Frame 1 → Frame 2 → Frame 3 → Frame 4 → Frame 5。\n"
         "请基于多帧之间的变化进行判断（不要只看单帧，位置/朝向/与自车距离的变化就是事件证据），"
@@ -254,8 +254,11 @@ def parse_and_validate(text):
     }
 
 
-def predict_clip(vlm_model, vlm_processor, frame_paths, device="cuda", max_pixels_imgsz=None, max_new_tokens=1024):
-    """5帧Clip多图推理。返回 (validated_result, raw_text)。失败返回 (None, raw)"""
+def predict_clip(vlm_model, vlm_processor, frame_paths, device="cuda", max_pixels_imgsz=None, max_new_tokens=1024, det_by_path=None):
+    """5帧Clip多图推理。返回 (validated_result, raw_text)。失败返回 (None, raw)
+
+    det_by_path: {帧路径: 检测摘要文本}（可选）—— 段内帧的 YOLO/DINO 检测结果注入提示词，
+    让 VLM 的场景/事件判断以真实检测为依据（2026-09-19 重构：检测与 VLM 分工的落点）。"""
     from PIL import Image
     if max_pixels_imgsz is None:
         # 与 app.py 的处理器构造读同一个变量：这里传参会覆盖处理器上的设置，
@@ -264,22 +267,39 @@ def predict_clip(vlm_model, vlm_processor, frame_paths, device="cuda", max_pixel
     # 这行才是真正的分辨率瓶颈：PIL 先把帧缩到 640 以内(1920x1080 -> 640x360 ≈ 23万像素)，
     # 远低于处理器上限，导致调 AD_VLM_MAX_PX 完全不生效。要提细节必须同时放大这里。
     _thumb = int(os.environ.get("AD_VLM_THUMB", "1024"))
-    rep = sample_representative(frame_paths, 5)
+    _n = int(os.environ.get("AD_CLIP_PICK", "10"))   # 段内送 VLM 帧数（2026-09-19: 5→10，配合 512px）
+    rep = sample_representative(frame_paths, _n)
     images = []
+    _kept = []   # 与 images 一一对应的原始路径（检测摘要按它对齐）
     for p in rep:
         try:
             im = Image.open(p).convert("RGB")
             im.thumbnail((_thumb, _thumb))
             images.append(im)
+            _kept.append(p)
         except Exception:
             continue
     if not images:
         return None, ""
 
+    _prompt = build_clip_prompt()
+    if det_by_path:
+        _notes = []
+        for _i, p in enumerate(_kept, 1):
+            _n = (det_by_path.get(p) or "").strip()
+            _notes.append("Frame %d: %s" % (_i, _n or "检测器未输出目标"))
+        _prompt += (
+            "\n\n附：目标检测器(YOLO)对上述各帧的输出：\n" + "\n".join(_notes) + "\n"
+            "强制规则：objects 与 events 的判断必须与上述检测结果一致——\n"
+            "某类目标在任何 Frame 都未被检测到时，禁止报告涉及该目标的事件；\n"
+            "报告「行人横穿/非机动车横穿」要求至少两个 Frame 检测到该目标且画面位置明显移动；\n"
+            "检测与你的观察冲突时，以检测为准并在 evidence 中说明。\n"
+        )
+
     conversation = [{
         "role": "user",
         "content": [{"type": "image"}] * len(images)
-                   + [{"type": "text", "text": build_clip_prompt()}],
+                   + [{"type": "text", "text": _prompt}],
     }]
     text = vlm_processor.apply_chat_template(
         conversation, tokenize=False, add_generation_prompt=True)

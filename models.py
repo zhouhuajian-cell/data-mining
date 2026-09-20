@@ -36,6 +36,22 @@ engine = create_engine(
     echo=False,  # 调试时改 True
 )
 
+# SQLite 性能 pragmas（每个新连接生效）。
+# 千万级路线图（见 STATE.md）：单写者 + 本地 NVMe 下 SQLite 就是最快的库，
+# 这里把连接层调到匹配 —— synchronous=NORMAL 是 WAL 的标准配套（提交不再逐次 fsync，
+# 崩溃一致性由 WAL 保证，最多丢最后一笔事务；本库另有每日备份+帧可重抽，可接受），
+# cache 256MB 匹配 680MB~数 GB 的库体，mmap 让大范围读走页缓存。
+from sqlalchemy import event as _sa_event
+
+@_sa_event.listens_for(engine, "connect")
+def _sqlite_pragmas(dbapi_conn, _rec):
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA cache_size=-262144")          # 256MB 页缓存
+    cur.execute("PRAGMA temp_store=MEMORY")
+    cur.execute("PRAGMA mmap_size=1073741824")        # 1GB mmap 读
+    cur.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -651,8 +667,14 @@ def migrate_from_json(db: Session, projects_root: str):
     # 2. 迁移检测缓存
     cache_path = os.path.join(DATA_ROOT, "detections_cache.json")
     if os.path.exists(cache_path):
-        with open(cache_path, "r", encoding="utf-8") as f:
-            detections_cache = json.load(f)
+        # 容错：该文件曾在写入被重启打断后截断（2026-09-19 21:20 崩溃循环）——
+        # 损坏就跳过（检测数据以 DB assets.detections 为准），绝不让启动崩溃
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                detections_cache = json.load(f)
+        except Exception as _e:
+            print(f"[Migration] ⚠️ detections_cache.json 损坏已跳过: {_e}")
+            detections_cache = {}
         
         for proj_name, proj_cache in detections_cache.items():
             project = db.query(Project).filter(Project.name == proj_name).first()
