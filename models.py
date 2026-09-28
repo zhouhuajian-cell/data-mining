@@ -240,6 +240,10 @@ class Asset(Base):
     __table_args__ = (
         Index("ix_asset_status_project", "status", "project_id"),
         Index("ix_asset_decision", "decision_status"),
+        # 三列覆盖索引：待审计数用 (status='REVIEW' OR decision_status='REVIEW') 这种跨列 OR，
+        # 没它就得回表逐行取这两列（南美 826k 行实测 0.24s），有它纯索引回答 → 0.03s。
+        # 审核队列与仪表盘概览直接吃这个收益。
+        Index("ix_assets_proj_status_decision", "project_id", "status", "decision_status"),
     )
 
     def __repr__(self):

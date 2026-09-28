@@ -140,6 +140,73 @@ os.makedirs(PROJECTS_ROOT, exist_ok=True)
 # 迁移脚本 /tmp/_migrate_index.py 已把存量项目拷到本地并逐项校验（ntotal==metadata 条数）。
 LOCAL_INDEX_STORE = os.environ.get("AD_INDEX_STORE", os.path.join(PROJECT_DIR, "index_store"))
 os.makedirs(LOCAL_INDEX_STORE, exist_ok=True)
+# 帧图本地热缓存（用户 2026-09-24："我大部分数据只能从网盘获取…从网盘下载到本地，然后读效率比较低"）。
+# 实测网盘取一帧 572KB 要 ~18ms（≈31MB/s 单文件），而向量化算一帧只要 4ms —— **读比算慢**；
+# 且处理链路对同一帧反复读（向量化→检测→VLM→缩略图→审核页），所以本地留一份很划算。
+# AD_FRAME_HOT 指向缓存根，**空/未设 = 完全关闭**（行为与改动前一致）；AD_FRAME_HOT_GB 限总量，按最久未访问淘汰。
+_FRAME_HOT = os.environ.get("AD_FRAME_HOT", "").strip()
+_FRAME_HOT_GB = float(os.environ.get("AD_FRAME_HOT_GB", "200") or 200)
+_FRAME_HOT_PREFIX = ("/mnt/",)   # 只对网盘路径生效；本地路径原样返回
+_HOT_STATE = {"added": 0}
+def _hot_prune():
+    """超预算时按最久未访问淘汰。**只删本地缓存目录，绝不碰网盘。**
+    每累计新增 2GB 才做一次全量统计 —— 否则每搬一帧就 walk 几万个文件，反而更慢。"""
+    if not _FRAME_HOT or not os.path.isdir(_FRAME_HOT) or _HOT_STATE["added"] < 2 * 1024 ** 3:
+        return
+    try:
+        items, total = [], 0
+        for _r, _d, _fs in os.walk(_FRAME_HOT):
+            for _f in _fs:
+                if ".tmp" in _f:
+                    continue
+                _p = os.path.join(_r, _f)
+                try:
+                    _st = os.stat(_p)
+                except Exception:
+                    continue
+                total += _st.st_size
+                items.append((getattr(_st, "st_atime", _st.st_mtime), _st.st_size, _p))
+        budget = int(_FRAME_HOT_GB * 1024 ** 3)
+        if total <= budget:
+            _HOT_STATE["added"] = 0
+            return
+        items.sort()
+        for _a, _s, _p in items:
+            if total <= budget * 0.9:      # 多清 10%，免得刚清完又超
+                break
+            try:
+                os.remove(_p)
+                total -= _s
+            except Exception:
+                pass
+        _HOT_STATE["added"] = 0
+    except Exception:
+        pass
+def _hot_path(path: str) -> str:
+    """网盘帧路径 → 本地缓存路径（未命中先搬一份）。任何异常都**回退成原路径**：
+    这层只允许让读变快，绝不允许让读失败。"""
+    if not _FRAME_HOT or not path:
+        return path
+    try:
+        if not path.startswith(_FRAME_HOT_PREFIX):
+            return path
+        dst = os.path.join(_FRAME_HOT, path.lstrip("/").replace("..", "_"))
+        # ⚠️ 包含性校验：绝对路径（如带盘符/以 / 开头）喂给 os.path.join 会**直接顶掉缓存根**，
+        #    等于原地覆盖源文件 —— 测试实测踩到（2026-09-24）。落到缓存外就放弃缓存、返回原路径。
+        _root = os.path.abspath(_FRAME_HOT) + os.sep
+        if not os.path.abspath(dst).startswith(_root):
+            return path
+        if os.path.exists(dst):
+            return dst
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = "%s.tmp%d" % (dst, os.getpid())   # 先写临时名再 os.replace：多 worker 并发安全
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, dst)
+        _HOT_STATE["added"] += os.path.getsize(dst)
+        _hot_prune()
+        return dst
+    except Exception:
+        return path
 LOG_DIR = os.environ.get("AD_LOG_DIR", os.path.join(PROJECT_DIR, "logs"))
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_RETENTION_DAYS = 30
@@ -362,6 +429,8 @@ dino_model = None
 dino_processor = None
 yolo_model = None
 project_cache = {}
+yoloworld_model = None
+sign_model = None          # 闭集交通标志模型（2026-09-23 接入；AD_SIGN_MODEL/AD_SIGN_ON 可关）
 # ---- YOLO 按需懒加载：用得少就让它不常驻，把显存让给 DINO 等主力模型 ----
 def _ensure_yolo():
     """按需加载 YOLO，返回是否就绪。"""
@@ -721,13 +790,24 @@ def make_room_for(model: str, need_gb: float = 2.0):
     """显存互斥调度：加载 model 前把与之不能共存的模型全部释放并归还显存。
     12G 卡上 VLM(7B-4bit 约 8G) 与 SigLIP/DINO/YOLO 尽量不共存。
     返回腾完后的可用显存(GB)。"""
-    keep = {"vlm": ("siglip", "dino", "yolo"), "siglip": ("vlm", "dino"),
-            "dino": ("vlm", "yolo"), "yolo": ("vlm", "dino")}.get(model, ("vlm", "siglip", "dino", "yolo"))
+    keep = {"vlm": ("siglip", "dino", "yolo", "yoloworld", "sign"), "siglip": ("vlm", "dino"),
+            "dino": ("vlm", "yolo"), "yolo": ("vlm", "dino"),
+            # ⚠️ 2026-09-22 优化：**YOLO-World（约 1.5G）在检测阶段常驻**（不被 yolo/dino 驱逐，
+            # 否则每个检测批次都要重载一次、每次 17 秒 ≈ 全量白烧 5 小时）。
+            # ⚠️ 但**加载 VLM 时必须驱逐它**（上面 "vlm" 的名单里加了 yoloworld）：
+            # 实测不驱逐会 OOM —— VLM 推理要 2.4G 余量，VLM+YW+碎片只剩 1.89G，
+            # 日志 "CUDA out of memory. Tried to allocate 2.41 GiB ... 1.89 GiB free"。
+            # 而且**判定阶段本来不需要 YW 驻留**（判定只读检测阶段存下的记录）→ 驱逐零代价。
+            # 实测：VLM+YW 共存 6948/12282 MiB；YOLO 那一趟本来就会驱逐 VLM(6G)，
+            # 所以 YOLO(6G)+YW(1.5G)=7.5G 也放得下。
+            # 之前把它挂在 yolo/dino 的驱逐名单里 → **每个检测批次都卸载重载一次、每次 17 秒**，
+            # 全量 209k 帧 ≈ 1046 批 × 17 秒 ≈ **5 小时纯白烧**（2026-09-22 从日志实测抓到）。
+            "yoloworld": (), "sign": ()}.get(model, ("vlm", "siglip", "dino", "yolo"))
     if "vlm" in keep:
         _free_vlm()
     if "siglip" in keep:
         _free_siglip()
-    for _m in ("dino", "yolo"):
+    for _m in ("dino", "yolo", "yoloworld", "sign"):
         if _m in keep:
             fn = globals().get("_free_" + _m)
             if callable(fn):
@@ -849,8 +929,10 @@ class SigLIPImageDataset(
         return len(self.file_paths)
     def __getitem__(self, idx):
         path = self.file_paths[idx]
+        # 读走本地热缓存（见 _hot_path），但**返回的仍是网盘原路径** —— 它是入库主键，
+        # 换成缓存路径会让 asset 指向本地、交付/备份全错位。
         try:
-            with open(path, "rb") as f:
+            with open(_hot_path(path), "rb") as f:
                 try:
                     _sz = os.fstat(f.fileno()).st_size   # 顺手拿，省掉入库时再开一次文件
                 except Exception:
@@ -1189,6 +1271,54 @@ def read_index():
     if os.path.exists(legacy):
         return FileResponse(legacy, headers=_nocache)
     return {"msg": "front.html 不存在"}
+# ===== 抽样/看板报告页（生成脚本写到 reports/<name>.html）+ 人工结论录入 =====
+# 为什么要从服务端提供：报告页在本地用 file:// 打开时，页面里的 /api/image 图片与
+# /api/label_note 会变成**跨源请求**被浏览器拦掉（用户实测反馈「看不了图片」）；
+# 走 /report/<name> 同源打开，图片与保存结论都正常。
+_REPORTS_DIR = os.path.join(PROJECT_DIR, "reports")
+# ⚠️ 结论文件放**本地 reports/**，不要用 WORKSPACE：WORKSPACE 跟数据根走（服务器上是 NAS），
+# CIFS 写起来慢、还删不掉；这份文件既小又要被我直接读取，本地最稳。
+_LABEL_NOTES = os.path.join(_REPORTS_DIR, "label_notes.jsonl")
+@app.get("/report/{name}")
+def serve_report(name: str):
+    _safe = re.sub(r"[^a-zA-Z0-9_\-]", "", name or "")
+    _p = os.path.join(_REPORTS_DIR, _safe + ".html")
+    if not _safe or not os.path.exists(_p):
+        return {"code": 404, "msg": "报告不存在: %s" % _safe}
+    from fastapi.responses import FileResponse as _FR
+    return _FR(_p, headers={"Cache-Control": "no-cache, must-revalidate"})
+@app.post("/api/label_note")
+def label_note(page: str = Form(""), clip_id: str = Form(...), verdict: str = Form(""),
+               note: str = Form("")):
+    """人工看样本时给的结论，**追加写 JSONL**。
+
+    追加而不是读改写 JSON：崩溃/并发都不会毁掉已有结论（代价是同一段会有多行，读时取最后一条）。"""
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "page": page, "clip_id": clip_id,
+           "verdict": verdict, "note": (note or "")[:2000]}
+    try:
+        os.makedirs(WORKSPACE, exist_ok=True)
+        with open(_LABEL_NOTES, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return {"code": 500, "msg": "写入失败: %s" % e}
+    return {"code": 200, "msg": "已记录", "rec": rec}
+@app.get("/api/label_notes")
+def label_notes(page: str = Query("")):
+    """读回已存的结论（报告页打开时回显）。同一 clip 取**最后一条**。"""
+    out = {}
+    try:
+        with open(_LABEL_NOTES, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if page and r.get("page") != page:
+                    continue
+                out[r.get("clip_id")] = r
+    except Exception:
+        pass
+    return {"code": 200, "total": len(out), "notes": out}
 @app.get("/api/projects")
 def list_projects():
     if DB_PATCH_AVAILABLE:
@@ -1963,6 +2093,35 @@ async def get_all_tasks_status(project: str = Query(None)):
                     "msg": "段级判定中… 已判 %d/%d%s" % (_dn, _tt, "（已发中止，本段结束后停）" if _stop else ""),
                     "current_path": "clip_judge:%s" % _jp,
                     "processed_count": _dn, "total_count": _tt,
+                }
+    except Exception:
+        pass
+    # 1.6) **重跑类任务**（重检测+重判定）自己的状态文件 —— 2026-09-23 加。
+    # 为什么另开一个文件：`clip_judge_status.json` 在前端被硬编码成「段级判定(VLM)」，
+    # 而重跑的**检测阶段**进度单位是**帧**，复用那个文件会把"检测 14000 帧"显示成"已判 14000 段"
+    # （用户 2026-09-23 当场发现："这是帧判断吧，任务名称搞错了"）。
+    # 用户 2026-09-23 定命名：**检测阶段叫「YOLO检测」、判定阶段叫「VLM检测」** ——
+    # 所以按阶段给**不同的 task_type**（sign_detect / sign_judge），标题各归各位，不再混。
+    try:
+        _rsp = os.path.join(PROJECT_DIR, "workspace", "tsr_rerun_status.json")
+        if os.path.exists(_rsp):
+            with open(_rsp, encoding="utf-8") as _f:
+                _rs = json.load(_f) or {}
+            _rp = _rs.get("project") or ""
+            _fresh = (time.time() - float(_rs.get("ts") or 0)) < 300
+            _tt_ok = ("sign_detect", "sign_judge")     # 白名单：只认这两种，别让文件内容决定一切
+            _tt = _rs.get("task_type")
+            if _tt not in _tt_ok:
+                _tt = "sign_detect"
+            if _rs.get("running") and _fresh and ((not project) or project == _rp):
+                _dn, _tt_n = int(_rs.get("done") or 0), int(_rs.get("total") or 0)
+                _unit = _rs.get("unit") or ""
+                pool["%s:%s" % (_tt, _rp)] = {
+                    "project": _rp, "task_type": _tt, "is_running": True,
+                    "is_cancelled": False,
+                    "msg": "%s %d/%d%s" % (_rs.get("phase") or "处理", _dn, _tt_n, _unit),
+                    "current_path": "%s:%s" % (_tt, _rp),
+                    "processed_count": _dn, "total_count": _tt_n,
                 }
     except Exception:
         pass
@@ -4073,12 +4232,16 @@ def yolo_detect(project: str = Form("default"), image_id: int = Form(...)):
         w, h = image.size
         results = yolo_model(image, verbose=False, device=DEVICE)[0]
         cls_indices = results.boxes.cls.cpu().numpy().astype(int).tolist()
+        _sc = results.boxes.conf.cpu().numpy().tolist()
+        _lb = [results.names[idx] for idx in cls_indices]
+        _bx = results.boxes.xyxy.cpu().numpy().tolist()
+        _K = _yolo_keep(_lb, _sc)          # 按类别阈值过滤（见 _yolo_keep）
         res = {
             "image_id": image_id,
             "engine": "yolo",
-            "scores": results.boxes.conf.cpu().numpy().tolist(),
-            "labels": [results.names[idx] for idx in cls_indices],
-            "boxes": results.boxes.xyxy.cpu().numpy().tolist(),
+            "scores": [_sc[i] for i in _K],
+            "labels": [_lb[i] for i in _K],
+            "boxes": [_bx[i] for i in _K],
             "width": w,
             "height": h,
         }
@@ -4211,12 +4374,16 @@ def _yolo_detect_batch_locked(
                         continue
                     w, h = _sizes.get(_idx, (1920, 1080))
                     cls_indices = r.boxes.cls.cpu().numpy().astype(int).tolist()
+                    _sc = r.boxes.conf.cpu().numpy().tolist()
+                    _lb = [r.names[c] for c in cls_indices]
+                    _bx = r.boxes.xyxy.cpu().numpy().tolist()
+                    _K = _yolo_keep(_lb, _sc)      # ⚠️ 批量路径也必须过滤（pipeline 走的就是这条）
                     res = {
                         "image_id": _idx,
                         "engine": "yolo",
-                        "scores": r.boxes.conf.cpu().numpy().tolist(),
-                        "labels": [r.names[c] for c in cls_indices],
-                        "boxes": r.boxes.xyxy.cpu().numpy().tolist(),
+                        "scores": [_sc[i] for i in _K],
+                        "labels": [_lb[i] for i in _K],
+                        "boxes": [_bx[i] for i in _K],
                         "width": w,
                         "height": h,
                     }
@@ -4227,6 +4394,14 @@ def _yolo_detect_batch_locked(
                     continue
             del _arr, _items      # 及时释放这一块的 BGR 数组（每张 1080p 约 6MB）
         _persist_detections()  # 全部块跑完一次落盘，避免逐张反复写文件
+    # 用户 2026-09-22：检测阶段顺带跑一趟 YOLO-World（开放词表：目标物 + 设施）。
+    # 用户 2026-09-23：闭集标志模型也接进检测阶段（"牌子这一路换成它"），并**合并成一次跑**：
+    #   两路共用一次读盘/解码（原先是各读一遍，实测 0.46 秒/帧里约 0.15~0.2 秒是重复 IO）。
+    #   合并函数内部保证：闭集在 YW 之后处理同一帧 → 摘掉 YW 的牌子框（不并存）。
+    try:
+        _yw_sign_batch_fill(project, list(out.keys()))
+    except Exception as _e:
+        _log("[检测] 开放词表+闭集标志 批量失败(不影响 YOLO): %s" % str(_e)[:140])
     return {"code": 200, "results": out, "count": len(out)}
 @app.post("/api/dino_detect_batch")
 def dino_detect_batch(
@@ -4375,6 +4550,589 @@ def _dino_detect_batch_locked(
         print(f"[!] DINO 批量推理异常: {e}")
         return {"code": 500, "msg": f"DINO 批量推理异常: {e}", "results": {}}
     return {"code": 200, "results": out, "count": len(out)}
+
+@app.post("/api/yoloworld_detect_batch")
+def yoloworld_detect_batch(project: str = Form("default"), image_ids: str = Form(...),
+                           text_prompt: str = Form(...)):
+    """YOLO-World 开放词表批量检测（与 DINO 同一套交互，但**快两个数量级**）。
+
+    与 DINO 的差别（2026-09-22 用户要求加这个按钮）：
+      - 模型是可重参数化的**开放词表**检测器：`set_classes(短语列表)` 之后按普通 YOLO 速度推理
+        （实测 CPU 0.32 秒/帧、GPU 更快；DINO 是 13 秒/帧）；
+      - 一次请求内**分块**推理（每 AD_YW_CHUNK 帧一块、每块打一行日志）——
+        实测：一次喂几百帧会把请求**挂死**（HTTP 连着但 0 字节待发、GPU 0% 利用率），必须分块；
+      - 结果形状与 DINO 完全一致（只把 engine 换成 "yoloworld"），所以前端那套框渲染/阈值直接复用。
+    """
+    with _gpu_slot("YOLO-World 开放词检测"):
+        return _yoloworld_detect_batch_locked(project, image_ids, text_prompt)
+_YW_WEIGHTS = os.environ.get("AD_YW_WEIGHTS", os.path.join(PROJECT_DIR, "yolov8m-worldv2.pt"))
+_YW_CHUNK = int(os.environ.get("AD_YW_CHUNK", "60"))
+def _yw_on():
+    """YOLO-World 是否启用。用户 2026-09-28 先让停、随即改口"不要停" → **默认开**（与原行为一致，开关保留以便临时关）。
+    ⚠️ 用开关而不是拆代码：`AD_YW_ON=1` 一条命令即可回退。这里只读环境变量，**不能**在这里触发模型加载。"""
+    return os.environ.get("AD_YW_ON", "1") != "0"
+def _ensure_yoloworld():
+    """按需加载 YOLO-World（权重走本机文件，服务器连不上 GitHub/HF 直连，别指望它自己下）。
+
+    ⚠️ 必须走 `make_room_for`（2026-09-22 补）：否则它绕过现有显存仲裁 —— 当 YOLO(6G)/SigLIP/DINO
+    已驻留时直接加载会挤爆（就是 AGENTS.md 记的 OOM 雪崩那类）。它与 VLM 实测可共存，不驱逐 VLM。
+    """
+    global yoloworld_model
+    if not _yw_on():
+        return False                      # AD_YW_ON=0 时才走到这（默认开、与原行为一致）
+    if yoloworld_model is not None:
+        return True
+    if not os.path.exists(_YW_WEIGHTS):
+        _log("[检测] YOLO-World 权重缺失: %s" % _YW_WEIGHTS)
+        return False
+    try:
+        make_room_for("yoloworld", 2.0)
+    except Exception:
+        pass
+    try:
+        from ultralytics import YOLOWorld
+        yoloworld_model = YOLOWorld(_YW_WEIGHTS)
+    except Exception as e:
+        _log("[检测] YOLO-World 加载失败: %s" % str(e)[:160])
+        yoloworld_model = None
+        return False
+    # ⚠️ 2026-09-22 实测踩的坑：`set_classes` 反复调用会**时好时坏** ——
+    #    "Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!"
+    #    而它一失败，调用方就静默返回"没有这一路证据" → 大幅检测白跑（9,288 帧一条 YW 结果都没写）。
+    #    `_YWL_CLASSES` 是固定常量，所以**只在加载时设一次**，之后复用；这里失败就响亮返回 False。
+    try:
+        yoloworld_model.set_classes(_YWL_CLASSES)
+        _log("[检测] YOLO-World 已加载并设好 %d 个类别: %s" % (len(_YWL_CLASSES), _YW_WEIGHTS))
+        return True
+    except Exception as e:
+        _log("[检测] YOLO-World set_classes 失败(整路不可用): %s" % str(e)[:160])
+        yoloworld_model = None
+        return False
+def _free_yoloworld():
+    """释放 YOLO-World 占用的显存（与 YOLO/DINO 不共存；与 VLM 可共存，不需要就不调）。"""
+    global yoloworld_model
+    if yoloworld_model is None:
+        return
+    yoloworld_model = None
+    if DEVICE == "cuda":
+        try:
+            torch.cuda.empty_cache()   # 不归还显存的话下一次加载仍可能 OOM
+        except Exception:
+            pass
+    _log("[GPU] YOLO-World 已卸载释放显存")
+# ===== 闭集交通标志模型（2026-09-23 接入，用户选「A：牌子这一路换成它」）=====
+# 为什么换：开放词表（YOLO-World/DINO）判断不了"这是不是一块**道路**上的交通标志"，把广告牌也报出来。
+# 自有帧验收（欧洲 40 段有标识 + 40 段真无标识，页面 reports/tsr_ba_*.html）：
+#   段级误检 **98% → 32%**（现状 YW 在真无标识段里几乎逢段必报），
+#   段级召回 @conf0.15 **95%**（tsr_s16；val mAP50 0.691，同口径下优于 tsr_n 的 0.678）。
+# 存储约定：与 yolo/yoloworld 合并成**同一条记录**，这类框带 `src="sign"`；判定只读、不再现场跑模型。
+_SIGN_WEIGHTS = os.environ.get("AD_SIGN_MODEL", os.path.join(PROJECT_DIR, "tsr_sign.pt"))
+_SIGN_CONF = float(os.environ.get("AD_SIGN_CONF", "0.15"))   # 实测 0.15 比 0.25 召回 +5%、误检仅 +6%
+# 闭集 7 类 → 本体 traffic_sign 的值（限速/红绿灯 是既有值，其余 4 个是 2026-09-23 新增语义值）
+_SIGN_MAP = {"speed_limit": "限速", "prohibition": "禁令标志", "warning": "警告标志",
+             "mandatory": "指示标志", "guide": "指路标志", "signal": "红绿灯",
+             "crosswalk": "交通标识牌"}
+# **语义补值的门槛与"有没有牌子"分开**（2026-09-23 用户定：≥2 帧 且 conf≥0.30）：
+# 检测阶段 `_SIGN_CONF=0.15` 该宽松（保召回）；但"是哪类牌子"该严格 —— 段级值是**所有帧的并集**，
+# 单帧偶发误检会把广告牌（实测 KFC 风格店招能到 0.75）写成整段的语义。
+# 实测：阈值 0.15→0.30 且要求 ≥2 帧后，每段平均语义值 3.9 → **2.5**；禁令标志 90% → 73% 段。
+_SIGN_SEM_CONF = float(os.environ.get("AD_SIGN_SEM_CONF", "0.30"))
+_SIGN_SEM_MIN_FRAMES = _env_int("AD_SIGN_SEM_MIN_FRAMES", 2, lo=1, hi=20)
+# **替换口径**：这几个 YW 类别从此由闭集模型接管 —— 合并时把 YW 的对应框丢掉（用户明确"不要并存"）。
+# 灯类**不在**此列：红绿灯继续由 YOLO(COCO)/YW 负责（闭集模型的 signal 类只有越南 900 个框，弱）。
+_YW_SIGN_SLOT = ("traffic sign", "road sign", "speed limit sign", "no entry sign",
+                 "warning sign", "crosswalk", "zebra crossing")
+
+
+def _ensure_sign():
+    """按需加载闭集交通标志模型。**必须走 make_room_for**（别绕过显存仲裁，见 AGENTS.md 的 OOM 事故）。"""
+    global sign_model
+    if sign_model is not None:
+        return True
+    if os.environ.get("AD_SIGN_ON", "1") == "0":
+        return False
+    if not os.path.exists(_SIGN_WEIGHTS):
+        _log("[检测] 闭集标志模型权重缺失: %s（AD_SIGN_MODEL 可指定；缺则退回只跑 YOLO+YW）" % _SIGN_WEIGHTS)
+        return False
+    try:
+        make_room_for("sign", 1.0)
+    except Exception:
+        pass
+    try:
+        from ultralytics import YOLO as _YOLO_C
+        sign_model = _YOLO_C(_SIGN_WEIGHTS)
+        _log("[检测] 闭集交通标志模型已加载: %s（imgsz=%d conf>=%.2f，接管牌子这一路）"
+             % (_SIGN_WEIGHTS, _env_int("AD_SIGN_IMGSZ", 1280, lo=640, hi=1536), _SIGN_CONF))
+        return True
+    except Exception as e:
+        sign_model = None
+        _log("[检测] 闭集标志模型加载失败(退回 YOLO+YW): %s" % str(e)[:150])
+        return False
+
+
+def _free_sign():
+    global sign_model
+    if sign_model is None:
+        return
+    sign_model = None
+    if DEVICE == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    _log("[GPU] 闭集交通标志模型已卸载释放显存")
+
+
+def _sign_batch_fill(project, ids):
+    """对一批帧跑闭集交通标志模型，结果并入同帧记录（`src="sign"`），并**接管** YW 的牌子类。
+
+    返回 (写入帧数, 摘掉的 YW 牌子框数)。未就绪/失败返回 (0, 0)，不影响已有结果。
+    """
+    if not ids or not _ensure_sign():
+        return 0, 0
+    _imgsz = _env_int("AD_SIGN_IMGSZ", 1280, lo=640, hi=1536)
+    ctx = load_project_context(project)
+    M = ctx.get("metadata") or []
+    sub = detections_cache.setdefault(project or "default", {})
+    n, replaced = 0, 0
+    for _i in ids:
+        try:
+            _i = int(_i)
+        except Exception:
+            continue
+        _p = M[_i]["path"] if 0 <= _i < len(M) else None
+        if not _p or not os.path.exists(_p):
+            continue
+        try:
+            r = sign_model.predict(source=_p, imgsz=_imgsz, conf=_SIGN_CONF, verbose=False)[0]
+        except Exception as e:
+            _log("[检测] 闭集标志单帧失败(%s): %s" % (_i, str(e)[:100]))
+            continue
+        rec = dict(sub.get(str(_i)) or {})
+        _lb = list(rec.get("labels") or [])
+        _sc = list(rec.get("scores") or [])
+        _bx = list(rec.get("boxes") or [])
+        _sr = list(rec.get("src") or (["yolo"] * len(_lb)))
+        # ① 先摘掉 YW 的牌子类框（闭集接管、不并存）；灯类保留
+        _keep = [(l, c, b, s) for l, c, b, s in zip(_lb, _sc, _bx, _sr)
+                 if not (s == "yoloworld" and str(l).lower().strip() in _YW_SIGN_SLOT)]
+        replaced += len(_lb) - len(_keep)
+        _lb = [x[0] for x in _keep]; _sc = [x[1] for x in _keep]
+        _bx = [x[2] for x in _keep]; _sr = [x[3] for x in _keep]
+        # ② 闭集框入列；闭集模型的 signal 类与已有灯框重叠时让给灯（它那类样本太少，不抢）
+        _lights = [b for l, s, b in zip(_lb, _sr, _bx)
+                   if s != "sign" and _YOLO_LABEL2OBJ.get(str(l).lower()) == "红绿灯"]
+        for b in r.boxes:
+            try:
+                cf = float(b.conf[0]); nm = str(r.names[int(b.cls[0])]).lower().strip()
+            except Exception:
+                continue
+            cn = _SIGN_MAP.get(nm)
+            if not cn or cf < _SIGN_CONF:
+                continue
+            bx = [float(x) for x in b.xyxy[0].tolist()]
+            if cn == "红绿灯" and any(_iou(bx, hb) >= 0.5 for hb in _lights):
+                continue
+            _lb.append(cn); _sc.append(cf); _bx.append(bx); _sr.append("sign")
+        rec.update({"image_id": _i, "engine": ("yolo+yoloworld+sign" if _yw_on() else "yolo+sign"),
+                    "width": int(r.orig_shape[1]), "height": int(r.orig_shape[0]),
+                    "labels": _lb, "scores": _sc, "boxes": _bx, "src": _sr})
+        sub[str(_i)] = rec
+        n += 1
+    _persist_detections()
+    _log("[检测] 闭集标志批量完成 %d/%d 帧（接管并摘掉 YW 牌子框 %d 个）" % (n, len(ids), replaced))
+    return n, replaced
+
+
+def _yw_sign_batch_fill(project, ids):
+    """**一趟读完帧，同一份数组跑 YOLO-World + 闭集标志模型**（2026-09-23 效率优化）。
+
+    为什么合并（用户 2026-09-23："优化下吧，效率问题也要解决"）：
+      原来 YW 与闭集各自 `predict(source=路径)` **逐帧**跑 —— 同一张图被**读盘+解码两次**
+      （加上 YOLO 那趟批量共三次）。东南亚实测 0.46 秒/帧，其中约 0.15~0.2 秒纯粹是重复 IO+解码；
+      闭集模型本身在 1280 只要约 40ms。南美 2.4M 帧时这个差值就是几十小时。
+    现在：`_preload_bgr` 并行读**一次** → 两张模型共用同一份 numpy 数组 → 各自**批量**推理。
+
+    ⚠️ **幂等**：同一帧重跑前，先摘掉记录里**已有的** `src=="sign"` 框与 YW 牌子框 ——
+       否则重跑会把闭集框累加一遍（2026-09-23 自查发现的坑）。
+    返回 (YW 写入帧数, 摘掉/拦下的 YW 牌子框数, 闭集写入帧数)。
+    """
+    if not ids:
+        return 0, 0, 0
+    _yw_ok = _ensure_yoloworld()
+    _sg_ok = _ensure_sign()
+    if not (_yw_ok or _sg_ok):
+        return 0, 0, 0
+    ctx = load_project_context(project)
+    M = ctx.get("metadata") or []
+    sub = detections_cache.setdefault(project or "default", {})
+    sel = []
+    for _i in ids:
+        try:
+            _i = int(_i)
+        except Exception:
+            continue
+        _p = M[_i]["path"] if 0 <= _i < len(M) else None
+        if _p and os.path.exists(_p):
+            sel.append((_i, _p))
+    if not sel:
+        return 0, 0, 0
+    _szi = _env_int("AD_SIGN_IMGSZ", 1280, lo=640, hi=1536)
+    _bs = max(1, min(int(os.environ.get("AD_SIGN_BATCH", "8")), len(sel)))
+    n_yw = n_sg = replaced = 0
+    for _s in range(0, len(sel), _bs):
+        part = sel[_s:_s + _bs]
+        _items = _preload_bgr([p for _i, p in part], workers=min(8, max(1, len(part))))
+        keep = [(i, it) for (i, _p), it in zip(part, _items) if it is not None]
+        if not keep:
+            continue
+        _arr = [it[0] for _i, it in keep]
+        _idxs = [i for i, _it in keep]
+        _ry = _rs = None
+        if _yw_ok:
+            try:
+                # 与生产一致：YW 原始 conf=0.05，后面按 _YWL_CONF 过滤
+                _ry = yoloworld_model.predict(source=_arr, imgsz=1280, conf=0.02, verbose=False)
+            except Exception as e:
+                _log("[检测] YOLO-World 批量失败: %s" % str(e)[:120])
+        if _sg_ok:
+            try:
+                _rs = sign_model.predict(source=_arr, imgsz=_szi, conf=_SIGN_CONF, verbose=False)
+            except Exception as e:
+                _log("[检测] 闭集标志批量失败: %s" % str(e)[:120])
+        for _k, _i in enumerate(_idxs):
+            rec = dict(sub.get(str(_i)) or {})
+            _lb = list(rec.get("labels") or [])
+            _sc = list(rec.get("scores") or [])
+            _bx = list(rec.get("boxes") or [])
+            _sr = list(rec.get("src") or (["yolo"] * len(_lb)))
+            # ① 幂等：摘掉已有的 sign 框 + YW 牌子框（重跑不累加、牌子不再并存）
+            _keepb = [(l, c, b, s) for l, c, b, s in zip(_lb, _sc, _bx, _sr)
+                      if not (str(s) == "sign"
+                              or (str(s) == "yoloworld" and str(l).lower().strip() in _YW_SIGN_SLOT))]
+            replaced += len(_lb) - len(_keepb)
+            _lb = [x[0] for x in _keepb]; _sc = [x[1] for x in _keepb]
+            _bx = [x[2] for x in _keepb]; _sr = [x[3] for x in _keepb]
+            # ② YW 框：牌子类**直接不写**（闭集接管），其余同类 IoU>=0.5 去重后再与 YOLO 框去重
+            if _ry is not None and _k < len(_ry):
+                r = _ry[_k]
+                _yw = []
+                for b in r.boxes:
+                    try:
+                        cf = float(b.conf[0]); nm = str(r.names[int(b.cls[0])]).lower().strip()
+                    except Exception:
+                        continue
+                    if cf < _YWL_CONF:
+                        continue
+                    cn = _YWL_MAP.get(nm)
+                    if not cn:
+                        continue
+                    if nm in _YW_SIGN_SLOT:
+                        replaced += 1
+                        continue
+                    bxx = [float(x) for x in b.xyxy[0].tolist()]
+                    _dup = False
+                    for _kk, (_cn2, _nm2, _cf2, _bx2) in enumerate(_yw):
+                        if _cn2 == cn and _iou(bxx, _bx2) >= 0.5:
+                            if cf > _cf2:
+                                _yw[_kk] = (cn, nm, cf, bxx)
+                            _dup = True
+                            break
+                    if not _dup:
+                        _yw.append((cn, nm, cf, bxx))
+                _have = [_YOLO_LABEL2OBJ.get(str(l).lower()) for l in _lb]
+                for cn, nm, cf, bxx in _yw:
+                    if any(c == cn and c is not None and _iou(bxx, hb) >= 0.5
+                           for c, hb in zip(_have, _bx)):
+                        continue
+                    _lb.append(nm); _sc.append(cf); _bx.append(bxx); _sr.append("yoloworld")
+                n_yw += 1
+            # ③ 闭集框：直接就是本体语义值；signal 类与已有灯框重叠时让给灯
+            if _rs is not None and _k < len(_rs):
+                r2 = _rs[_k]
+                _lights = [b for l, s, b in zip(_lb, _sr, _bx)
+                           if str(s) != "sign" and _YOLO_LABEL2OBJ.get(str(l).lower()) == "红绿灯"]
+                for b in r2.boxes:
+                    try:
+                        cf = float(b.conf[0]); nm = str(r2.names[int(b.cls[0])]).lower().strip()
+                    except Exception:
+                        continue
+                    cn = _SIGN_MAP.get(nm)
+                    if not cn or cf < _SIGN_CONF:
+                        continue
+                    bxx = [float(x) for x in b.xyxy[0].tolist()]
+                    if cn == "红绿灯" and any(_iou(bxx, hb) >= 0.5 for hb in _lights):
+                        continue
+                    _lb.append(cn); _sc.append(cf); _bx.append(bxx); _sr.append("sign")
+                n_sg += 1
+            _wh = (int(_arr[_k].shape[1]), int(_arr[_k].shape[0]))
+            rec.update({"image_id": _i, "engine": ("yolo+yoloworld+sign" if _yw_on() else "yolo+sign"),
+                        "width": _wh[0], "height": _wh[1],
+                        "labels": _lb, "scores": _sc, "boxes": _bx, "src": _sr})
+            sub[str(_i)] = rec
+        del _arr          # 及时释放（每张 1080p BGR 约 6MB）
+    _persist_detections()
+    _log("[检测] 开放词表+闭集标志 合并跑完 %d 帧（YW %d / 闭集 %d；摘掉或拦下 YW 牌子框 %d 个）"
+         % (len(sel), n_yw, n_sg, replaced))
+    return n_yw, replaced, n_sg
+
+
+def _sign_cn_of_frames(project, fids):
+    """判定阶段**只读**：取 `src=="sign"` 的框 → 本体值（限速/禁令标志/警告标志/指示标志/指路标志/…）。
+
+    ⚠️ 2026-09-23 用户定口径：**同一个值要在 ≥`_SIGN_SEM_MIN_FRAMES` 帧出现、且每帧 conf≥`_SIGN_SEM_CONF`，
+    才允许写进段级值**。原来"任 1 帧就算"被实测证明会污染整段（段级值是并集，单帧偶发误检 ——
+    例如把 KFC 风格红底白"K"店招判成 禁令标志 —— 会把整段写成"有禁令标志"）。
+    实测每类在段内本就只出现在少数帧（禁令中位 13/101、限速 2/101），所以"≥2 帧"滤掉的是单帧噪声，
+    几乎不动真牌子。**与检测阶段的 `_SIGN_CONF=0.15` 刻意分开：检测要宽（保召回），语义要严。**
+    读不到就返回空集（退化成"没有这一路证据"），不影响判定。
+    """
+    sub = detections_cache.get(project or "default") or {}
+    cnt = {}
+    for _i in (fids or []):
+        try:
+            rec = sub.get(str(int(_i))) or {}
+        except Exception:
+            continue
+        _lb = list(rec.get("labels") or [])
+        _sc = list(rec.get("scores") or [])
+        _sr = list(rec.get("src") or (["yolo"] * len(_lb)))
+        seen = set()                       # 同一帧内同类只算一次（多框不重复计数）
+        for l, c, s in zip(_lb, _sc, _sr):
+            if s != "sign":
+                continue
+            try:
+                if float(c) < _SIGN_SEM_CONF:
+                    continue
+            except Exception:
+                continue
+            seen.add(str(l))
+        for _v in seen:
+            cnt[_v] = cnt.get(_v, 0) + 1
+    return {v for v, n in cnt.items() if n >= _SIGN_SEM_MIN_FRAMES}
+# 检测阶段跑一趟 YOLO-World（由 _patch_yw_detect_stage.py 插入）
+# 用户 2026-09-22：「后者吧」= 把 YOLO-World 挪到**检测阶段**，与 YOLO 同批对全部帧跑一遍、结果落盘，
+# 判定阶段只读不算。
+#
+# 存储约定（**关键**）：结果写进该帧检测记录的**嵌套子键** `yoloworld`，而不是整条替换 ——
+# 现有的 yolo 记录是"整条替换"语义（DINO 那条路就把 `yolo` 冲掉过），
+# 而判定的补全和前端框渲染都依赖同一帧的 yolo 字段，冲掉就同时坏两处。
+# 检测阶段 YOLO-World：与 YOLO **合并成一条记录**（用户 2026-09-22：「yolo 和 yolo world 相同结果要覆盖，
+# 不要并存，省点内存，这样的话 yolo 的置信度要提到 3.5 以上」）
+#
+# 设计：
+#   - 不再另存 `yoloworld` 子键；一帧只有**一条**检测记录，每个框带 `src`（yolo / yoloworld）；
+#   - **去重**：同"本体词"且 IoU>=0.5 视为同一目标 —— YW 的那条丢弃（YOLO 是闭集，同类更准）；
+#     YW 内部同类重复也丢（它 22 个类别短语常对同一目标给多个框，实测 46 框/帧里大半是重复）；
+#   - YOLO 侧按 `_YOLO_THR` 过滤（红绿灯已从 0.30 提到 0.35），YW 侧按 `_YWL_CONF`；
+#   - **来源分流**：判定里"检测摘要 / 轨迹 / 事件闸门"只吃 `src=="yolo"` 的框（`_yolo_of` 里过滤），
+#     免得 YW 的框改变闸门行为；补全证据则专门吃 `src=="yoloworld"` 的框（`_yoloworld_cn_of_frames`）。
+def _iou(a, b):
+    """两个 [x1,y1,x2,y2] 的 IoU（去重用）。"""
+    try:
+        ax1, ay1, ax2, ay2 = [float(v) for v in a]
+        bx1, by1, bx2, by2 = [float(v) for v in b]
+    except Exception:
+        return 0.0
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = (max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+          + max(0.0, bx2 - bx1) * max(0.0, by2 - by1) - inter)
+    return inter / ua if ua > 0 else 0.0
+def _yw_batch_fill(project, ids):
+    """对一批帧跑 YOLO-World（V4 类别），结果**合并进同一帧那条检测记录**（不并存、去重）。
+
+    返回 (写入帧数, 丢掉的重复框数)。失败/未就绪返回 (0, 0)（不影响 YOLO 那一趟的结果）。
+    """
+    if not ids or not _ensure_yoloworld():
+        return 0, 0
+    ctx = load_project_context(project)
+    M = ctx.get("metadata") or []
+    # 类别已在 _ensure_yoloworld() 加载时设好（固定常量），这里不再重复设置
+
+    sub = detections_cache.setdefault(project or "default", {})
+    n, dropped = 0, 0
+    for _i in ids:
+        try:
+            _i = int(_i)
+        except Exception:
+            continue
+        _p = M[_i]["path"] if 0 <= _i < len(M) else None
+        if not _p or not os.path.exists(_p):
+            continue
+        try:
+            r = yoloworld_model.predict(source=_p, imgsz=1280, conf=0.02, verbose=False)[0]
+        except Exception as e:
+            _log("[检测] YOLO-World 单帧失败(%s): %s" % (_i, str(e)[:100]))
+            continue
+        # ① YOLO-World 侧：过滤 → 按本体词归并去重（同类且 IoU>=0.5 只留高分那条）
+        _yw = []
+        for b in r.boxes:
+            try:
+                cf = float(b.conf[0])
+                nm = str(r.names[int(b.cls[0])]).lower().strip()
+            except Exception:
+                continue
+            if cf < _YWL_CONF:
+                continue
+            cn = _YWL_MAP.get(nm)
+            if not cn:
+                continue
+            bx = [float(x) for x in b.xyxy[0].tolist()]
+            _dup = False
+            for _k, (_cn2, _nm2, _cf2, _bx2) in enumerate(_yw):
+                if _cn2 == cn and _iou(bx, _bx2) >= 0.5:
+                    if cf > _cf2:                     # 同类重复：留高分那条
+                        _yw[_k] = (cn, nm, cf, bx)
+                    _dup = True
+                    dropped += 1
+                    break
+            if not _dup:
+                _yw.append((cn, nm, cf, bx))
+        # ② 与已有的 YOLO 框合并（同本体词且 IoU>=0.5 → 认为同一目标，丢弃 YW 的）
+        rec = dict(sub.get(str(_i)) or {})
+        _lb = list(rec.get("labels") or [])
+        _sc = list(rec.get("scores") or [])
+        _bx = list(rec.get("boxes") or [])
+        _sr = list(rec.get("src") or (["yolo"] * len(_lb)))
+        _have_cn = [_YOLO_LABEL2OBJ.get(str(l).lower()) for l in _lb]
+        for cn, nm, cf, bx in _yw:
+            if any(c == cn and c is not None and _iou(bx, hb) >= 0.5
+                   for c, hb in zip(_have_cn, _bx)):
+                dropped += 1
+                continue
+            _lb.append(nm)
+            _sc.append(cf)
+            _bx.append(bx)
+            _sr.append("yoloworld")
+        rec.update({"image_id": _i, "engine": "yolo+yoloworld",
+                    "width": int(r.orig_shape[1]), "height": int(r.orig_shape[0]),
+                    "labels": _lb, "scores": _sc, "boxes": _bx, "src": _sr})
+        sub[str(_i)] = rec
+        n += 1
+    _persist_detections()
+    _log("[检测] YOLO-World 批量完成 %d/%d 帧（已并入同帧记录，丢重复框 %d 个）" % (n, len(ids), dropped))
+    return n, dropped
+def _yoloworld_cn_of_frames(project, fids):
+    """判定阶段**只读**：取这些帧记录里 `src=="yoloworld"` 的框，归一成本体词表里的中文标签。
+
+    ⚠️ 只吃 YW 来源的框，不去碰 YOLO 那一侧（免得改变提示词/轨迹/闸门的行为）。
+    读不到就返回空集（该批帧检测时 YOLO-World 没跑成），退化成"没有这一路证据"，不影响判定。
+    """
+    sub = detections_cache.get(project or "default") or {}
+    out = set()
+    for _i in (fids or []):
+        try:
+            rec = sub.get(str(int(_i))) or {}
+        except Exception:
+            continue
+        _lb = list(rec.get("labels") or [])
+        _sc = list(rec.get("scores") or [])
+        _sr = list(rec.get("src") or (["yolo"] * len(_lb)))
+        for l, c, s in zip(_lb, _sc, _sr):
+            if s != "yoloworld":
+                continue
+            try:
+                if float(c) < _YWL_CONF:
+                    continue
+            except Exception:
+                continue
+            cn = _YWL_MAP.get(str(l).lower().strip())
+            if cn:
+                out.add(cn)
+    return out
+
+def _yw_classes(text_prompt):
+    """提示词 → YOLO-World 类别列表：按 . , 、 ; 换行 切开，每段经 dino_dict 中→英（长词优先）。
+
+    ⚠️ 关键词表要跟 `_YOLO_LABEL2OBJ` 对得上，否则返回的英文类别反查不回中文、前端显示英文。
+    """
+    d = _load_dino_dict()
+    txt = text_prompt or ""
+    for sep in ("\n", ";", "；", ",", "，", "、", "."):
+        txt = txt.replace(sep, "|")
+    segs = [x.strip() for x in txt.split("|") if x.strip()]
+    keys = sorted(d.keys(), key=len, reverse=True)
+    out = []
+    for x in segs:
+        for zh in keys:
+            if zh in x:
+                x = x.replace(zh, d[zh])
+        x = x.strip()
+        if x and x not in out:
+            out.append(x)
+    return out or ["object"]
+def _yoloworld_detect_batch_locked(project, image_ids, text_prompt):
+    global yoloworld_model
+    _log("[检测] YOLO-WORLD-BATCH project=%s ids=%s prompt=%s" % (project, image_ids, text_prompt))
+    ctx = load_project_context(project)
+    _free_vlm()                       # 12G 卡不共存：先腾显存再加载
+    _free_dino()
+    _free_yolo()
+    if not _ensure_yoloworld():
+        return {"code": 500, "msg": "YOLO-World 模型未就绪（权重缺失或加载失败，看 logs/app_*.log）",
+                "results": {}}
+    ids = []
+    for s in (image_ids or "").replace(" ", "").split(","):
+        if s == "":
+            continue
+        try:
+            ids.append(int(s))
+        except Exception:
+            pass
+    classes = _yw_classes(text_prompt)
+    d = _load_dino_dict()
+    rev = {v: k for k, v in d.items()}
+    try:
+        yoloworld_model.set_classes(classes)
+    except Exception as e:
+        return {"code": 500, "msg": "set_classes 失败: %s" % str(e)[:120], "results": {}}
+    cand = []
+    for i in ids:
+        if 0 <= i < len(ctx["metadata"]):
+            p = ctx["metadata"][i]["path"]
+            if os.path.exists(p):
+                cand.append((i, p))
+    if not cand:
+        return {"code": 200, "results": {}, "count": 0}
+    out = {}
+    for c0 in range(0, len(cand), _YW_CHUNK):
+        part = cand[c0:c0 + _YW_CHUNK]
+        try:
+            rs = yoloworld_model.predict(source=[p for _, p in part], imgsz=1280, conf=0.05,
+                                         verbose=False)
+        except Exception as e:
+            _log("[检测] YOLO-World 块 %d-%d 失败: %s" % (c0, c0 + len(part), str(e)[:140]))
+            continue
+        for (i, _p), r in zip(part, rs):
+            try:
+                h, w = int(r.orig_shape[0]), int(r.orig_shape[1])
+            except Exception:
+                w, h = 1920, 1080
+            sc, lb, bx = [], [], []
+            for b in r.boxes:
+                sc.append(float(b.conf[0]))
+                nm = str(r.names[int(b.cls[0])])
+                # 优先用显式映射表（_YWL_MAP），保证 UI 里也是中文、与判定链路同一套词
+                lb.append(_YWL_MAP.get(nm.lower().strip(), rev.get(nm, nm)))
+                bx.append([float(x) for x in b.xyxy[0].tolist()])
+            res = {"image_id": i, "engine": "yoloworld", "prompt": text_prompt,
+                   "scores": sc, "labels": lb, "boxes": bx, "width": w, "height": h}
+            # ⚠️ 必须**合并写**：save_detection_record 是整条替换，会把同帧的 yolo 字段冲掉，
+            # 而判定的目标补全和前端框渲染都依赖它（2026-09-22 把这条路的语义改对）。
+            _sub = detections_cache.setdefault(project or "default", {})
+            _rec = dict(_sub.get(str(i)) or {})
+            _rec.setdefault("image_id", i)
+            _rec["yoloworld"] = dict(res)
+            _sub[str(i)] = _rec
+            out[str(i)] = res
+        _log("[检测] YOLO-World 进度 %d/%d" % (min(c0 + _YW_CHUNK, len(cand)), len(cand)))
+    _persist_detections()   # 改成合写后统一落盘（原来是每帧 save_detection_record 自己落）
+    return {"code": 200, "results": out, "count": len(out)}
 @app.get("/api/get_all_detections")
 def get_all_detections(project: str = Query("default")):
     """返回某项目下已持久化的所有目标检测结果，供前端加载页面时全量同步。
@@ -4418,8 +5176,12 @@ def _vlm_budget(multi: bool = False) -> int:
     宁可多给预算（生成到 EOS 自然停，多给不会变慢多少），也不要截断。
     可用 AD_VLM_MAX_TOKENS / AD_VLM_MAX_TOKENS_MULTI 覆盖（比如显存吃紧时调回 220）。"""
     if multi:
-        return _env_int("AD_VLM_MAX_TOKENS_MULTI", 512, lo=128, hi=4096)
-    return _env_int("AD_VLM_MAX_TOKENS", 384, lo=128, hi=4096)
+        # 2026-09-20：输出多了 risk 字段与更长的逐帧证据（禁套话后每条都要写画面内容），
+        # 512 开始吃紧 —— 截断会让 JSON 解析失败、evidence/confidence 整批丢失，宁可多给。
+        # 2026-09-20 又加了"逐帧观察 frames + 判定理由 reason"，输出显著变长，
+        # 768 会截断成半截 JSON（解析失败就整段白判），因此提到 1280。
+        return _env_int("AD_VLM_MAX_TOKENS_MULTI", 1200, lo=128, hi=4096)
+    return _env_int("AD_VLM_MAX_TOKENS", 512, lo=128, hi=4096)
 def _bnb_4bit():
     """4bit 量化配置（12G 卡跑 7B 必须）。视觉塔不量化：VLM 的视觉编码器对量化很敏感，
     量化后远处小目标(行人/非机动车)识别会明显变差。不可用时返回 None(退回 fp16)。"""
@@ -5768,18 +6530,18 @@ def review_queue(project: str = Query("default"), page: int = 1, size: int = 20)
         proj = _ensure_db_project(db, project)
         if proj is None:
             return {"code": 500, "msg": "数据库未就绪", "items": [], "total": 0}
-        q = db.query(Asset).filter(Asset.project_id == proj.id)
-        q = q.filter(
-            (Asset.status == AssetStatus.REVIEW)
-            | (Asset.decision_status == DecisionStatus.REVIEW)
-        )
-        total = q.count()
-        assets = (
-            q.order_by(Asset.updated_at.asc())
-            .offset((page - 1) * size)
-            .limit(size)
-            .all()
-        )
+        from sqlalchemy import func as _func
+        _cond = ((Asset.status == AssetStatus.REVIEW)
+                 | (Asset.decision_status == DecisionStatus.REVIEW))
+        # ⚠️ 计数必须用 func.count()：Query.count() 会把**全列**包成子查询再 count，
+        # 覆盖索引直接失效（南美 826k 行实测 0.297s → 0.043s，7 倍）。
+        total = db.query(_func.count()).select_from(Asset).filter(
+            Asset.project_id == proj.id, _cond).scalar() or 0
+        _start = (page - 1) * size
+        # 该页为空就不必再查一次：这条带 OR + 排序的取页查询实测 0.24s，纯白等。
+        assets = (db.query(Asset).filter(Asset.project_id == proj.id, _cond)
+                  .order_by(Asset.updated_at.asc()).offset(_start).limit(size).all()
+                  ) if _start < total else []
         items = [_asset_to_legacy_item(a, project) for a in assets]
         return {"code": 200, "total": total, "page": page, "size": size, "items": items}
     finally:
@@ -5833,11 +6595,57 @@ _YOLO_LABEL2OBJ = {
     "bus": "大车",
     "van": "大车",
     "trailer": "大车",
-    "traffic light": "交通设施",
-    "stop sign": "交通设施",
-    "cone": "交通设施",
-    "barrier": "交通设施",
+    # 交通设施按检测器**实际能分出的类**拆开（用户 2026-09-20：模型检出多少就分类多少）。
+    # 语料实测：traffic light 19518 次、stop sign 3239、zebra 188 —— 以前全压成一个「交通设施」，
+    # 细类信息白白丢掉。剩下的路边设施（消防栓/长椅等）仍归入「交通设施」兜底。
+    "traffic light": "红绿灯",
+    "stop sign": "交通标识牌",
+    "zebra": "斑马线",
+    "cone": "锥桶",
+    "barrier": "围挡",
 }
+# 检测器检出的「设施类」**已经不属于 objects**（2026-09-21 标签规整：目标只留参与者 + 锥桶/围挡）。
+# 它们该去的地方在这里统一指路，两处必须都用它：
+#   ① 「目标列表补全」——检测摘要里有红绿灯就补进 objects 的话，同一件事会在「目标」与
+#      「交通标识」/「道路」各记一遍（这正是人工真值算不清的根因，实测 25 段里红绿灯 18 段被补回去）
+#   ② traffic_sign / road_marking 的确定性补全
+_DET_FACILITY_MOVE = {
+    # YOLO-World（V4）返回的牌子标签；缺了它这条证据会被直接丢掉（坑 #16 的同型问题）
+    "指示牌": ("traffic_sign", "交通标识牌"),
+    "红绿灯": ("traffic_sign", "红绿灯"),
+    "斑马线": ("road_marking", "人行横道"),
+    "人行横道": ("road_marking", "人行横道"),
+    "交通标识牌": ("traffic_sign", "交通标识牌"),
+    "交通设施": ("traffic_sign", "交通标识牌"),
+    # 2026-09-23 闭集交通标志模型（src=="sign"）直接给的就是本体语义值，**必须在这里登记**：
+    # 缺了它们，补全会把"指示标志/限速"塞进 objects（端到端实测踩到），
+    # 而不是填进 traffic_sign —— 与坑 #16「换维度的类值，补全侧那张表也要改」同型。
+    "限速": ("traffic_sign", "限速"),
+    "指示标志": ("traffic_sign", "指示标志"),
+    "禁令标志": ("traffic_sign", "禁令标志"),
+    "警告标志": ("traffic_sign", "警告标志"),
+    "指路标志": ("traffic_sign", "指路标志"),
+}
+# ⚠️ 只把**能映射到本体词表**的标签计入检测摘要/轨迹：COCO 预训练模型在行车场景里会误检
+# skis/kite/airplane/refrigerator 这类完全无关的类（语料实测确实有），以前它们会原样
+# （英文）出现在注入给模型的摘要里 —— 是噪声，也永远进不了输出词表。
+# YOLO 按类别置信度阈值（用户 2026-09-20）：小目标位置信度低、误检多（路灯被认成红绿灯），
+# 人车类可靠。**两处推理路径都必须用它** —— 只改单帧路径的话批量检测不会生效（实测踩过）。
+_YOLO_THR = {
+    # ⚠️ 红绿灯这类小目标：YOLO **误检（路灯被认成灯）与漏检同时存在**，阈值救不了 ——
+    # 0.5 会把真灯漏掉（用户实测）、调低又会放进路灯。现阶段以**召回优先**（用户明确），
+    # ⚠️ 2026-09-22 用户改口径：**提到 0.35**（"yolo 和 yolo world 相同结果要覆盖…yolo 的置信度要提到 3.5 以上"）
+    # —— 低置信的那部分交给 YOLO-World（开放词表）去覆盖，两边不再并存、省内存。
+    "traffic light": 0.35,
+    "stop sign": 0.50, "cone": 0.50, "barrier": 0.50,
+    "zebra": 0.50, "parking meter": 0.50,
+    "person": 0.35, "car": 0.35, "truck": 0.35, "bus": 0.35, "van": 0.35,
+    "trailer": 0.35, "bicycle": 0.35, "motorcycle": 0.35, "rickshaw": 0.35,
+}
+def _yolo_keep(labels, scores):
+    """按类别阈值挑出要保留的下标。"""
+    return [i for i, (l, c) in enumerate(zip(labels, scores))
+            if c >= _YOLO_THR.get(str(l).lower(), 0.55)]
 _EVENT_NEED = {
     "行人横穿": {"person"},
     "行人密集": {"person"},
@@ -5855,6 +6663,112 @@ try:
         _EVENT_NEED = {k: set(v) for k, v in _NEED.items()}
 except Exception:
     pass
+
+# 事件"必须动起来才算数"的横向位移下限（占画面宽比例）
+_MOVE_MIN = {
+    "行人横穿": 0.20, "非机动车横穿": 0.20,
+    "车辆切入": 0.06, "车辆切出": 0.06, "车辆变道": 0.06, "车辆加塞": 0.06,
+    "车辆掉头": 0.08, "车辆逆行": 0.06,
+}
+def _gate_clip_result(result, member_cn, track, veh_per_frame, fids, project, has_det=True):
+    """分层程序化核验：**能算的才算**，算不了的不硬编（只靠证据可核对 + 反模板标记）。
+
+    写入 result["events"][i]["flags"]：ungrounded（检测不支持）、motion（实测位移占比）。
+    返回 {"flagged": [...], "gates": [...], "diag": {...}}。
+
+    ⚠️ 旧版有致命 bug：本体 events_need 用**中文**目标名，而旧代码拿**英文** YOLO 标签
+       求交集 —— 永远为空，于是每个事件都被误标"目标缺失"并强制 REVIEW（审核员看到
+       "行人横穿·目标缺失"但画面里明明有行人）。这里两边统一到中文（调用方已映射）。
+    覆盖：目标缺失 / 横穿与车辆类横向位移 / 交通状态极端矛盾 / 时段；
+    天气、路面、急减速、施工占道**无法可靠程序化**，不在此列。"""
+    def _span(_cn):
+        _pts = track.get(_cn) or []
+        if len(_pts) < 2:
+            return 0.0, len(_pts)
+        _xs = [p[1] for p in _pts]
+        return (max(_xs) - min(_xs)), len(_pts)
+
+    _flagged, _gates, _diag = [], [], {}
+    if not has_det:
+        # ⚠️ 整段一帧都没有检测数据（例如这个项目还没跑过 YOLO）时，**不能**把"没有数据"
+        # 当成"目标缺失"——否则每个事件都会被误判并强制转人工（欧洲项目实测）。
+        # 这种情况老实标注"无法程序化核验"，不做任何判断。
+        return {"flagged": [], "gates": ["无 YOLO 数据：核验跳过（该项目尚未跑 YOLO）"], "diag": {}}
+    for _e in result.get("events") or []:
+        _t = _e.get("type")
+        _need = set((_EVENT_NEED or {}).get(_t) or set())
+        _fl = _e.setdefault("flags", {})
+        if _need and not (_need & set(member_cn or ())):
+            # YOLO 没检到 → 先看**模型自己**有没有看到（用户要求：两者取并集提升召回）。
+            # 模型看到了 = 可能是检测漏检，不能直接判"目标缺失"；但仍无位移佐证 → 转人工。
+            _mo = set(o.get("type") or "" for o in (result.get("objects") or []))
+            if _need & _mo:
+                _fl["model_only"] = True
+                _e["check"] = "目标由模型判定（YOLO 未检出），无位移佐证 → 人工确认"
+                _flagged.append(_t)
+                _gates.append("%s:仅模型判定(YOLO未检出)" % _t)
+            else:
+                _fl["ungrounded"] = True
+                _e["check"] = "目标缺失：YOLO 与模型都没看到该事件所需目标"
+                _flagged.append(_t)
+                _gates.append("%s:目标缺失" % _t)
+            continue
+        _mv = _MOVE_MIN.get(_t)
+        if _mv and _need:
+            _best, _n = 0.0, 0
+            for _c in (_need & set((track or {}).keys())):
+                _s, _c2 = _span(_c)
+                if _s > _best:
+                    _best, _n = _s, _c2
+            _fl["motion"] = round(_best, 3)
+            if _n < 2:
+                _fl["ungrounded"] = True
+                _e["check"] = "YOLO 只在 %d 帧看到所需目标，无法构成帧间运动" % _n
+                _flagged.append(_t)
+                _gates.append("%s:帧数不足" % _t)
+            elif _best < _mv:
+                _fl["ungrounded"] = True
+                _e["check"] = "YOLO 未见明显横向位移（实测 %.0f%%，判据要求 ≥%.0f%%）" % (
+                    _best * 100, _mv * 100)
+                _flagged.append(_t)
+                _gates.append("%s:无位移" % _t)
+            else:
+                _gates.append("%s:位移验证通过(%.0f%%)" % (_t, _best * 100))
+        elif _need:
+            _gates.append("%s:目标存在(无运动判据)" % _t)
+    # 交通状态：只在**极端矛盾**时提示（阈值放宽，避免不同相机/场景造成误报）
+    _ts = set(((result.get("scene") or {}).get("traffic_state")) or []) - {"unknown"}
+    _vmax = max(veh_per_frame) if veh_per_frame else 0
+    if "车辆稀少" in _ts and _vmax >= 10:
+        _diag["traffic_state_mismatch"] = _vmax
+        _gates.append("traffic_state:画面最多 %d 辆车，与「车辆稀少」矛盾" % _vmax)
+    elif _ts & {"拥堵", "车辆密集"} and _vmax <= 1:
+        _diag["traffic_state_mismatch"] = _vmax
+        _gates.append("traffic_state:画面最多 %d 辆车，与「%s」矛盾" % (_vmax, "/".join(sorted(_ts))))
+    # 时段：用帧时间戳核对（只在时间与结论都明确时提示）
+    try:
+        _hour = None
+        for _fid in list(fids or [])[:1]:
+            _a4, _c4, _db4 = _find_db_asset(project, _fid)
+            try:
+                if _a4 is not None and getattr(_a4, "timestamp", None) is not None:
+                    _hour = _a4.timestamp.hour
+            finally:
+                if _db4 is not None:
+                    _db4.close()
+        _tm = set(((result.get("scene") or {}).get("time")) or []) - {"unknown"}
+        if _hour is not None and _tm:
+            _want = ("夜晚" if (_hour >= 22 or _hour < 5) else
+                     "清晨" if 5 <= _hour < 7 else
+                     "白天" if 8 <= _hour <= 16 else
+                     "黄昏" if 17 <= _hour <= 19 else None)
+            if _want and _want not in _tm:
+                _diag["time_mismatch"] = _hour
+                _gates.append("time:帧时间戳 %d 点应为「%s」，模型判 %s" % (
+                    _hour, _want, "/".join(sorted(_tm))))
+    except Exception:
+        pass
+    return {"flagged": _flagged, "gates": _gates, "diag": _diag}
 # DINO 标签还原：词表值(英文) -> 中文键；再兜一层标识关键词（模型偶尔输出 ##walk/lane 这类碎词）
 _DINO_EN2CN = {}
 try:
@@ -5865,7 +6779,7 @@ except Exception:
     _dd = {}
 _DINO_SIGN_KW = [
     ("crosswalk", "人行横道"), ("#walk", "人行横道"), ("zebra", "人行横道"),
-    ("stop line", "停止线"), ("traffic light", "交通信号灯"), ("signal light", "交通信号灯"),
+    ("stop line", "停止线"), ("traffic light", "红绿灯"), ("signal light", "红绿灯"),
     ("no entry", "禁止通行"), ("no parking", "禁止停车"), ("stop sign", "停车让行"),
     ("speed limit", "限速"),
 ]
@@ -5895,18 +6809,29 @@ def _dino_label_to_cn(lb: str):
     if re.search(r"[a-zA-Z]", t):         # 仍是英文 -> 丢弃
         return None
     return lb.strip()
-# 交通标识信号：DINO 词表里属于标线/标志的词（命中后进 traffic_sign 维度，不进 objects）
+# 交通标识信号 / 路面标线：DINO 词表里属于这两类的词（命中后进各自维度，不进 objects）。
+# 2026-09-21 标签规整：标线（人行横道/停止线/导流线…）已从 traffic_sign 迁到 road_marking，
+# 这里必须两维都认 —— 否则 DINO 检出的「人行横道」会掉进 objects 变成一个"目标类"。
 try:
     from ontology import values_of as _values_of
     _SIGN_TAGS = set(_values_of("traffic_sign")) - {"unknown"}
+    _MARK_TAGS = set(_values_of("road_marking")) - {"unknown"}
 except Exception:
-    _SIGN_TAGS = set()
+    _SIGN_TAGS, _MARK_TAGS = set(), set()
 # DINO 词表里的键名比本体取值更口语（"限速标志" vs 取值"限速"），先归一再判定
 _SIGN_ALIAS = {
     "斑马线": "人行横道", "限速标志": "限速", "左转标志": "左转", "右转标志": "右转",
     "掉头标志": "掉头", "直行标志": "直行", "禁止通行标志": "禁止通行",
     "禁止停车标志": "禁止停车", "停车让行标志": "停车让行",
     "注意行人标志": "注意行人", "施工标志": "施工",
+    # 2026-09-21 标签规整：检测类里的设施词也要指到新维度，否则 DINO 检出的「红绿灯」
+    # 会因为不在 traffic_sign 词表里而掉进 objects（变成一个"目标类"）
+    # 2026-09-23 用户改口径：本维的值统一叫「红绿灯」（原来叫「交通信号灯」，与检测侧的
+    # `_YOLO_LABEL2OBJ` 写出的「红绿灯」不一致；且"交通信号灯"太泛，VLM 容易把路灯也算进去）。
+    "交通信号灯": "红绿灯", "信号灯": "红绿灯", "交通灯": "红绿灯", "红绿信号灯": "红绿灯",
+    "交通标识牌": "交通标识牌", "交通设施": "交通标识牌", "路标": "交通标识牌",
+    "道路标识牌": "交通标识牌",
+    "警示牌": "交通标识牌", "标志牌": "交通标识牌", "指示牌": "交通标识牌", "路牌": "交通标识牌",
 }
 def _detections_to_objects(detections: dict):
     """把真实检测结果(YOLO/DINO)映射为 ai_tags.objects 标签列表(带真实置信, 不虚报)。"""
@@ -5937,6 +6862,9 @@ def _detections_to_objects(detections: dict):
             if _lb_sign in _SIGN_TAGS:
                 cands.append((cf, _lb_sign, "sign"))
                 continue
+            if _lb_sign in _MARK_TAGS:
+                cands.append((cf, _lb_sign, "marking"))
+                continue
             lb = _lb2
             tag = _YOLO_LABEL2OBJ.get(lb)
             if not tag:
@@ -5947,13 +6875,14 @@ def _detections_to_objects(detections: dict):
             cands.append((cf, tag, eng))
     # 标识与目标分开截断：交通标识常是低置信（0.2~0.5），一起排序会被目标挤掉前 6 名之外
     cands.sort(key=lambda x: -x[0])
-    _signs = [c for c in cands if c[2] == "sign" and c[0] >= 0.25][:2]
-    _objs = [c for c in cands if c[2] != "sign"][:4]
+    _signs = [c for c in cands if c[2] in ("sign", "marking") and c[0] >= 0.25][:2]
+    _objs = [c for c in cands if c[2] not in ("sign", "marking")][:4]
     for cf, tag, eng in _signs:
         if tag in seen:
             continue
         seen.add(tag)
-        out.append({"tag": tag, "source": "DINO", "confidence": cf, "dim": "traffic_sign"})
+        out.append({"tag": tag, "source": "DINO", "confidence": cf,
+                    "dim": "road_marking" if eng == "marking" else "traffic_sign"})
     for cf, tag, eng in _objs:
         if tag in seen:
             continue
@@ -6423,7 +7352,8 @@ def _ai_batch_worker(
                         _d2o = _detections_to_objects(asset.detections or {})
                         _objs = [o for o in _d2o if (o.get("dim") or "objects") == "objects"]
                         _signs = [o for o in _d2o if o.get("dim") == "traffic_sign"]
-                        if _objs or _signs:
+                        _marks = [o for o in _d2o if o.get("dim") == "road_marking"]
+                        if _objs or _signs or _marks:
                             ai = dict(asset.ai_tags or {})
                             if _objs:
                                 ai["objects"] = _objs
@@ -6435,6 +7365,14 @@ def _ai_batch_worker(
                                     if _sg["tag"] not in _have:
                                         _merged.append(_sg)
                                 ai["traffic_sign"] = _merged
+                            if _marks:
+                                # 路面标线（2026-09-21 从 traffic_sign 拆出）：单独一维合并去重
+                                _have_m = {t.get("tag") for t in (ai.get("road_marking") or []) if isinstance(t, dict)}
+                                _merged_m = list(ai.get("road_marking") or [])
+                                for _mk in _marks:
+                                    if _mk["tag"] not in _have_m:
+                                        _merged_m.append(_mk)
+                                ai["road_marking"] = _merged_m
                             asset.ai_tags = ai
                     evidence = _build_decision_evidence(asset)
                     decision = dec_engine.decide(evidence)
@@ -7014,8 +7952,12 @@ def pipeline_resume(job_pk: int):
 # ===== Analytics：数据需求 / 分布分析（PRD 26-33） =====
 # ============================================================
 @app.get("/api/analytics/overview")
-def analytics_overview(project: str = Query("default")):
-    """仪表盘概览：总量/已通过/待审核/已过滤/AI覆盖 + 各维度分布（Final Tags）"""
+def analytics_overview(project: str = Query("default"), light: int = 0):
+    """仪表盘概览：总量/已通过/待审核/已过滤/AI覆盖 + 各维度分布（Final Tags）。
+
+    light=1：只给计数（审核面板要的那几个），跳过 ai_tagged_assets。
+    那是 `ai_tags IS NOT NULL` 的全项目计数 —— 南美 826k 行实测 0.29s，而前端一处都没用它。
+    （各维度分布实测只 0.006s，不必跳；db_service.py 按约定不动。）"""
     from db_service import get_project, get_analytics_overview
     from models import Asset, AssetStatus
     from models import DecisionStatus as _DecisionStatus
@@ -7034,27 +7976,25 @@ def analytics_overview(project: str = Query("default")):
             .count()
         )
         base["filtered_count"] = filtered
-        # 无标签资产数（AI 标注覆盖率分母更精确）
-        tagged = (
-            db.query(Asset)
-            .filter(
-                Asset.project_id == proj.id,
-                Asset.ai_tags.isnot(None),
+        # 无标签资产数（AI 标注覆盖率分母更精确）。全项目扫描，light 模式下跳过。
+        if not light:
+            base["ai_tagged_assets"] = (
+                db.query(Asset)
+                .filter(
+                    Asset.project_id == proj.id,
+                    Asset.ai_tags.isnot(None),
+                )
+                .count()
             )
-            .count()
-        )
-        base["ai_tagged_assets"] = tagged
         # 口径分桶：以前 only 有 approved_count，前端把"人工审过的帧"也算进了「AI自动通过」，
         # 而「已人工通过」只统计 Clip -> 人工审帧后那个数字永远不动，看着像没生效。
-        base["pending_count"] = (
-            db.query(Asset)
-            .filter(
-                Asset.project_id == proj.id,
-                (Asset.status == AssetStatus.REVIEW)
-                | (Asset.decision_status == _DecisionStatus.REVIEW),
-            )
-            .count()
-        )
+        from sqlalchemy import func as _func
+        # 同上：Query.count() 的包装会让覆盖索引失效（0.24s → 0.04s）
+        base["pending_count"] = db.query(_func.count()).select_from(Asset).filter(
+            Asset.project_id == proj.id,
+            (Asset.status == AssetStatus.REVIEW)
+            | (Asset.decision_status == _DecisionStatus.REVIEW),
+        ).scalar() or 0
         base["approved_human_count"] = (
             db.query(Asset)
             .filter(
@@ -7714,13 +8654,186 @@ _ONTO_DIM_NAMES = {
     "events": "事件",
     "risk": "风险",
 }
+# 检索关键词补充表（2026-09-21 加）：`_VLM_KEYWORD_MAP` 只覆盖早期 6 个维度，于是"交通信号灯"
+# "车辆切入"这类查询连条件都解析不出来 —— **少覆盖一个维度就等于这个维度搜不到**。
+# 单开一张表而不是直接往 `_VLM_KEYWORD_MAP` 里加：那张表还是 VLM 输出解析失败时的兜底归类，
+# 检索加词不该顺带改变模型输出的兜底行为。
+# 道路三轴（road_shape/lane_count/junction）**故意映射到 road**：对外只有「道路」一维，
+# 且合并后的 road 同时被段级结果与帧级老数据提供 —— 映射到轴名会让帧级老数据一条都搜不到。
+_QUERY_KW_EXTRA = [
+    ("交通信号灯", "traffic_sign", "红绿灯"),
+    ("红绿灯", "traffic_sign", "红绿灯"),
+    ("信号灯", "traffic_sign", "红绿灯"),
+    ("斑马线", "road", "人行横道"),
+    ("人行横道", "road", "人行横道"),
+    # 标线类一律走「道路」（对外一维 = 线形∪车道∪路口∪标线）：2026-09-21 标签规整后标线
+    # 从 traffic_sign 迁到 road_marking，按 road 筛才能同时命中段级结果与帧级老数据。
+    ("停止线", "road", "停止线"),
+    ("导流线", "road", "导流线"),
+    ("网状线", "road", "网状线"),
+    ("待行区", "road", "待行区"),
+    ("减速标线", "road", "减速标线"),
+    ("可变导向车道", "road", "可变导向车道"),
+    ("公交专用道", "road", "公交专用道"),
+    ("标识牌", "traffic_sign", "交通标识牌"),
+    ("标志牌", "traffic_sign", "交通标识牌"),
+    ("交通标识", "traffic_sign", "交通标识牌"),
+    ("交通设施", "traffic_sign", "交通标识牌"),
+    ("交通标识牌", "traffic_sign", "交通标识牌"),
+    ("道路标识牌", "traffic_sign", "交通标识牌"),
+    ("限速", "traffic_sign", "限速"),
+    ("禁止停车", "traffic_sign", "禁止停车"),
+    ("禁止通行", "traffic_sign", "禁止通行"),
+    ("停车让行", "traffic_sign", "停车让行"),
+    ("注意行人", "traffic_sign", "注意行人"),
+    ("出口指示牌", "traffic_sign", "出口指示牌"),
+    ("低照度", "lighting", "低照度"),
+    ("正常照明", "lighting", "正常照明"),
+    ("逆光", "lighting", "逆光"),
+    ("强光", "lighting", "强光"),
+    ("人车混行", "traffic_state", "人车混行"),
+    ("非机动车密集", "traffic_state", "非机动车密集"),
+    ("大型车辆较多", "traffic_state", "大型车辆较多"),
+    ("车辆稀少", "traffic_state", "车辆稀少"),
+    # 拥堵/堵车：`_VLM_KEYWORD_MAP` 里映射到 events=车辆拥堵（旧枚举、现行事件表里已经没有这个值），
+    # 覆盖到现行维度 traffic_state 上，否则按这两个词搜等于去搜一个不存在的取值
+    ("拥堵", "traffic_state", "拥堵"),
+    ("堵车", "traffic_state", "拥堵"),
+    ("单车道", "road", "单车道"),
+    ("多车道", "road", "多车道"),
+    ("窄路", "road", "窄路"),
+    # 事件：`_VLM_KEYWORD_MAP` 里只有横穿/加塞/异常停车/施工/拥堵几个，
+    # 事件枚举里其余的（切入/切出/变道/急减速…）以前一个都解析不出来
+    ("非机动车横穿", "events", "非机动车横穿"),
+    ("行人横穿", "events", "行人横穿"),
+    ("车辆切入", "events", "车辆切入"),
+    ("切入", "events", "车辆切入"),
+    ("车辆切出", "events", "车辆切出"),
+    ("切出", "events", "车辆切出"),
+    ("车辆变道", "events", "车辆变道"),
+    ("车辆加塞", "events", "车辆加塞"),
+    ("车辆急减速", "events", "车辆急减速"),
+    ("急减速", "events", "车辆急减速"),
+    ("前车突然停车", "events", "前车突然停车"),
+    ("行人突然出现", "events", "行人突然出现"),
+    ("车辆逆行", "events", "车辆逆行"),
+    ("逆行", "events", "车辆逆行"),
+    ("车辆掉头", "events", "车辆掉头"),
+    ("道路施工", "events", "道路施工"),
+    ("临时占道", "events", "临时占道"),
+    ("公交车停车", "events", "公交车停车"),
+]
+def _query_kw_map() -> Dict[str, tuple]:
+    """自然语言检索用：关键词 → (维度, 取值)。**后写的覆盖前面的**。
+
+    同一个词只能落到一个维度：否则"红绿灯"会同时生成 objects=交通设施（只有帧级老数据才有）
+    与 traffic_sign=交通信号灯 两个条件，而维度间是 AND —— 交集必然为空，查询变成"搜不到"。"""
+    m = {}
+    for kw, dim, tag in _VLM_KEYWORD_MAP + _QUERY_KW_EXTRA:
+        if tag in ("", "无", "unknown"):
+            continue        # `_VLM_KEYWORD_MAP` 用 tag="无" 表示"这个词不映射到标签"（变道/跟车）
+        m[kw] = (dim, tag)
+    return m
+_QUERY_KW = None
 def _parse_query_tags(query: str) -> Dict[str, List[str]]:
-    """用关键词词典从自然语言 query 提取维度标签条件（与 VLM 解析共用词表）"""
+    """用关键词词典从自然语言 query 提取维度标签条件（覆盖范围见 `_QUERY_KW_EXTRA`）。
+
+    **长词优先、被更长命中包含的短词丢弃**：query="行人横穿" 同时含"行人横穿"与"行人"，
+    两条都留下就会 AND 出"必须有 events=行人横穿 且 objects=行人" —— 模型 objects 有上限
+    （截断到 8 条），少列一次就整条查询搜不到。短词的意思已被长词涵盖，丢掉只减少误杀。"""
+    global _QUERY_KW
+    if _QUERY_KW is None:
+        _QUERY_KW = _query_kw_map()
+    hits = sorted(((kw, d, t) for kw, (d, t) in _QUERY_KW.items() if kw in query),
+                  key=lambda x: -len(x[0]))
     cond: Dict[str, set] = {}
-    for kw, dim, tag in _VLM_KEYWORD_MAP:
-        if kw in query:
-            cond.setdefault(dim, set()).add(tag)
+    kept = []
+    for kw, dim, tag in hits:
+        if any(kw != k and kw in k for k, _d, _t in kept):
+            continue
+        kept.append((kw, dim, tag))
+        cond.setdefault(dim, set()).add(tag)
     return {k: sorted(v) for k, v in cond.items()}
+def _tag_names(vals) -> list:
+    """标签取值 → 纯字符串列表（兼容 {tag:…} 溯源对象与裸字符串两种存量形态）。"""
+    out = []
+    for v in (vals if isinstance(vals, (list, tuple, set)) else [vals]):
+        n = str((v.get("tag") if isinstance(v, dict) else v) or "").strip()
+        if n and n not in out:
+            out.append(n)
+    return out
+def _clip_tag_sets(clip: dict) -> dict:
+    """一个 Clip 的标签集合 {dim: set(值)}：**人工修正优先**（final_tags 已是
+    "人工 ∪ (模型 − 人工否决)"），没有人工作业过的段回退模型判定 vlm_result。
+    与 `_clip_model_sets`（定义在后面）同一词表空间，检索条件才能和帧级链路直接比对。"""
+    ft = clip.get("final_tags")
+    if isinstance(ft, dict) and any(ft.values()):
+        sets = {}
+        for dim, vals in ft.items():
+            s = {n for n in _tag_names(vals) if n != "unknown"}
+            if s:
+                sets[dim] = s
+        # 「道路」对外一维 = 四轴并集：final_tags 里可能只有某个分轴（road_shape/lane_count/
+        # junction/road_marking），必须合并，否则人工只标了「直路」时面板会显示"模型没给道路"
+        _r = set(sets.get("road") or ())
+        for _ax in ("road_shape", "lane_count", "junction", "road_marking"):
+            _r |= set(sets.get(_ax) or ())
+        if _r:
+            sets["road"] = _r
+        return sets
+    return _clip_model_sets(clip.get("vlm_result"))
+def _search_clips_by_tags(project: str, conds: dict):
+    """段级判定结果按标签筛选（2026-09-21 加，补一个"判定结果搜不到"的洞）。
+
+    帧级标签 2026-09-19 起不再产出（改由段级判定统一给标签），而融合搜索原来只查 DB 的
+    帧级 ai_tags/final_tags —— 于是**段级判定的结果根本没进检索索引**：实测 road=直路
+    （欧洲有 28 段）返回 0 段，query="车辆切入" 连条件都解析不出来。
+    这里把命中的 Clip 展开成它的 frame_ids 参与融合，语义与帧级**完全一致**：
+    维度内 OR、维度间 AND（同 db_service.search_assets_by_tags）。
+    返回 (帧 id 集合, 命中 Clip 列表)。"""
+    if not conds:
+        return set(), []
+    from clip_service import load_clips
+    ctx = load_project_context(project)
+    ids, clips = set(), []
+    for c in (load_clips(ctx) or []):
+        sets = _clip_tag_sets(c)
+        if not all((sets.get(d) or set()) & set(w) for d, w in conds.items() if w):
+            continue
+        clips.append(c)
+        for vid in (c.get("frame_ids") or []):
+            if isinstance(vid, int):
+                ids.add(vid)
+    return ids, clips
+def _clip_tags_display(clip: dict) -> dict:
+    """Clip 标签 → 前端"本段综合标签"的形状 {dim: [{tag,confidence?,evidence?}]}。
+
+    置信度/证据取自 vlm_result（人工没动过的段才有），形状与帧级 ai_tags 一致，
+    前端渲染器两种都吃得下 —— 搜索结果点开能看到"这段凭什么这么判"。"""
+    r = clip.get("vlm_result") or {}
+    meta = {}
+    for _e in (r.get("events") or []):
+        if isinstance(_e, dict) and _e.get("type"):
+            rec = {}
+            if _e.get("confidence") is not None:
+                rec["confidence"] = _e["confidence"]
+            _why = str(_e.get("reason") or _e.get("anchor") or "").strip()
+            if _why:
+                rec["evidence"] = [_why]
+            meta[("events", _e["type"])] = rec
+    for _o in (r.get("objects") or []):
+        if isinstance(_o, dict) and _o.get("type") and _o.get("confidence") is not None:
+            meta[("objects", _o["type"])] = {"confidence": _o["confidence"]}
+    out = {}
+    for dim, vals in _clip_tag_sets(clip).items():
+        items = []
+        for n in sorted(vals):
+            rec = {"tag": n}
+            rec.update(meta.get((dim, n)) or {})
+            items.append(rec)
+        if items:
+            out[dim] = items
+    return out
 @app.get("/api/ontology")
 def ontology_list(project: str = Query("default")):
     """融合语义搜索的筛选字段与取值：与明细表同一套字段
@@ -7802,23 +8915,25 @@ def _project_tag_values(project: str) -> list:
                             _bump(dim, v.get("tag") if isinstance(v, dict) else v, a.vector_id)
     finally:
         db.close()
-    # Clip 级标签纳入候选：**优先人工修正后的 final_tags / human_tags**（人工覆盖模型，
-    # 用户 2026-09-20 要求），没有人工作业的段才回退到 vlm_result。
+    # Clip 级标签纳入候选：**优先人工修正后的 final_tags**（= (模型 − 人工取消) ∪ 人工，
+    # 用户 2026-09-20 明确为互补并集而非覆盖），没有人工作业的段才回退到 vlm_result。
     try:
         from clip_service import load_clips
         ctx = load_project_context(project)
-        _DIMS = ("events", "objects", "scene", "road", "road_surface", "weather", "time")
+        # ⚠️ 9 维一个都不能漏：漏了 traffic_sign / risk 就等于"这些标签搜不到"（2026-09-21 补）
+        _DIMS = ("events", "objects", "scene", "road", "road_shape", "lane_count",
+                 "junction", "road_marking", "road_surface", "weather", "time",
+                 "traffic_sign", "risk", "lighting", "traffic_state")
         for c in (load_clips(ctx) or []):
-            _used = False
-            for _src in (c.get("final_tags"), c.get("human_tags")):
-                if isinstance(_src, dict) and _src:
-                    for dim in _DIMS:
-                        if isinstance(_src.get(dim), list):
-                            for v in _src[dim]:
-                                _bump(dim, v.get("tag") if isinstance(v, dict) else v)
-                            _used = True
-            if _used:
-                continue      # 人工已标注的段：以人工为准，不再计模型标签
+            # final_tags 已是"人工 ∪ 模型"的互补并集（人工标注时算好）→ 直接用它；
+            # 没人工标注过的段 final_tags 为空，回退到 vlm_result。
+            _src = c.get("final_tags") if isinstance(c.get("final_tags"), dict) and c.get("final_tags") else None
+            if _src:
+                for dim in _DIMS:
+                    if isinstance(_src.get(dim), list):
+                        for v in _src[dim]:
+                            _bump(dim, v.get("tag") if isinstance(v, dict) else v)
+                continue
             res = c.get("vlm_result") or {}
             for dim in _DIMS:
                 if isinstance(res.get(dim), list):
@@ -7946,6 +9061,9 @@ def search_fusion(
     scene: str = Form(None),
     risk: str = Form(None),
     road_surface: str = Form(None),
+    traffic_sign: str = Form(None),
+    lighting: str = Form(None),
+    traffic_state: str = Form(None),
     vehicle: str = Form(None),
     resolution: str = Form(None),
     top_k: int = Form(200),
@@ -7973,6 +9091,11 @@ def search_fusion(
         "scene": scene,          # 场景是首要关注维度之一，早期漏了这个参数导致场景筛选被静默忽略
         "risk": risk,
         "road_surface": road_surface,
+        # 交通标识/光照/交通状态以前没有显式参数（前端下拉选完传上来被 FastAPI 静默忽略，
+        # 表现为"勾了没用"）；它们都是段级判定产出、帧级老数据没有的维度（2026-09-21 补）
+        "traffic_sign": traffic_sign,
+        "lighting": lighting,
+        "traffic_state": traffic_state,
     }
     for dim, val in explicit.items():
         if isinstance(val, str) and val.strip():
@@ -8052,6 +9175,15 @@ def search_fusion(
             tag_hits = {a.vector_id for a in assets}
     finally:
         db.close()
+    # ---- 2.2) 段级判定结果（Clip）按标签筛选 ----
+    # 帧级标签 2026-09-19 起不再产出，段级判定才是标签的产出方，而它原来完全不在检索索引里
+    # （实测 road=直路 有 28 段却返回 0）。命中 Clip → 展开成 frame_ids 与帧级命中取并集。
+    clip_hits, clip_matched = set(), []
+    if tag_conditions:
+        try:
+            clip_hits, clip_matched = _search_clips_by_tags(project, tag_conditions)
+        except Exception as e:
+            _log(f"[搜索] 段级标签检索跳过: {e}")
     # ---- 2.5) 车型/分辨率过滤（来自资产元数据，不是标签）----
     meta_conds = {}
     for _k, _val in (("vehicle", vehicle), ("resolution", resolution)):
@@ -8093,20 +9225,31 @@ def search_fusion(
             _log(f"[搜索] 事件/场景加权集合计算失败: {e}")
         finally:
             dbp.close()
+    # 段级命中的 Clip 必然满足全部条件（含 events/scene）→ 事件/场景加权对它们同样成立
+    if prio_dims and clip_hits:
+        prio_hits |= clip_hits
     # ---- 3) 融合打分 ----
-    union = set(sem_scores.keys()) | tag_hits
+    # 三种证据取并集：语义近邻 ∪ 帧级标签命中 ∪ 段级判定命中
+    union = set(sem_scores.keys()) | tag_hits | clip_hits
     if meta_conds:
         # 与其它条件取交集；只选了车型/分辨率时则以它为准
         union = (union & meta_hits) if (tag_conditions or sem_scores) else set(meta_hits)
     matched_dims = len(tag_conditions)
+    # 帧级候选池：语义近邻 ∪ (帧级标签命中 − 段级命中)。
+    # 段级命中的帧**不参与**这里的 top_k 竞争：几百帧的预算会被几个 Clip 随机吃光，
+    # 结果是"命中了 5000 段却只显示七八段"（留下谁由集合迭代顺序决定）。它们下面由
+    # "段级结果"整段给出，代表帧另行补进去。车型/分辨率这种元数据过滤仍要照旧生效。
+    _frame_pool = set(sem_scores.keys()) | (tag_hits - clip_hits)
+    if meta_conds:
+        _frame_pool = (_frame_pool & meta_hits) if (tag_conditions or sem_scores) else set(meta_hits)
     results = []
-    for vid in union:
+    for vid in _frame_pool:
         score = 0.0
         sem = sem_scores.get(vid, 0.0)
         if sem_ok:
             score += sem * 0.7
-        if (vid in tag_hits and tag_conditions) or (vid in meta_hits and meta_conds):
-            score += 0.3  # 标签/元数据命中基础分（无逐帧命中计数时全命中近似）
+        if ((vid in tag_hits or vid in clip_hits) and tag_conditions) or (vid in meta_hits and meta_conds):
+            score += 0.3  # 标签/段级判定/元数据命中基础分（无逐帧命中计数时全命中近似）
         if vid in prio_hits:
             score += 0.1  # 事件/场景命中加权（这两个维度是平台的首要关注）
         if score < min_score:
@@ -8121,6 +9264,25 @@ def search_fusion(
         )
     results.sort(key=lambda x: x["score"], reverse=True)
     results = results[:top_k]
+    # 每个命中的 Clip 补一个"代表帧"占位（不受上面 top_k 限制）：聚合阶段用它把整段取出来，
+    # 这样"命中的段"一段都不会因为帧级预算而消失。
+    _clip_cap = int(os.environ.get("AD_CLIP_SEARCH_MAX", "500"))
+    _clip_cap_hit = len(clip_matched) > _clip_cap
+    for _c in clip_matched[:_clip_cap]:
+        _fids = [x for x in (_c.get("frame_ids") or []) if isinstance(x, int)]
+        if not _fids:
+            continue
+        _rid = _fids[len(_fids) // 2]
+        if meta_conds and _rid not in meta_hits:
+            continue
+        _sem = sem_scores.get(_rid, 0.0)
+        _sc = (_sem * 0.7 if sem_ok else 0.0) + 0.3 + (0.1 if prio_dims else 0.0)
+        results.append({"id": _rid, "score": round(_sc, 4),
+                        "semantic_score": round(_sem, 4) if sem_ok else None,
+                        "tag_hit": _rid in tag_hits})
+    if _clip_cap_hit:
+        _log(f"[搜索] 段级命中 {len(clip_matched)} 段，超过 AD_CLIP_SEARCH_MAX={_clip_cap}，"
+             f"本次只出前 {_clip_cap} 段（收窄条件可看全）")
     # 组装与 metadata 对齐的完整 item（含 url/标签摘要）
     ctx = load_project_context(project)
     meta = ctx.get("metadata", [])
@@ -8179,6 +9341,27 @@ def search_fusion(
             for _vid in _seg:
                 _seg_of[_vid] = _k
             _frames_of[_k] = list(_seg)
+    # 段级判定命中的 Clip：**以 Clip 本身作为"段"出结果**（判定单元就是它），并且覆盖上面
+    # 按文件名猜出来的分段 —— 直导图片的帧名（东南亚那 3 万张 1787120247.455.jpg）不属于任何
+    # 帧级分段规则，光靠帧分段这些命中会被整批丢掉（342 段就是这么"搜不到"的）。
+    _clip_label_by_key, _clip_tags_by_key = {}, {}
+    for _c in clip_matched:
+        _cids = [x for x in (_c.get("frame_ids") or []) if isinstance(x, int)]
+        if not _cids:
+            continue
+        _ck = ("clip", str(_c.get("clip_id")))
+        if _ck in _frames_of:
+            continue
+        _frames_of[_ck] = _cids
+        for _fid in _cids:
+            _seg_of[_fid] = _ck
+        _vs = str(_c.get("video_id") or "")
+        if _vs.startswith("seq:"):                 # 直导图片：video_id 是目录，取末级目录名
+            _cname = _vs[4:].rstrip("/\\").replace("\\", "/").split("/")[-1]
+        else:
+            _cname = os.path.basename(_vs.replace("\\", "/"))
+        _clip_label_by_key[_ck] = _cname or str(_c.get("clip_id") or "")
+        _clip_tags_by_key[_ck] = _clip_tags_display(_c)
     _grouped, _order = {}, []
     _no_video = 0
     for _it in items:
@@ -8192,8 +9375,10 @@ def search_fusion(
         _g = _grouped.get(_k)
         if _g is None:
             _g = _grouped[_k] = dict(_it)
-            _g["segment"] = {"video": os.path.basename(_k[0]) if _k[0] else "",
+            _g["_segkey"] = _k
+            _g["segment"] = {"video": _clip_label_by_key.get(_k) or (os.path.basename(_k[0]) if _k[0] else ""),
                              "index": _k[1] if isinstance(_k[1], int) else 0,
+                             "clip_id": _k[1] if (isinstance(_k[0], str) and _k[0] == "clip") else None,
                              "frame_count": len(_frames_of.get(_k) or [_vid]),
                              "frame_ids": list(_frames_of.get(_k) or [_vid])}
             _g["_best"] = _it.get("score") or 0
@@ -8210,6 +9395,14 @@ def search_fusion(
         items = []          # 结果全是图片直导帧（无源视频）-> 按片段的搜索不展示
     if _order:
         _segs = []
+        # 代表帧要从 metadata 里取路径/时间戳：以前每个段都 `next(m for m in meta …)` 线性扫一遍，
+        # 南美 40 万帧 × 200 段 = 8000 万次比较（段级命中后一次能出上百段，这里会明显卡）。
+        # 先建一次 id→行 的索引，整体从 O(段数×帧数) 降到 O(帧数)。
+        _meta_by_id = {}
+        for _m in meta:
+            _mid = _m.get("id")
+            if isinstance(_mid, int):
+                _meta_by_id.setdefault(_mid, _m)
         for _k in _order:
             _g = _grouped[_k]
             _g.pop("_best", None)
@@ -8218,7 +9411,7 @@ def search_fusion(
             if _fids:
                 _g["id"] = _fids[len(_fids) // 2]
                 _g["image_url"] = "/api/image/%s/%s" % (project, _g["id"])
-                _mm = next((m for m in meta if m.get("id") == _g["id"]), None)
+                _mm = _meta_by_id.get(_g["id"])
                 if _mm is not None:
                     for _f in ("filename", "path", "video_source", "timestamp", "video_path"):
                         if _mm.get(_f) is not None:
@@ -8231,6 +9424,12 @@ def search_fusion(
     if items:
         for _it in items:
             _it.setdefault("tags", {})
+            # 段级命中：标签直接用 Clip 的（含证据/置信度），别再去看代表帧的帧级 ai_tags
+            # —— 9-19 之后帧级不再产标签，那儿永远是空的，结果就是"点开看不到依据"。
+            _ck = _it.pop("_segkey", None)
+            if _ck in _clip_tags_by_key:
+                _it["tags"] = _clip_tags_by_key[_ck]
+                _it["clip_id"] = _ck[1]
         try:
             from models import Asset as _As
             _ids = [it.get("id") for it in items if isinstance(it.get("id"), int)][:1000]
@@ -8244,6 +9443,8 @@ def search_fusion(
                                 _As.project_id == _pt.id, _As.vector_id.in_(_ids)).all():
                             _tagmap[_a.vector_id] = _a.ai_tags or {}
                     for _it in items:
+                        if _it.get("clip_id"):
+                            continue        # 段级命中的段已用自己的标签，不被帧级空标签覆盖
                         _it["tags"] = _tagmap.get(_it.get("id")) or {}
                 finally:
                     _dbt.close()
@@ -8261,6 +9462,9 @@ def search_fusion(
         "semantic_note": sem_note,
         "semantic_total": len(sem_scores),
         "tag_hit_total": len(tag_hits),
+        "clip_hit_total": len(clip_hits),          # 段级判定命中的帧数
+        "clip_match_segments": len(clip_matched),  # 命中的 Clip 段数（段级判定的统计口径）
+        "clip_capped": _clip_cap_hit,              # 命中段数是否被 AD_CLIP_SEARCH_MAX 截断
         "total": len(items),
         "results": items,
     }
@@ -8660,10 +9864,11 @@ def _write_deliver_meta(project: str, output_dir: str, items: list, img_dir: str
 # ============================================================
 try:
     from clip_service import (build_clips_from_metadata, load_clips, save_clips,
-                              update_clip_result, set_clip_decision)
+                              update_clip_result, set_clip_decision, mark_clip_error)
     from vlm_clip import predict_clip
 except Exception:  # 缺 torch 等依赖时进入轻量模式，避免整个应用启动失败
-    build_clips_from_metadata = load_clips = save_clips = update_clip_result = set_clip_decision = None
+    build_clips_from_metadata = load_clips = save_clips = update_clip_result = None
+    set_clip_decision = mark_clip_error = None
     predict_clip = None
 @app.post("/api/clips/scan")
 def clips_scan(project: str = Form("default"), clip_size: int = Form(30)):
@@ -8678,38 +9883,355 @@ def clips_scan(project: str = Form("default"), clip_size: int = Form(30)):
     if not clips:
         return {"code": 200, "msg": "未生成 Clip：底库中没有来自视频抽帧的帧（纯图片直导不计入 Clip）", "count": 0}
     return {"code": 200, "msg": f"已生成 {len(clips)} 个 Clip", "count": len(clips)}
+def _clip_item(c, project, light=True, mini=False):
+    """Clip 出参统一在这里构造（列表 / 详情 / 轻量队列共用一套字段口径）。
+
+    mini：只给列表卡片用的极简投影。过去前端要拿"这个段能不能标 / 是不是待审"，
+    只能把全部段拉回浏览器再自己 filter（南美 2.8 万段 → 几十个请求、几 MB），
+    现在筛选交给服务端，卡片要的那几个字段单独带出来即可。"""
+    fids = c.get("frame_ids") or []
+    it = dict(c)
+    it["frame_count"] = len(fids)
+    it["preview_url"] = f"/api/image/{project}/{fids[0]}?w=480" if fids else None
+    if mini:
+        r = c.get("vlm_result") or {}
+        _keep = lambda a: [v for v in (a or []) if v and v != "unknown"]
+        # 只用**事件**置信度：objects 已不再带 confidence（提示词为省输出去掉了），混进来会把"没有事件的段"算成 0 分
+        # （用户反馈"模型自动通过怎么都是0分"的根因）。没有事件 → 分数为 None，前端显示 "-"。
+        _confs = [e.get("confidence") for e in (r.get("events") or [])]
+        _confs = [x for x in _confs if x is not None]
+        return {
+            "clip_id": c.get("clip_id"),
+            "video_id": c.get("video_id"),
+            "frame_count": it["frame_count"],
+            "decision": c.get("decision"),
+            "preview_url": it["preview_url"],
+            "is_seq": str(c.get("video_id") or "").startswith("seq:"),
+            "has_vlm": bool(r),
+            "objs": _keep([o.get("type") for o in (r.get("objects") or [])])[:4],
+            "events": _keep([e.get("type") for e in (r.get("events") or [])])[:3],
+            "weather": _keep((r.get("scene") or {}).get("weather"))[:2],
+            "risk": _keep(r.get("risk"))[:2],          # 风险等级也带出来：它是 AUTO_PASS/REVIEW 的依据之一
+            # 新格式标记：有 reason/risk 才是当前提示词的判定结果。旧格式（历史判定）没有这些字段，
+            # 拿它们做人工对比没有意义（打开理由/参照物都是空的）——前端据此过滤。
+            # 新链路每段都会写 _diag（闸门/检测摘要/判定依据），旧链路没有 → 用它当格式标记最可靠。
+            # （曾用 risk/reason 判断，结果"模型没报事件也没给风险"的段被误判成旧格式）
+            "v2": bool(r.get("_diag")),
+            "score": (int(round(max(_confs) * 100)) if _confs else None),
+        }
+    if fids:
+        # 默认 8 而不是 10：生产一直靠 systemd drop-in 覆盖成 8 —— 代码默认值必须是**安全值**，
+        # 否则绕过 systemd 跑临时脚本时（12G 卡）直接 OOM，还可能连锁触发 VLM 静默降级到 2B
+        # （2026-09-21 实测踩过，排查半天才发现是环境变量没带）。改这里必须同步 vlm_clip.py。
+        _N = int(os.environ.get("AD_CLIP_PICK", "8"))
+        _idx = np.linspace(0, len(fids) - 1, min(_N, len(fids))).round().astype(int).tolist()
+        _seen, _pos = set(), []
+        for _k in _idx:
+            if _k not in _seen:
+                _seen.add(_k)
+                _pos.append(int(_k))
+        it["sample_urls"] = [
+            {"pos": k, "url": f"/api/image/{project}/{fids[k]}?w=480"} for k in _pos
+        ]
+    if light:  # 列表/可视化场景裁掉大字段省流量；frame_ids 保留（30 个 int，很小）：
+               # 前端"播放本段"要用——视频段走 video_window，图片序列段逐帧回放都靠它
+        it.pop("frame_paths", None)
+    return it
 @app.get("/api/clips/list")
-def clips_list(project: str = Query("default"), page: int = 1, size: int = 20, light: int = 0):
+def clips_list(project: str = Query("default"), page: int = 1, size: int = 20, light: int = 0,
+               mini: int = 0, has_vlm: int = 0, decision: str = ""):
+    """段列表。has_vlm / decision 为**服务端筛选**：前端过去是把每一段都拉回去再在浏览器里筛，
+    南美 2.8 万段时那是十几个请求、几 MB 下载，而真正要的只有几十~一千条。
+
+    has_vlm: 1=只要已判定的；**2=只要还没判定的**（批量判定驱动的待判清单用；
+    以前没有这个筛选，驱动只能把全部段拉下来自己求补集 —— 南美 2.6 万段是 50 多个请求、十几 MB）。"""
     ctx = load_project_context(project)
     clips = load_clips(ctx)
+    if has_vlm == 1:
+        clips = [c for c in clips if c.get("vlm_result")]
+    elif has_vlm == 2:
+        clips = [c for c in clips if not c.get("vlm_result")]
+    if decision:
+        _d = decision.upper()
+        clips = [c for c in clips if str(c.get("decision") or "").upper() == _d]
     total = len(clips)
     start = (page - 1) * size
-    # ⚠️ 必须拷贝：clips 来自 load_clips 的**内存缓存**，元素是共享 dict。
+    # ⚠️ _clip_item 内部 dict(c) 拷贝：clips 来自 load_clips 的**内存缓存**，元素是共享 dict。
     # 直接 pop 会把缓存里所有段的 frame_paths 永久删掉 —— 之后 analyze_single 取
     # clip["frame_paths"] 直接 KeyError，判定全量失败（2026-09-20 实测踩坑）。
-    items = [dict(c) for c in clips[start:start + size]]
-    # 返回时附带代表帧预览（每clip前1帧的url即可，前端列表用）
-    for it in items:
-        it["frame_count"] = len(it.get("frame_ids") or [])
-        it["preview_url"] = f"/api/image/{project}/{it['frame_ids'][0]}?w=480" if it.get("frame_ids") else None
-        # 采样帧 URL：与 vlm_clip.sample_representative 同一套均匀取点，
-        # 供审核界面做"模型实际输入的 5 帧 × 判定结果"对照
-        fids = it.get("frame_ids") or []
-        if fids:
-            _N = int(os.environ.get("AD_CLIP_PICK", "10"))
-            _idx = np.linspace(0, len(fids) - 1, min(_N, len(fids))).round().astype(int).tolist()
-            _seen, _pos = set(), []
-            for _k in _idx:
-                if _k not in _seen:
-                    _seen.add(_k)
-                    _pos.append(int(_k))
-            it["sample_urls"] = [
-                {"pos": k, "url": f"/api/image/{project}/{fids[k]}?w=480"} for k in _pos
-            ]
-        if light:  # 列表/可视化场景裁掉大字段省流量；frame_ids 保留（30 个 int，很小）：
-                   # 前端"播放本段"要用——视频段走 video_window，图片序列段逐帧回放都靠它
-            it.pop("frame_paths", None)
+    items = [_clip_item(c, project, light=bool(light) or bool(mini), mini=bool(mini))
+             for c in clips[start:start + size]]
     return {"code": 200, "total": total, "page": page, "size": size, "items": items}
+@app.get("/api/clips/get")
+def clips_get(project: str = Query("default"), clip_id: str = Query(...)):
+    """单个段的完整详情（审核卡 / 打标面板点开某段时按需取，避免整表下放）。"""
+    ctx = load_project_context(project)
+    clip = next((c for c in load_clips(ctx) if c.get("clip_id") == clip_id), None)
+    if not clip:
+        return {"code": 404, "msg": "Clip 不存在"}
+    return {"code": 200, "item": _clip_item(clip, project, light=True)}
+@app.get("/api/clips/objects_report")
+def clips_objects_report(project: str = Query("Oversea_欧洲"), obj: str = Query("红绿灯"),
+                         limit: int = Query(60), all_projects: int = Query(0)):
+    """列出"模型判出某类目标"的段，附抽帧、判定与当时的 YOLO 摘要 —— 供人工核对误检用。
+
+    典型用途：判断 YOLO 置信度阈值是否合适（例如红绿灯 0.5 是否把真灯滤掉了）：
+      * 模型报了这个目标 + YOLO 摘要里也有 → 双方一致，可信
+      * 模型报了但 YOLO 摘要里没有 → YOLO 漏检（阈值可能偏高）
+      * 画面上根本没有 → 模型误检
+    """
+
+    import html as _h
+    import urllib.parse as _up
+    _base = os.environ.get("AD_INDEX_STORE", os.path.join(PROJECT_DIR, "index_store"))
+    _names = [project] if project else []
+    if all_projects:
+        try:
+            _names = [d for d in sorted(os.listdir(_base)) if os.path.isdir(os.path.join(_base, d))]
+        except Exception:
+            _names = []
+    _lim = max(1, min(int(limit or 60), 300))
+    rows = []
+    for nm in _names:
+        try:
+            for c in (load_clips({"name": nm, "dir": os.path.join(_base, nm)}) or []):
+                r = c.get("vlm_result") or {}
+                if not r:
+                    continue
+                _objs = [o.get("type") for o in (r.get("objects") or []) if o.get("type")]
+                if obj not in _objs:
+                    continue
+                fids = c.get("frame_ids") or []
+                det = ((r.get("_diag") or {}).get("det") or [])[:8]
+                evs = []
+                for e in (r.get("events") or []):
+                    fl = e.get("flags") or {}
+                    tag = ("✓位移验证%d%%" % round(fl["motion"] * 100)) if fl.get("motion") is not None else (
+                        "⚠仅模型判定" if fl.get("model_only") else (
+                            "⚠目标缺失" if fl.get("ungrounded") else "未验证"))
+                    evs.append({"t": e.get("type"), "c": e.get("confidence"), "tag": tag,
+                                "r": e.get("reason") or ""})
+                # YOLO 摘要里到底有没有这个目标
+                _hits = [x for x in det if obj in str(x)]
+                rows.append({
+                    "proj": nm, "cid": c.get("clip_id"), "decision": c.get("decision"),
+                    "objs": _objs, "fids": fids[:10], "det": det, "evs": evs,
+                    "yolo_has": len(_hits), "yolo_rows": len([x for x in det if x]),
+                })
+                if len(rows) >= _lim:
+                    break
+        except Exception:
+            continue
+        if len(rows) >= _lim:
+            break
+
+    _n_yolo = sum(1 for x in rows if x["yolo_has"] > 0)
+    cards = []
+    for x in rows:
+        _arr = ",".join("'%s'" % ("/api/image/%s/%s?w=1600" % (_up.quote(x["proj"]), f))
+                        for f in x["fids"])
+        imgs = "".join(
+            '<img loading="lazy" src="/api/image/%s/%s?w=640" onclick="lbOpen([%s],%d)" '
+            'title="点击放大（←→ 翻页 · Esc 关闭）" '
+            'style="width:236px;height:133px;object-fit:cover;border-radius:6px;background:#000;cursor:zoom-in;">'
+            % (_up.quote(x["proj"]), f, _arr, k)
+            for k, f in enumerate(x["fids"]))
+        cards.append(
+            '<div class="c"><div class="hd">%s <span class="dim">%s · %s</span>'
+            '<b class="%s">%s</b></div>'
+            % (_h.escape(str(x["cid"])), _h.escape(x["proj"]), x["decision"],
+               "ok" if x["yolo_has"] else "bad",
+               ("YOLO 摘要里有 %s" % obj) if x["yolo_has"] else ("YOLO 摘要里没有 %s ← 重点看" % obj))
+            + '<div class="imgs">%s</div>' % imgs
+            + '<div class="dim">目标：%s</div>' % "、".join(_h.escape(o) for o in x["objs"])
+            + "".join('<div class="ev"><b>%s</b> %s <span class="%s">%s</span>'
+                      % (_h.escape(str(e["t"])), e["c"],
+                         "ok" if e["tag"].startswith("✓") else "warn", e["tag"])
+                      + ('<div class="rsn">%s</div>' % _h.escape(e["r"]) if e["r"] else "")
+                      + "</div>" for e in x["evs"])
+            + '<div class="det"><b>当时给模型的 YOLO 摘要</b>：%s</div>'
+            % _h.escape("；".join("F%d %s" % (i + 1, t or "-") for i, t in enumerate(x["det"])))
+            + "</div>")
+
+    html = """<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>%s 核对</title><style>
+body{background:#0f172a;color:#e2e8f0;font:13px/1.7 -apple-system,"Microsoft YaHei",sans-serif;margin:0;padding:18px}
+h1{font-size:17px;margin:0 0 6px}.dim{color:#94a3b8}.ok{color:#22c55e}.warn{color:#f59e0b}.bad{color:#ef4444}
+.c{border:1px solid #27364d;border-radius:8px;padding:10px 12px;margin-bottom:10px;background:#111c33}
+.hd{font-weight:700;margin-bottom:7px}.imgs{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px}
+.ev{margin-top:3px}.rsn{color:#e2e8f0;font-size:12px}.det{color:#94a3b8;font-size:12px;margin-top:5px}
+</style></head><body>
+<h1>「%s」核对 · %s</h1>
+<div class="dim">共 <b>%d</b> 段；其中 <b class="ok">%d</b> 段当时的 YOLO 摘要里也检出了「%s」，
+<b class="bad">%d</b> 段只有模型报了（YOLO 没检出，重点看这类 —— 画面里到底有没有）。<br>
+看帧图判断即可（点图放大，←→ 翻页）。</div>
+%s
+<div id="lb" onclick="lbClose()" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.96);align-items:center;justify-content:center;cursor:zoom-out;">
+  <img id="lbImg" style="max-width:96vw;max-height:92vh;object-fit:contain;border-radius:6px;">
+  <div style="position:absolute;bottom:14px;left:0;right:0;text-align:center;color:#94a3b8;font-size:12px;">点击任意处 / Esc 关闭 · ← → 翻页</div>
+</div>
+<script>
+var _lbUrls=[],_lbI=0;
+function lbOpen(urls,i){_lbUrls=urls||[];_lbI=i||0;lbShow();document.getElementById("lb").style.display="flex";}
+function lbShow(){var u=_lbUrls[_lbI]||"";document.getElementById("lbImg").src=u;}
+function lbClose(){document.getElementById("lb").style.display="none";}
+function lbStep(d){if(!_lbUrls.length)return;_lbI=(_lbI+d+_lbUrls.length)%%_lbUrls.length;lbShow();}
+document.addEventListener("keydown",function(e){
+  var lb=document.getElementById("lb");if(!lb||(lb.style.display!=="flex"&&lb.style.display!=="block"))return;
+  if(e.key==="Escape"){lbClose();}
+  else if(e.key==="ArrowRight"){e.preventDefault();lbStep(1);}
+  else if(e.key==="ArrowLeft"){e.preventDefault();lbStep(-1);}
+});
+</script>
+</body></html>""" % (obj, obj, project, len(rows), _n_yolo, obj, len(rows) - _n_yolo,
+                     "".join(cards) or '<div class="dim">没有匹配的段</div>')
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(html)
+
+@app.get("/api/clips/search")
+def clips_search(q: str = Query(...), project: str = Query(""), limit: int = Query(50)):
+    """按 clip ID 搜索（**跨项目全局**）。子串匹配，命中项带项目/决策/首帧预览。
+
+    clip_id 结构是 <源视频名>_<段序号>，项目内唯一且可复现（同一份数据重建段列表 ID 不变）。"""
+    _q = (q or "").strip().lower()
+    if len(_q) < 3:
+        return {"code": 400, "msg": "至少输入 3 个字符"}
+    _lim = max(1, min(int(limit or 50), 200))
+    _base = os.environ.get("AD_INDEX_STORE", os.path.join(PROJECT_DIR, "index_store"))
+    try:
+        _names = [d for d in sorted(os.listdir(_base))
+                  if os.path.isdir(os.path.join(_base, d))]
+    except Exception:
+        _names = []
+    if project:
+        _names = [project] if project in _names else []
+    items = []
+    for nm in _names:
+        try:
+            for c in (load_clips({"name": nm, "dir": os.path.join(_base, nm)}) or []):
+                cid = str(c.get("clip_id") or "")
+                if _q not in cid.lower():
+                    continue
+                fids = c.get("frame_ids") or []
+                r = c.get("vlm_result") or {}
+                items.append({
+                    "project": nm,
+                    "clip_id": cid,
+                    "decision": c.get("decision"),
+                    "has_vlm": bool(r),
+                    "frame_count": len(fids),
+                    "preview_url": ("/api/image/%s/%s?w=320" % (nm, fids[0])) if fids else None,
+                    "events": [e.get("type") for e in (r.get("events") or [])][:4],
+                })
+                if len(items) >= _lim:
+                    break
+        except Exception:
+            continue
+        if len(items) >= _lim:
+            break
+    return {"code": 200, "q": q, "total": len(items), "items": items}
+@app.get("/api/clips/for_frame")
+def clips_for_frame(project: str = Query("default"), fid: int = Query(...)):
+    """帧 → 它所属那一段的 frame_ids（审核卡播放单帧时的上下文）。
+
+    放在服务端是为了不再让前端为查一次所属段而把全部 clip 拉下来。"""
+    ctx = load_project_context(project)
+    for c in load_clips(ctx):
+        fids = c.get("frame_ids") or []
+        if fids and fids[0] <= fid <= fids[-1] and fid in fids:   # 先比边界（常见情形一次比较搞定）
+            return {"code": 200, "clip_id": c.get("clip_id"), "frame_ids": fids}
+    return {"code": 200, "clip_id": None, "frame_ids": []}
+def _mark_clip_error(ctx, clip_id, msg):
+    """判定失败落盘（薄包装）：绝不因为记录失败再抛异常。"""
+    try:
+        if mark_clip_error:
+            mark_clip_error(ctx, clip_id, msg)
+    except Exception as _e:
+        print("[Clip] 记录 vlm_error 失败(忽略): %s" % _e, flush=True)
+
+
+def _project_has_yolo(project: str) -> bool:
+    """本项目跑过帧检测吗（DB 里存在带 yolo 字段的检测记录）。
+
+    用途见 clips_analyze_single 的前置闸门：区分"项目没跑过检测"和"这段确实没目标"。
+    只取一行、走 project_id 索引，毫秒级。DB 异常时返回 True（宁可判定也不要静默拦住）。"""
+    try:
+        from db_service import get_project, Asset
+        db = get_db_session()
+        try:
+            proj = get_project(db, project)
+            if not proj:
+                return False
+            return db.query(Asset.id).filter(
+                Asset.project_id == proj.id,
+                Asset.detections.isnot(None),
+                Asset.detections.like('%"yolo"%'),
+            ).first() is not None
+        finally:
+            db.close()
+    except Exception as _e:
+        print("[Clip] _project_has_yolo 查询失败(%s)，按『跑过检测』处理" % _e, flush=True)
+        return True
+
+
+# YOLO-World（V4）进判定链路：辅助函数（由 _patch_yw_pipeline.py 插入到 clips_analyze_single 之前）
+# 用户 2026-09-22 要求：「进入 clip 判断的链路，就 yolo + yolo world V4，不要 dino 兜底了；
+# 想要 dino 自己手动跑」+「yolo word 所探寻的目标物不要仅限于道路标识，其他目标物也要做进去，
+# 逻辑是 yolo > yolo world > 切段 clip > vlm 结果取并集」。
+#
+# 所以这一路是"**再来一个检测器**"，它的标签和 YOLO 的标签一样进入**并集**：
+#   - 参与类（行人/两轮车/三轮车/小车/大车/公交车/锥桶/围挡）→ 目标列表补全（objects）
+#   - 设施类（红绿灯/指示牌/斑马线）→ 走 `_DET_FACILITY_MOVE` 落到 traffic_sign / road_marking
+#
+# 为什么用显式映射表而不是 dino_dict 反查：V4 是多条英文短语，dino_dict 反查只能命中少数几条，
+# 其余会以英文原样返回、被 `_DET_FACILITY_MOVE`/`_YOLO_LABEL2OBJ` 直接丢掉（坑 #16 的同型问题）。
+# 这里让**类别表本身就是映射表的键**，返回什么、落到本体哪个词，一眼可查、不会两处漂移。
+#
+# 代价实测：模型约 1.5G 显存（可与 7B VLM 8.8G 同卡共存）；单段 8 帧约 0.5~1 秒
+# （对比：DINO 13 秒/帧、VLM 判定约 10 秒/段）。任何异常都返回空集合 → 退化成"没有这一路证据"，不影响判定。
+_YWL_MAP = {
+    # 参与类（本体 objects 的取值）
+    "person": "行人", "bicycle": "两轮车", "motorcycle": "两轮车", "tricycle": "三轮车",
+    "car": "小车", "truck": "大车", "bus": "大车", "van": "大车", "trailer": "大车",
+    "traffic cone": "锥桶", "cone": "锥桶", "barrier": "围挡",
+    # 设施类（本体 traffic_sign / road_marking 的取值）
+    "traffic light": "红绿灯", "traffic signal": "红绿灯", "signal light": "红绿灯",
+    "traffic sign": "指示牌", "road sign": "指示牌", "speed limit sign": "指示牌",
+    "no entry sign": "指示牌", "warning sign": "指示牌",
+    "crosswalk": "斑马线", "zebra crossing": "斑马线",
+}
+_YWL_CLASSES = list(_YWL_MAP.keys())
+_YWL_CONF = 0.30            # 与落盘口径一致（P1b 的 THR2 也是 0.30）
+def _yoloworld_of_segment(frame_paths):
+    """段内采样帧跑一趟 YOLO-World，返回**本体词表里的中文标签**集合（目标物 + 设施）。
+
+    返回值直接喂给并集：参与类进 objects 补全、设施类进 traffic_sign/road_marking。
+    """
+    if not _ensure_yoloworld():
+        return set()
+    # 类别在加载时已设好，这里不重复 set_classes（见 _ensure_yoloworld 的注释：重复调用会设备不匹配）
+    out = set()
+    for p in (frame_paths or []):
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            r = yoloworld_model.predict(source=p, imgsz=1280, conf=0.02, verbose=False)[0]
+        except Exception as e:
+            _log("[检测] YOLO-World 单帧推理失败(跳过该帧): %s" % str(e)[:120])
+            continue
+        for b in r.boxes:
+            try:
+                if float(b.conf[0]) < _YWL_CONF:
+                    continue
+                nm = str(r.names[int(b.cls[0])]).lower().strip()
+            except Exception:
+                continue
+            cn = _YWL_MAP.get(nm)
+            if cn:
+                out.add(cn)
+    if out:
+        _log("[Clip] YOLO-World 段内检出(并入并集): %s" % sorted(out))
+    return out
+
 @app.post("/api/clips/analyze_single")
 def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...)):
     """P0 同步接口：分析单个 Clip（5帧VLM）。用于先验证效果，批量Job在P0通过后再加
@@ -8741,42 +10263,103 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
                    for f in clip["frame_ids"]]
         _fpaths = [p for p in _fpaths if p and os.path.exists(p)]
         clip = dict(clip, frame_paths=_fpaths)   # 用副本，别改缓存对象
-    # 采样帧（与 predict_clip 内部同一套均匀取点）→ 收集每帧的 YOLO/DINO 检测摘要
+    # 采样帧（与 predict_clip 内部同一套均匀取点）→ 一次扫描同时产出两样东西：
+    #   ① 注入提示词的检测摘要：**计数 + 粗略位置**（左/中/右三分栏）。
+    #      以前只给计数（"car×4、person×1"），而提示词里写着"报告横穿要求 ≥2 帧检到
+    #      且位置明显移动"—— 模型根本看不到位置，这条规则它没法执行。只给三分栏，
+    #      不给精确轨迹，避免把答案直接喂进去。
+    #   ② 程序化闸门用的逐帧框中心/宽高（**不**注入提示词）。
     _fids = clip.get("frame_ids") or []
     _fpaths = clip.get("frame_paths") or []
-    _N = int(os.environ.get("AD_CLIP_PICK", "10"))
+    _N = int(os.environ.get("AD_CLIP_PICK", "8"))   # 安全默认 8，理由同上面取帧处
     _idx = np.linspace(0, len(_fids) - 1, min(_N, len(_fids))).round().astype(int).tolist()
+
+    def _yolo_of(_fid):
+        """取该帧**YOLO 来源**的框（含画幅尺寸，用于归一化）。
+
+        ⚠️ 2026-09-22：检测记录现在是"YOLO + YOLO-World 合并"的一条记录，每个框带 `src`。
+        这里**只取 src=="yolo"** 的框 —— 检测摘要/轨迹/事件闸门都吃这个返回值，
+        要是把 YW 的框也算进来，闸门行为会被动改掉（本次改动刻意不碰那部分）。
+        读缓存优先（检测阶段写的就是它），DB 兜底（历史数据）。
+        """
+        try:
+            _rec = (detections_cache.get(project or "default") or {}).get(str(int(_fid))) or {}
+            if not _rec:
+                _a, _c, _db = _find_db_asset(project, _fid)
+                try:
+                    if _a is None:
+                        return [], 1920.0, 1080.0
+                    _rec = (_a.detections or {}) or {}
+                finally:
+                    if _db is not None:
+                        _db.close()
+            _lb = list(_rec.get("labels") or [])
+            _sc = list(_rec.get("scores") or [])
+            _bx = list(_rec.get("boxes") or [])
+            _sr = list(_rec.get("src") or (["yolo"] * len(_lb)))   # 老记录没有 src → 全算 yolo
+            _out = [{"label": l, "confidence": c, "box": b}
+                    for l, c, b, s in zip(_lb, _sc, _bx, _sr) if s == "yolo"]
+            return _out, float(_rec.get("width") or 1920), float(_rec.get("height") or 1080)
+        except Exception:
+            return [], 1920.0, 1080.0
+
     _det_by_path = {}
+    _T0 = time.time()          # 分环节计时（STATE.md 的规矩：先计时再优化，别凭猜）
+    _T1 = _T2 = _T3 = _T0
+    _raw1_len = 0
+    _member_cn = set()          # 段内出现过的目标（中文，映射后）——目标缺失闸门用
+    _track = {}                 # 中文目标 -> [(帧序号, 横向中心0~1, 纵向中心0~1, 宽0~1, 高0~1)]
+    _veh_per_frame = []         # 每帧车辆数（交通状态闸门用）
+    _VEH = ("小车", "大车", "两轮车", "三轮车")
     for _k in _idx:
         if _k >= len(_fpaths):
             continue
         _p, _fid = _fpaths[_k], _fids[_k]
-        _labels = []
-        try:
-            _rec = (detections_cache.get(project) or {}).get(str(_fid)) or {}
-            _labels = list(_rec.get("labels") or [])
-        except Exception:
-            _labels = []
-        if not _labels:
-            try:
-                _a, _c2, _db2 = _find_db_asset(project, _fid)
+        _boxes, _W, _H = _yolo_of(_fid)
+        _cnt, _posb, _nveh = {}, {}, 0
+        for _d in _boxes:
+            _en = str((_d or {}).get("label") or "").lower()
+            if not _en:
+                continue
+            _cn = _YOLO_LABEL2OBJ.get(_en)
+            if not _cn:            # 未映射的类（COCO 误检）直接不计，避免污染摘要
+                continue
+            _member_cn.add(_cn)
+            _cnt[_cn] = _cnt.get(_cn, 0) + 1
+            if _cn in _VEH:
+                _nveh += 1
+            _b = (_d or {}).get("box") or []
+            if len(_b) == 4:
                 try:
-                    if _a is not None:
-                        _dd = (_a.detections or {}).get("yolo") or []
-                        _labels = [d.get("label") for d in _dd if d.get("label")]
-                finally:
-                    if _db2 is not None:
-                        _db2.close()
-            except Exception:
-                _labels = []
-        if _labels:
-            from collections import Counter as _Ct
-            _cn = _Ct()
-            for _lb in _labels:
-                _cn[_YOLO_LABEL2OBJ.get(_lb, _lb)] += 1   # 英文类名映射为中文目标词
-            _det_by_path[_p] = "、".join("%s×%d" % (k, v) for k, v in _cn.most_common())
+                    _cx = (_b[0] + _b[2]) / 2.0 / _W
+                    _cy = (_b[1] + _b[3]) / 2.0 / _H
+                    _bw = abs(_b[2] - _b[0]) / _W
+                    _bh = abs(_b[3] - _b[1]) / _H
+                except Exception:
+                    continue
+                _posb.setdefault(_cn, set()).add("左" if _cx < 1 / 3 else ("右" if _cx > 2 / 3 else "中"))
+                _track.setdefault(_cn, []).append((_k, _cx, _cy, _bw, _bh))
+        _veh_per_frame.append(_nveh)
+        if _cnt:
+            _det_by_path[_p] = "、".join(
+                ("%s×%d(%s)" % (c, n, "".join(sorted(_posb[c])))) if _posb.get(c) else ("%s×%d" % (c, n))
+                for c, n in sorted(_cnt.items(), key=lambda x: -x[1]))
         else:
             _det_by_path[_p] = ""
+
+    # ---- 前置闸门：本项目**从未跑过检测**才跳过；单纯"这段没目标"不该拦 ----
+    # 判定是"检测接地"的：没有检测就没有依据（闸门也失去参照）。用户 2026-09-20 要求。
+    # ⚠️ 2026-09-21 修：原来只要"采样帧一帧都没检出"就 412，但这件事有两种含义——
+    #   ① 项目还没跑 YOLO（该拦）；② 跑过了、这段画面里确实没有目标（不该拦）。
+    #   实测：东南亚 1,687 帧（连片）重检后**仍然全为空**，是真的没目标；旧逻辑把它们
+    #   当成"没跑过检测"，导致含这些帧的段永远判不了（342 段里 33 段、欧洲同类更多）。
+    #   改用**项目级**有没有检测数据来区分：跑过就放行，只是检测摘要为空、核验跳过
+    #   （下面的 has_det=bool(_member_cn) 已经把这点交给 _gate_clip_result 处理）。
+    if not _member_cn and not _project_has_yolo(project):
+        _log("[Clip] %s 跳过：本项目还没跑过帧检测（请先跑「AI场景分析」）" % clip_id)
+        return {"code": 412, "clip_id": clip_id,
+                "msg": "本项目还没有 YOLO 检测结果，已跳过 VLM 判定。"
+                       "请先跑帧检测（数据审核栏「AI场景分析」），再重判。"}
     # 加载与推理放在同一个 GPU 闸门内：12G 卡上模型不能共存，
     # 也避免"加载完->释放锁->被别人卸掉"这种空窗（原来分两段加锁就有这个缝）
     try:
@@ -8786,8 +10369,79 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
                 init_vlm_local()
             if vlm_model is None:
                 return {"code": 500, "msg": "VLM 加载失败（显存不足或权重缺失）"}
+            # ⚠️ 必须显式传预算：predict_clip 的签名默认是 1024，不传的话 _vlm_budget 根本不生效
+            # （实测加"逐帧观察+判定理由"后 2215 字符就被截断，JSON 吐不到结尾，events 整段丢失）
+            _budget = _vlm_budget(multi=True)
+            # 用户 2026-09-22：判定链路里多跑一趟 YOLO-World（只用 yolo + yolo-world，不兜 DINO）。
+            # 它和 YOLO 的标签一样进并集：参与类补 objects、设施类补 traffic_sign/road_marking。
+            # 用户 2026-09-22 定：**检测阶段跑一遍、判定只读**（不再现场跑模型）。
+            _yw_cn = _yoloworld_cn_of_frames(project, _fids)
+            # 2026-09-23：闭集交通标志模型那一路（`src=="sign"`）并进同一份补全证据。
+            # 它给的是语义大类（限速/禁令标志/警告标志/指示标志/指路标志），直接就是本体值。
+            _yw_cn = set(_yw_cn) | _sign_cn_of_frames(project, _fids)
+            _T1 = time.time()          # 到这儿为止 = 取帧 + 检测摘要
             result, raw = predict_clip(vlm_model, vlm_processor, clip["frame_paths"],
-                                       det_by_path=_det_by_path)
+                                       max_new_tokens=_budget, det_by_path=_det_by_path)
+            _T2 = time.time()          # 首判耗时
+            _raw1_len = len(raw or "")  # 首判输出长度（raw 会被重问覆盖，先记下）
+            # ⚠️ 判定"是否截断"必须先剥掉 markdown 代码围栏：模型常把 JSON 包在 ``` 里，
+            # 直接看结尾是不是 } 会误判成截断 → 每段白跑一遍重试（实测把耗时翻倍）。
+            def _looks_truncated(_t):
+                _c = (_t or "").replace("```json", "").replace("```", "").strip()
+                return (not _c) or (not _c.endswith("}"))
+            # 只在"解析不出来"或"关键字段缺失"时重试：模型把 objects 写飞导致的尾部截断
+            # 不该再白跑一遍（events 已按新 schema 顺序放在前面，尾部被切不影响结论）
+            # 压套话第二轮：理由/参照物仍不具体（flags.generic）→ 带定向提示**重问一次**
+            # （只对这部分段触发，实测约占四成；多花的时间换"理由真的能核对画面"）
+            # ⚠️ 2026-09-21 修：重问一次就够。原来重问的输出若又解析失败，还会再触发下面的
+            # "格式提示重问" → **一段跑三次推理**（实测有段 76.5 秒：首判 9.6s + 定向重问 + 66.9s）。
+            # 现在重问失败就**回退到首判结果**（首判本来是能解析的，只是理由不够具体），
+            # 既不白烧一次推理，也不丢掉已经拿到的判定。
+            _first_result, _first_raw = result, raw
+            try:
+                _fl = lambda e: (e.get("flags") or {})       # noqa: E731
+                _gen = [e for e in ((result or {}).get("events") or [])
+                        if _fl(e).get("generic") or _fl(e).get("boiler")]
+                if _gen and result is not None:
+                    _log("[Clip] %s 有 %d 个事件理由缺画面依据，定向重问一次" % (clip_id, len(_gen)))
+                    _r2, _raw2 = predict_clip(
+                        vlm_model, vlm_processor, clip["frame_paths"],
+                        max_new_tokens=_budget,
+                        det_by_path=_det_by_path,
+                        extra_note="你上一条判定里，events 的 reason/anchor 没有点出画面里的具体参照物"
+                                   "（车道线/路缘/人行横道/停止线/前车尾灯/画面边缘…），"
+                                   "或者写的是「马路对面/道路一侧/本车道」这类换到任何视频都成立的判断结论。"
+                                   "请逐条重写 anchor 与 reason，写成「F<起>→F<止>：<目标>从<物A>移到<物B>」。"
+                                   "⚠️ **events 的条数必须与首判完全一致**：写不具体就尽量写，"
+                                   "**绝对不要因为写不具体而删掉事件**（漏报无法补救）。")
+                    if _r2 is None:
+                        _log("[Clip] 定向重问输出无法解析 → 回退首判结果，不再重试")
+                    else:
+                        result, raw = _r2, _raw2
+            except Exception as _e:
+                _log("[Clip] 定向重问失败(忽略): %s" % _e)
+            # 解析失败（result is None）时上面那次重试没用 —— 解码是确定性的（do_sample=False），
+            # 同样输入必然同样格式错误。必须**改变输入**：加一句"只输出合法 JSON"再问一次。
+            # 但若首判本来能解析（只是理由不具体），就别再烧一次了，直接用首判结果。
+            if result is None and _first_result is not None:
+                _log("[Clip] %s 重问失败 → 回退首判结果（首判可解析）" % clip_id)
+                result, raw = _first_result, _first_raw
+            if result is None:
+                _log("[Clip] %s 输出无法解析，带格式提示重问一次" % clip_id)
+                try:
+                    result, raw = predict_clip(
+                        vlm_model, vlm_processor, clip["frame_paths"],
+                        max_new_tokens=_budget,
+                        det_by_path=_det_by_path,
+                        extra_note="你上一次的输出不是合法 JSON（无法解析）。这次**只输出一个 JSON 对象**，"
+                                   "不要任何解释、说明、前缀或代码块围栏；字符串内部不要出现未转义的换行。")
+                except Exception as _e2:
+                    _log("[Clip] 格式重问失败(忽略): %s" % _e2)
+            if result is None or not ((result.get("scene") or {}).get("time")):
+                _log("[Clip] 输出疑似截断(clip=%s, %d 字符)，按 2 倍预算重试一次"
+                     % (clip_id, len(raw or "")))
+                result, raw = predict_clip(vlm_model, vlm_processor, clip["frame_paths"],
+                                           max_new_tokens=_budget * 2, det_by_path=_det_by_path)
     except Exception as e:
         # 只记错误不落 decision：异常多为环境/依赖问题，保持可重试，别把 Clip 永久标成需人工
         import traceback as _tb
@@ -8803,53 +10457,127 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
             except Exception:
                 pass
             _log(f"[Clip] VLM 推理 OOM，已卸载 VLM 释放显存；下次调用会重新加载")
-        update_clip_result(ctx, clip_id, {"error": str(e)})
+        # 失败**只记 vlm_error**，不覆盖已有的好结果，也不把失败段计成已判定（见 mark_clip_error）
+        _mark_clip_error(ctx, clip_id, "VLM推理失败: %s" % str(e)[:300])
         return {"code": 500, "msg": f"VLM推理失败: {e}"}
     if result is None:
-        update_clip_result(ctx, clip_id, {"error": "parse_failed"}, decision="REVIEW")
+        _mark_clip_error(ctx, clip_id, "VLM输出解析失败: %s" % str(raw or "")[:300])
         return {"code": 500, "msg": "VLM输出解析失败", "raw": raw[:500]}
-    # ---- 程序化事件-目标校验（段级版 vlm_event_conflict）----
-    # 事件所需目标在段内任何一帧的 YOLO 检测中都从未出现 → 该事件标记"目标缺失"，整段强制 REVIEW
-    _member_labels = set()
-    for _fid in (clip.get("frame_ids") or []):
-        try:
-            _rec = (detections_cache.get(project) or {}).get(str(_fid)) or {}
-            _member_labels.update(str(x).lower() for x in (_rec.get("labels") or []))
-        except Exception:
-            pass
-    if not _member_labels:
-        try:
-            for _fid in (clip.get("frame_ids") or []):
-                _a3, _c3, _db3 = _find_db_asset(project, _fid)
-                try:
-                    if _a3 is not None:
-                        for _d in (_a3.detections or {}).get("yolo") or []:
-                            if _d.get("label"):
-                                _member_labels.add(str(_d["label"]).lower())
-                finally:
-                    if _db3 is not None:
-                        _db3.close()
-        except Exception:
-            pass
-    _flagged = []
-    for _e in result.get("events") or []:
-        _need = (_EVENT_NEED or {}).get(_e.get("type")) or set()
-        if _need and not (_need & _member_labels):
-            _e["check"] = "目标缺失：段内任何帧的检测都未出现该事件所需目标"
-            _flagged.append(_e.get("type"))
+    # ---- 分层程序化核验闸门（2026-09-20 重写，逻辑在 _gate_clip_result）----
+    # 覆盖：目标缺失 / 横穿与车辆类横向位移 / 交通状态极端矛盾 / 时段。
+    _g = _gate_clip_result(result, _member_cn, _track, _veh_per_frame, _fids, project,
+                           has_det=bool(_member_cn))
+    _flagged = _g["flagged"]
+    result["_diag"] = dict(result.get("_diag") or {},
+                           gates=_g["gates"][-8:],
+                           det=[_det_by_path.get(p, "") for p in _fpaths if p in _det_by_path],
+                           **(_g["diag"] or {}))
     if _flagged:
-        _log(f"[Clip] ⚠️ clip={clip_id} 事件目标缺失: {_flagged} → 强制 REVIEW")
-    # 简易决策：有事件且置信>=0.7 且证据齐全 → REVIEW（重点事件必人工）；事件目标缺失 → REVIEW；否则AUTO_PASS
+        _log("[Clip] ⚠️ clip=%s 事件未通过程序化核验: %s → 强制 REVIEW" % (clip_id, _flagged))
+    # 简易决策：有事件且置信>=0.7 且证据齐全 → REVIEW（重点事件必人工）；未通过核验 → REVIEW；否则AUTO_PASS
     try:
         if torch is not None and DEVICE == "cuda":
             torch.cuda.empty_cache()   # 批量判定时每段回收，防碎片累积（实测长期跑会）
     except Exception:
         pass
-    has_event = any(e["confidence"] >= 0.7 and len(e["evidence"]) >= 2
-                    for e in result["events"])
-    decision = "REVIEW" if (has_event or _flagged) else "AUTO_PASS"
+    # ⚠️ 不能再用 e["evidence"]：证据链字段已按方案删除（A1），只有 reason。
+    # 直接下标会 KeyError → 每个带事件的段都 500（2026-09-20 实测踩到）。兼容老数据保留 evidence 分支。
+    # 目标列表**补全**（确定性，不依赖模型听话）：检测器在段内确实检出的类别，
+    # 模型没列出来的也补上 —— 用户要求"模型检出多少就分类多少"，而实测模型会漏
+    # （检测摘要里有两轮车、目标列表里却没有）。补的项带 src=det 以便界面区分。
+    try:
+        _have = set((o.get("type") or "") for o in (result.get("objects") or []))
+        _slots = max(0, 8 - len(_have))
+        _added = []
+        # 并集（用户 2026-09-22）：段内 YOLO 检出 ∪ YOLO-World 检出
+        for _c in sorted(set(_member_cn) | _yw_cn):
+            if _slots <= 0:
+                break
+            if _c and _c not in _have and _c not in _DET_FACILITY_MOVE:
+                # ⚠️ 设施类（红绿灯/交通标识牌/斑马线）**不能补进 objects**：它们由下面的
+                # _DET_FACILITY_MOVE 补进 traffic_sign / road_marking。补进来就成了
+                # "信号灯同时在目标与交通标识里"，人工真值没法算（2026-09-21 实测踩到）
+                result.setdefault("objects", []).append({"type": _c, "src": "det"})
+                _have.add(_c)
+                _added.append(_c)
+                _slots -= 1
+        if _added:
+            _log("[Clip] %s 目标列表补全(检测器检出但模型没列): %s" % (clip_id, _added))
+    except Exception as _e:
+        _log("[Clip] 目标补全失败(忽略): %s" % _e)
+    # traffic_sign **补全**（同上一段：确定性、不依赖模型听话）。
+    # 2026-09-21：该维度实测 154 段里全是 unknown —— 先试过加提示词规则（12b），
+    # 重判实测模型照样不输出这个字段（它只按规则 11 把红绿灯写进 objects）。
+    # 所以改成和 objects 补全同一套做法：**检测器段内确实检出**的交通设施，
+    # 按本体词表映射后补进 traffic_sign（纯字符串列表，与 scene 其它维度同类型）。
+    # 映射只覆盖"本体里确实有对应值"的类，锥桶/围挡不在 traffic_sign 词表里 → 不补（留在 objects）。
+    try:
+        # 来源两个：段内 YOLO 检出的目标 ∪ **模型自己在 objects 里列出的目标**。
+        # 用户 2026-09-21 要求：只要有"牌子"的证据，就要给出「道路标识牌」这个通用标签，
+        # 而不是让它落成 unknown —— **unknown 从此只表示「确实没有标识 / 完全看不出」**。
+        _src_cn = set(_member_cn) | _yw_cn      # 并集：YOLO ∪ YOLO-World ∪ 模型 objects
+        for _o in (result.get("objects") or []):
+            if isinstance(_o, dict) and _o.get("type"):
+                _src_cn.add(_o["type"])
+        # ⚠️ 必须含 `交通设施` —— 它是 objects 的合法**通用**取值，模型经常只说到这一层
+        # （实测 82 段 traffic_sign=unknown 里，检测摘要没有设施类词、但模型 objects 里写着
+        #  `交通设施`）。漏了它就会出现"模型说了有设施、标签却是 unknown"（2026-09-21 用户反馈）。
+        # ⚠️ 2026-09-21 标签规整后：**标线**（斑马线→人行横道）归 road_marking（对外并入「道路」），
+        # 不再往 traffic_sign 塞 —— 否则同一条标线会在「道路」与「交通标识」两处各记一遍，
+        # 这正是人工真值算不清的根因。这里改成"目标维度 + 值"的映射，分头写。
+        _TS_MAP = _DET_FACILITY_MOVE      # 与「目标列表补全」共用一张表（定义在 _YOLO_LABEL2OBJ 后面）
+        _ts_now = [v for v in ((result.get("traffic_sign") or []) if isinstance(result.get("traffic_sign"), list) else [])
+                   if v and v not in ("unknown", "无标识")]   # 否定值/占位不当作"已有取值"
+        _scene_d = result.get("scene") if isinstance(result.get("scene"), dict) else {}
+        _rm_now = [v for v in (_scene_d.get("road_marking") or []) if v and v != "unknown"]
+        _ts_add, _rm_add = [], []
+        for _c in sorted(_src_cn):
+            _t = _TS_MAP.get(_c)
+            if not _t:
+                continue
+            _dim, _val = _t
+            if _dim == "traffic_sign":
+                if _val not in _ts_now and _val not in _ts_add:
+                    _ts_add.append(_val)
+            elif _val not in _rm_now and _val not in _rm_add:
+                _rm_add.append(_val)
+        if _ts_add:
+            # ⚠️ 必须是**纯字符串列表**：vlm_result 的 scene 各维就是这个类型，
+            # 而下游 `set(r.get("traffic_sign") or [])` 拿它建集合 —— 塞 dict 会 TypeError。
+            result["traffic_sign"] = _ts_now + _ts_add
+            _log("[Clip] %s traffic_sign 补全(段内检出/模型列出该设施但 traffic_sign 没给): %s" % (clip_id, _ts_add))
+        if _rm_add:
+            if not isinstance(result.get("scene"), dict):
+                result["scene"] = _scene_d = {}
+            _scene_d["road_marking"] = _rm_now + _rm_add
+            _log("[Clip] %s road_marking 补全(段内检出/模型列出标线但 road_marking 没给): %s" % (clip_id, _rm_add))
+    except Exception as _e:
+        _log("[Clip] traffic_sign 补全失败(忽略): %s" % _e)
+    has_event = any((e.get("confidence") or 0) >= 0.7
+                    and (e.get("reason") or e.get("evidence"))
+                    for e in result.get("events") or [])
+    # 决策依据（原先只看了事件与核验，**漏了 risk** —— 判成「高风险」但没事件的段会被自动通过）。
+    # 现在：强事件 / 核验失败 / 中高风险 三者任一 → REVIEW；只有「低风险 + 无事件 + 无核验失败」才 AUTO_PASS。
+    _risk = set((result.get("risk") or []) if isinstance(result.get("risk"), list) else [])
+    _risky = bool(_risk & {"中风险", "高风险"})
+    decision = "REVIEW" if (has_event or _flagged or _risky) else "AUTO_PASS"
+    # 把"为什么这么判"记进诊断，界面上能直接看到依据
+    result["_diag"] = dict(result.get("_diag") or {},
+                           basis=" + ".join([x for x in (
+                               ("有事件" if has_event else ""),
+                               ("核验未通过" if _flagged else ""),
+                               ("风险:" + "/".join(sorted(_risk - {"unknown"})) if _risky else ""),
+                           ) if x]) or "无事件·低风险")
     if _flagged:
-        result["check"] = "事件目标缺失: %s" % ",".join(_flagged)
+        result["check"] = "事件未通过程序化核验: %s" % ",".join(_flagged)
+    # 分环节计时落日志：一眼看出时间花在哪（取帧/摘要 vs VLM 首判 vs 重问 vs 后处理）
+    try:
+        _T3 = time.time()
+        _log("[Clip] ⏱ %s 取帧+摘要 %.1fs | 首判 %.1fs(%d字) | 重问 %.1fs | 后处理 %.1fs | 合计 %.1fs"
+             % (clip_id[-26:], _T1 - _T0, _T2 - _T1, _raw1_len, _T3 - _T2, _T3 - _T2,
+                _T3 - _T0))
+    except Exception:
+        pass
     update_clip_result(ctx, clip_id, result, decision=decision)
     return {"code": 200, "clip_id": clip_id, "decision": decision,
             "result": result, "raw_output": raw}
@@ -8857,6 +10585,9 @@ def clips_analyze_single(project: str = Form("default"), clip_id: str = Form(...
 # ===== Clip 段级人工对比打标（金标采集 + 人机逐维度自动对比）=====
 # ============================================================
 _CLIP_BENCH_DIR = os.path.join(PROJECT_DIR, "workspace", "clip_benchmark")
+# 对外仍是 9 维（用户 2026-09-21：9 维已经很多了，保持 9 维）。
+# 「道路」一维内部由模型分三轴回答（road_shape/lane_count/junction，见 _clip_model_sets），
+# 这里对外只暴露合并后的 road，人工打标与评测都按这一维算。
 _CLIP_BENCH_DIMS = ("time", "weather", "road", "road_surface", "scene", "risk",
                     "traffic_sign", "objects", "events")
 
@@ -8868,28 +10599,52 @@ def _clip_model_sets(vlm_result):
     r = vlm_result or {}
     sc = r.get("scene") or {}
     sets = {}
-    for dim in ("time", "weather", "road", "road_surface", "scene", "lighting", "traffic_state"):
+    for dim in ("time", "weather", "road_surface", "scene", "lighting", "traffic_state"):
         sets[dim] = set(sc.get(dim) or [])
+    # 「道路」：模型输出的是四个单一轴，对外仍按一维合并（拆轴只为让模型能答出来）。
+    # 2026-09-21 加 road_marking（路面标线，从 traffic_sign 迁来）：标线属于「路」本身，
+    # 用户定的人机评测口径里「道路」= 线形 ∪ 车道 ∪ 路口 ∪ 标线。漏了这一项，人工在「道路」
+    # 里选「人行横道」就会显示"模型没给道路"。
+    sets["road"] = (set(sc.get("road_shape") or []) | set(sc.get("lane_count") or [])
+                    | set(sc.get("junction") or []) | set(sc.get("road_marking") or [])
+                    | set(sc.get("road") or []))
     sets["risk"] = set(r.get("risk") or [])
     sets["traffic_sign"] = set(r.get("traffic_sign") or [])
     sets["objects"] = set((o.get("type") or "") for o in (r.get("objects") or []) if o.get("type"))
     sets["events"] = set((e.get("type") or "") for e in (r.get("events") or []) if e.get("type"))
     return sets
 
-def _clip_compare(human, model_sets):
+def _clip_compare(human, model_sets, rejected=None, reviewed=False):
+    """逐维度一致性判定（人机打标界面语义：模型标签以**黄色**直接展示，人工只点掉判错的）。
+
+    因此口径是"人工认可后的标签"而非"人工手输的标签"：
+      人工动过的维度（有新增 human 或有取消 rejected）→ 认为他看过该维，
+      未被取消的模型标签视为**默许保留**；再跟模型原判定比 ——
+        一致 / 部分一致（取消了部分或模型漏了人工补的部分）/ 不一致（模型全被点掉）。
+      人工没动过的维度 → 「人工未标」，不计入一致率（没看的维度不能判不一致）。
+    只取消不新增同样是明确判断（"模型这条判错了"），算 不一致，不会被当成"未标"。
+    """
+    _rej = rejected or {}
     out = {}
     for dim in _CLIP_BENCH_DIMS:
         h = set(human.get(dim) or [])
         m = set(model_sets.get(dim) or set())
-        if not h and not m:
-            out[dim] = "both_empty"
-        elif not h:
-            out[dim] = "人工未标"     # 不计入一致率（人工没看的维度不能判不一致）
-        elif not m:
-            out[dim] = "仅模型"
-        elif h == m:
+        x = set(_rej.get(dim) or [])
+        if not h and not x:
+            if reviewed:
+                # 人工核对过这一维、且没做任何改动 = 认可模型（用户口径：没标就算模型对）
+                out[dim] = "both_empty" if not m else "一致"
+            else:
+                out[dim] = "both_empty" if not m else "人工未标"
+            continue
+        eff = h | (m - x)             # 人工认可后的标签（黄标签没点掉=默认认可）
+        if not m:
+            out[dim] = "模型未标"      # 模型一条没报
+        elif not eff:
+            out[dim] = "不一致"        # 模型判的全被人工点掉，人工也没给别的
+        elif eff == m:
             out[dim] = "一致"
-        elif h & m:
+        elif eff & m:
             out[dim] = "部分一致"
         else:
             out[dim] = "不一致"
@@ -8897,23 +10652,43 @@ def _clip_compare(human, model_sets):
 
 @app.post("/api/benchmark/clip_label")
 def clip_label_save(project: str = Form("default"), clip_id: str = Form(...),
-                    gt: str = Form(...), note: str = Form("")):
+                    gt: str = Form(...), note: str = Form(""), rejected: str = Form(""),
+                    reviewed: str = Form("")):
     """人工标注一个 Clip 的场景/事件维度（金标采集）。保存即自动与该段的模型判定逐维度对比，
-    结果随记录存储（盲标：标注时前端不展示模型结果，避免偏置）。"""
+    结果随记录存储。
+    标签语义（2026-09-20 用户明确）：人工与模型**互补不覆盖** —— 最终标签 = (模型 − 人工取消) ∪ 人工；
+    人工既能补模型漏的，也能点掉模型判错的（rejected）。只取消、不新增也允许保存。"""
     try:
         gt = json.loads(gt) if isinstance(gt, str) and gt.strip() else {}
     except Exception:
         return {"code": 400, "msg": "gt 不是合法 JSON"}
-    if not isinstance(gt, dict) or not gt:
-        return {"code": 400, "msg": "gt 不能为空（至少标注一个维度）"}
+    if not isinstance(gt, dict):
+        return {"code": 400, "msg": "gt 不是对象"}
+    try:
+        _rej = json.loads(rejected) if isinstance(rejected, str) and rejected.strip() else {}
+    except Exception:
+        _rej = {}
+    if not isinstance(_rej, dict):
+        _rej = {}
+    # 人工"核对过、认为模型判得对"→ 不做任何改动也必须能存下（2026-09-21 用户要求）：
+    # 他的口径是「模型标了人工没标 = 认为模型是对的」，所以模型判对的段人工本来就什么都不点。
+    # 没有这个开关，那类段一个都留不下痕，等于人工工作白做、P/R/F1 也没法统计。
+    _rev = str(reviewed or "").strip().lower() in ("1", "true", "yes", "on")
+    if not gt and not _rej and not (note or "").strip() and not _rev:
+        return {"code": 400, "msg": "没有任何改动（人工标签、取消项、备注都为空）；"
+                                   "若确认模型判得对，请点「标记已核对」"}
     ctx = load_project_context(project)
     clips = load_clips(ctx)
     clip = next((c for c in clips if c["clip_id"] == clip_id), None)
     if not clip:
         return {"code": 404, "msg": "Clip 不存在"}
     model_sets = _clip_model_sets(clip.get("vlm_result"))
-    compare = _clip_compare(gt, model_sets)
-    rec = {"gt": gt, "model": {k: sorted(v) for k, v in model_sets.items()},
+    # ⚠️ 必须把 _rej 传进去：人工"点掉模型判错的"是要算作判断的（只取消不新增 = 不一致），
+    # 不传的话 eff 会退化成 h|m，"人工只删除"的情况被误判成"一致"（2026-09-21 修）。
+    compare = _clip_compare(gt, model_sets, _rej, _rev)
+    # rejected 必须**存进记录**：统计层要用它区分"人工删掉的（FP）"和"人工没动过的（默认认可，不算 FP）"
+    rec = {"gt": gt, "rejected": _rej, "reviewed": _rev,
+           "model": {k: sorted(v) for k, v in model_sets.items()},
            "compare": compare, "note": note,
            "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
     os.makedirs(_CLIP_BENCH_DIR, exist_ok=True)
@@ -8932,15 +10707,312 @@ def clip_label_save(project: str = Form("default"), clip_id: str = Form(...),
     # 人工标注写入 human_tags，并把 final_tags 设为人工值（最终标签以人工为准）；
     # vlm_result 保持原样不动 —— 它是对比评测的依据（模型当初判了什么要可追溯）。
     # 融合搜索 / 前端展示读 final_tags 时自然用上人工修正后的结果。
+    _merged = {}
     try:
         from clip_service import apply_human_tags as _aht
-        _aht(ctx, clip_id, gt, decision="APPROVED")
+        # _rej：人工在界面上"取消"掉的模型标签（否决名单）—— 已在入口解析
+        # final_tags = (模型 − 人工否决) ∪ 人工新增（互补并集，用户 2026-09-20 明确）：
+        # 人工既能补充模型漏掉的、也能取消模型判错的，是真正可编辑；vlm_result 不动（评测依据）
+        _dims_all = set(list(gt.keys()) + list(model_sets.keys()))
+        for _d in _dims_all:
+            _h = set(gt.get(_d) or [])
+            _x = set(_rej.get(_d) or [])
+            _keep = [v for v in (model_sets.get(_d) or []) if v not in _x]   # 模型里没被否决的
+            _uniq = list(dict.fromkeys(_keep + [v for v in (gt.get(_d) or []) if v]))
+            if _uniq:
+                _merged[_d] = _uniq
+        _aht(ctx, clip_id, gt, final_tags=_merged, rejected=_rej, decision="APPROVED")
+        _log(f"[人机评测] {clip_id} 合并：人工 {json.dumps(gt, ensure_ascii=False)[:80]}"
+             f" | 否决 {json.dumps(_rej, ensure_ascii=False)[:60]} → final {json.dumps(_merged, ensure_ascii=False)[:120]}")
     except Exception as _e:
         _log(f"[人机评测] {clip_id} 人工标签落盘失败: {_e}")
     agree = sum(1 for v in compare.values() if v == "一致")
     return {"code": 200, "clip_id": clip_id, "compare": compare,
             "model": rec["model"], "agree": agree, "total": len(compare),
-            "applied": True, "msg": "已保存：人工标签已覆盖模型结果（final_tags）"}
+            "applied": True, "merged": _merged,
+            "msg": "已保存：final_tags = 人工 ∪ 模型（剔除人工否决），互补并集"}
+
+@app.post("/api/clips/flush")
+def clips_flush():
+    """把批量缓冲的判定结果强制落盘（判定脚本收尾 / 重启前调用，避免留在内存里丢）。"""
+    try:
+        from clip_service import flush_pending
+        flush_pending()
+        return {"code": 200, "msg": "已落盘"}
+    except Exception as e:
+        return {"code": 500, "msg": "落盘失败: %s" % e}
+@app.get("/api/benchmark/sample_report")
+def sample_report(project: str = Query("Oversea_南美"), only: str = Query("")):
+    """抽样对照报告：把「重判前 vs 重判后」逐段并排显示，供人工核对模型到底准不准。
+
+    数据来自抽样存档（重判前快照 + 重判结果），不依赖 clips.json，所以**重判过程中也能看**。
+    only=changed 只看结果有变化的段。
+    """
+    import html as _html
+    import urllib.parse as _up
+    _dir = os.path.join(PROJECT_DIR, "backups", "clips_snapshots")
+    _b = os.path.join(_dir, "sample100_before.json")
+    _a = os.path.join(_dir, "sample100_after_run.json")
+    try:
+        B = json.load(open(_b, encoding="utf-8"))
+    except Exception as e:
+        return {"code": 404, "msg": "找不到重判前快照: %s" % e}
+    try:
+        A = json.load(open(_a, encoding="utf-8"))
+    except Exception:
+        A = {}
+    before = B.get("before_vlm_result") or {}
+    ids = B.get("clip_ids") or []
+    # 预览帧：从 clips.json 取每段首帧（load_clips 有 mtime 缓存，不会每次全量解析）
+    _fr = {}
+    try:
+        for c in (load_clips(load_project_context(project)) or []):
+            if c.get("frame_ids"):
+                _fr[c["clip_id"]] = c["frame_ids"][0]
+    except Exception:
+        pass
+
+    def _ev(e):
+        fl = e.get("flags") or {}
+        tags = []
+        if fl.get("ungrounded"):
+            tags.append('<span class="bad">⚠ 检测不支持</span>')
+        elif fl.get("motion") is not None:
+            tags.append('<span class="ok">✓ 位移验证 %d%%</span>' % round(fl["motion"] * 100))
+        else:
+            tags.append('<span class="dim">未验证</span>')
+        if fl.get("generic"):
+            tags.append('<span class="warn">⚠ 模板复述</span>')
+        if fl.get("repeat"):
+            tags.append('<span class="warn">⚠ 证据重复</span>')
+        s = '<div class="ev"><b>%s</b> <span class="dim">%s</span> %s' % (
+            _html.escape(str(e.get("type"))), e.get("confidence"), " ".join(tags))
+        for t in (e.get("evidence") or []):
+            s += '<div class="evi">· %s</div>' % _html.escape(str(t))
+        if e.get("reason"):
+            s += '<div class="rsn">理由：%s</div>' % _html.escape(str(e["reason"]))
+        if e.get("check"):
+            s += '<div class="bad">核验：%s</div>' % _html.escape(str(e["check"]))
+        return s + "</div>"
+
+    def _scene(r):
+        sc = (r or {}).get("scene") or {}
+        # 对外仍是 9 维：道路的模型输出是四个单一轴，这里合并成一行「道路」显示
+        _AX = ("road_shape", "lane_count", "junction", "road_marking")
+        CN = {"time": "时间", "weather": "天气", "road_surface": "路面",
+              "scene": "场景", "lighting": "照明", "traffic_state": "交通"}
+        out = []
+        for k, v in sc.items():
+            if k in _AX or k == "road":
+                continue
+            v = [x for x in (v or []) if x and x != "unknown"]
+            if v:
+                out.append("%s:%s" % (CN.get(k, k), "/".join(v)))
+        _rd = []
+        for k in _AX + ("road",):
+            _rd += [x for x in (sc.get(k) or []) if x and x != "unknown"]
+        if _rd:
+            _i = next((i for i, t in enumerate(out) if t.startswith("天气:")), -1) + 1
+            out.insert(_i, "道路:" + "/".join(dict.fromkeys(_rd)))
+        for k, cn in (("risk", "风险"), ("traffic_sign", "标识")):
+            v = [x for x in ((r or {}).get(k) or []) if x and x != "unknown"]
+            if v:
+                out.append("%s:%s" % (cn, "/".join(v)))
+        objs = [o.get("type") for o in ((r or {}).get("objects") or []) if o.get("type")]
+        if objs:
+            out.append("目标:" + "/".join(objs))
+        return "　".join(out) or "（空）"
+
+    # ---- 指标对比 ----
+    def _stat(getter, subset):
+        n_ev = n_tmpl = n_motion = n_unver = n_bad = 0
+        groups = set()
+        risk_clips = 0
+        for cid in subset:
+            r = getter(cid)
+            if not r:
+                continue
+            evs = r.get("events") or []
+            for e in evs:
+                n_ev += 1
+                if e.get("evidence"):
+                    groups.add(" | ".join(e.get("evidence") or []))
+                fl = e.get("flags") or {}
+                if not fl:
+                    try:
+                        from vlm_clip import _evidence_flags
+                        fl = _evidence_flags(e.get("type"), e.get("evidence") or [])
+                    except Exception:
+                        fl = {}
+                if fl.get("generic") or fl.get("boiler") or fl.get("repeat"):
+                    n_tmpl += 1
+                if fl.get("ungrounded"):
+                    n_bad += 1
+                elif fl.get("motion") is not None:
+                    n_motion += 1
+                else:
+                    n_unver += 1
+            if [x for x in ((r.get("risk") or []) if isinstance(r.get("risk"), list) else []) if x != "unknown"]:
+                risk_clips += 1
+        return dict(ev=n_ev, tmpl=n_tmpl, groups=len(groups), motion=n_motion,
+                    unver=n_unver, bad=n_bad, risk=risk_clips)
+
+    # 两侧都用**同一个子集**（已完成重判的段）统计，否则重判跑到一半时口径不可比
+    _done_ids = [c for c in ids if (A.get(c) or {}).get("code") == 200]
+    sb = _stat(lambda c: before.get(c), _done_ids)
+    sa = _stat(lambda c: {
+        "events": (A.get(c) or {}).get("events") or [],
+        "scene": (A.get(c) or {}).get("scene") or [],
+        "risk": (A.get(c) or {}).get("risk") or [],
+    }, _done_ids)
+    done = len(_done_ids)
+
+    def _row(k, b, a, pct=False):
+        f = (lambda x: ("%.0f%%" % (100.0 * x / max(1, sb["ev"]))) if pct else str(x))
+        g = (lambda x: ("%.0f%%" % (100.0 * x / max(1, sa["ev"]))) if pct else str(x))
+        return '<tr><td>%s</td><td class="num">%s</td><td class="num">%s</td></tr>' % (k, f(b), g(a))
+
+    rows = (_row("事件总数", sb["ev"], sa["ev"])
+            + _row("模板复述/证据重复", sb["tmpl"], sa["tmpl"], True)
+            + _row("证据不同写法（种）", sb["groups"], sa["groups"])
+            + _row("位移验证通过", sb["motion"], sa["motion"])
+            + _row("检测不支持", sb["bad"], sa["bad"])
+            + _row("无法程序化验证", sb["unver"], sa["unver"])
+            + _row("risk 有值的段", sb["risk"], sa["risk"]))
+
+    # ---- 逐维度取值分布（改动前 vs 改动后）----
+    # 用户要的就是这个："各维度结果放到这里，前后对比"。用 `_clip_model_sets` 同一套投影，
+    # 所以「道路」是四轴并集 —— 标线迁到 road_marking 后仍会显示在「道路」行里，不会凭空消失。
+    def _dim_counts(getter):
+        cnt = {}
+        for cid in _done_ids:
+            r = getter(cid)
+            if not r:
+                continue
+            try:
+                sets = _clip_model_sets(r)
+            except Exception:
+                continue
+            for d, vals in sets.items():
+                if d not in _CLIP_BENCH_DIMS:
+                    continue          # 内部分轴(road_shape/lane_count/junction/road_marking)已在「道路」里
+                for v in (vals or []):
+                    if v and v != "unknown":
+                        cnt.setdefault(d, {})
+                        cnt[d][v] = cnt[d].get(v, 0) + 1
+        return cnt
+
+    _DIM_CN = {"time": "时间", "weather": "天气", "road": "道路", "road_surface": "路面",
+               "scene": "场景", "risk": "风险", "traffic_sign": "交通标识",
+               "objects": "目标", "events": "事件"}
+    _cb = _dim_counts(lambda c: before.get(c))
+    _ca = _dim_counts(lambda c: {"scene": (A.get(c) or {}).get("scene"),
+                                 "risk": (A.get(c) or {}).get("risk"),
+                                 "traffic_sign": (A.get(c) or {}).get("traffic_sign"),
+                                 "objects": (A.get(c) or {}).get("objects"),
+                                 "events": (A.get(c) or {}).get("events")})
+    _drows = []
+    for _dim in _CLIP_BENCH_DIMS:
+        _vals = sorted(set(_cb.get(_dim) or {}) | set(_ca.get(_dim) or {}),
+                       key=lambda v: -((_cb.get(_dim) or {}).get(v, 0) + (_ca.get(_dim) or {}).get(v, 0)))
+        for _v in _vals:
+            _b = (_cb.get(_dim) or {}).get(_v, 0)
+            _a = (_ca.get(_dim) or {}).get(_v, 0)
+            if _b and not _a:
+                _mk = '<span class="bad">改动后没了</span>'
+            elif _a and not _b:
+                _mk = '<span class="ok">改动后才出现</span>'
+            elif _a > _b:
+                _mk = '<span class="ok">+%d</span>' % (_a - _b)
+            elif _a < _b:
+                _mk = '<span class="warn">%d</span>' % (_a - _b)
+            else:
+                _mk = '<span class="dim">=</span>'
+            _drows.append('<tr><td>%s</td><td>%s</td><td class="num">%d</td><td class="num">%d</td><td>%s</td></tr>'
+                          % (_DIM_CN.get(_dim, _dim), _html.escape(str(_v)), _b, _a, _mk))
+    dim_table = ('<table><tr><th>维度</th><th>取值</th><th>改动前</th><th>改动后</th><th>变化</th></tr>%s</table>'
+                 % "".join(_drows)) if _drows else '<div class="dim">（还没有可对比的判定结果）</div>'
+
+    # ---- 逐段对照 ----
+    items = []
+    for cid in ids:
+        b = before.get(cid) or {}
+        a = A.get(cid)
+        b_ev = [{"type": e.get("type"), "confidence": e.get("confidence"),
+                 "evidence": e.get("evidence") or []} for e in (b.get("events") or [])]
+        a_ev = (a or {}).get("events") or []
+        bt = tuple(sorted(e["type"] for e in b_ev))
+        at = tuple(sorted(e["type"] for e in a_ev))
+        changed = (bt != at) or (not a)
+        if only == "changed" and not changed:
+            continue
+        det = ((a or {}).get("frames") or [])
+        det = ((a or {}).get("_diag") or {}).get("det") or det
+        img = _fr.get(cid)
+        thumb = ('<img loading="lazy" src="/api/image/%s/%s?w=320">' % (
+            _up.quote(project), img)) if img else '<div class="noimg">无预览</div>'
+        blk_a = ("".join(_ev(e) for e in a_ev)
+                 or ('<div class="prg">尚未重判（进度 %d/%d）</div>' % (done, len(ids)) if not a
+                     else '<div class="dim">本段未判定出事件</div>'))
+        if a_ev:
+            blk_a += '<div class="dl">场景：%s</div>' % _html.escape(_scene(a))
+            if det:
+                blk_a += ('<div class="dl">当时给模型的检测摘要：%s</div>'
+                          % _html.escape("；".join("F%d %s" % (i + 1, t or "-") for i, t in enumerate(det))))
+        items.append(
+            '<div class="clip%s">' % (" chg" if changed else "")
+            + '<div class="hd">%s <span class="dim">%s</span>%s</div>'
+            % (_html.escape(cid[-26:]), (a or {}).get("decision") or "", " <b>已变</b>" if changed else "")
+            + '<div class="cols">'
+            + '<div class="col"><div class="ttl">预览</div>%s</div>' % thumb
+            + '<div class="col"><div class="ttl">改动前</div>%s<div class="dl">场景：%s</div></div>'
+            % ("".join(_ev(e) for e in b_ev), _html.escape(_scene(b)))
+            + '<div class="col"><div class="ttl">改动后</div>%s</div>' % blk_a
+            + "</div></div>")
+
+    html = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<title>抽样对照报告 · %s</title><style>
+body{background:#0f172a;color:#e2e8f0;font:13px/1.7 -apple-system,"Microsoft YaHei",sans-serif;margin:0;padding:18px}
+h1{font-size:17px;margin:0 0 4px}h2{font-size:14px;margin:22px 0 8px;color:#38bdf8}
+table{border-collapse:collapse;font-size:13px;margin-bottom:6px}td,th{border:1px solid #27364d;padding:5px 12px;text-align:left}
+td.num{text-align:right;font-variant-numeric:tabular-nums}.dim{color:#94a3b8}
+.clip{border:1px solid #27364d;border-radius:8px;padding:10px 12px;margin-bottom:10px;background:#111c33}
+.clip.chg{border-color:#2563eb}.hd{font-weight:700;margin-bottom:8px}
+.cols{display:flex;gap:14px;flex-wrap:wrap}.col{flex:1 1 300px;min-width:280px}
+.ttl{font-size:12px;color:#38bdf8;margin-bottom:4px}.ev{margin-bottom:6px}
+.evi{color:#cbd5e1;font-size:12px}.rsn{color:#e2e8f0;font-size:12px}
+.dl{color:#94a3b8;font-size:12px;margin-top:4px}
+.ok{color:#22c55e}.warn{color:#f59e0b}.bad{color:#ef4444}
+img{width:100%%;max-width:320px;border-radius:6px;display:block;background:#000}
+.noimg{color:#64748b;font-size:12px}.prg{color:#f59e0b}
+a{color:#38bdf8;margin-right:12px}</style></head><body>
+<h1>抽样对照报告 · %s</h1>
+<div class="dim">重判进度 %d/%d　<a href="?project=%s">全部</a><a href="?project=%s&only=changed">只看有变化的段</a></div>
+<h2>指标对比</h2>
+<table><tr><th>指标</th><th>改动前</th><th>改动后</th></tr>%s</table>
+<div class="dim">上表两侧都只统计<b>已重判完成的同一批段</b>，进度见页面顶部；跑到 200/200 即为全样本口径。<br>模板复述率 = 命中「没有具体参照物 / 判据同义词套话 / 证据重复」标记的事件占比；越低越好。<br>
+位移验证 = 程序化用 YOLO 框实测到横向位移并通过判据的事件数。</div>
+<h2>逐维度取值分布（改动前 vs 改动后）</h2>%s
+<h2>逐段对照</h2>%s
+</body></html>""" % (project, project, done, len(ids),
+                     _up.quote(project), _up.quote(project),
+                     rows, dim_table, "".join(items) or '<div class="dim">（没有可显示的段）</div>')
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(html)
+
+@app.get("/api/benchmark/clip_label/one")
+def clip_label_one(project: str = Query("default"), clip_id: str = Query(...)):
+    """取某一段**已保存的人工真值**（数据审核卡打开时回显上次的订正与备注）。
+
+    与人机打标共用同一份记录（`workspace/clip_benchmark/<项目>.json`），
+    所以两处看到的永远是同一套真值 —— 用户 2026-09-21 要求直接在数据审核里做这个交互。"""
+    try:
+        with open(_clip_bench_path(project), encoding="utf-8") as f:
+            rec = ((json.load(f).get("labeled")) or {}).get(clip_id)
+    except Exception:
+        rec = None
+    return {"code": 200, "record": rec}
+
 
 @app.get("/api/benchmark/clip_label/stats")
 def clip_label_stats(project: str = Query("default")):
@@ -8951,7 +11023,7 @@ def clip_label_stats(project: str = Query("default")):
             labeled = (json.load(f).get("labeled")) or {}
     except Exception:
         labeled = {}
-    agg = {dim: {"一致": 0, "部分一致": 0, "不一致": 0, "人工未标": 0, "仅模型": 0, "both_empty": 0}
+    agg = {dim: {"一致": 0, "部分一致": 0, "不一致": 0, "人工未标": 0, "模型未标": 0, "both_empty": 0}
            for dim in _CLIP_BENCH_DIMS}
     dis = []
     # ---- P/R/F1（以人工标注为真值 GT，micro 按维度聚合；unknown 双侧剔除）----
@@ -8959,27 +11031,50 @@ def clip_label_stats(project: str = Query("default")):
     _m_all = {dim: 0 for dim in _CLIP_BENCH_DIMS}
     _h_all = {dim: 0 for dim in _CLIP_BENCH_DIMS}
     _ev = {}   # 事件类别 -> tp/fp/fn（段级多标签）
+    # 统计口径（用户 2026-09-21 明确）：**模型标了、人工没标 = 认为模型是对的**。
+    # 人工的职责只有两件：**删掉判错的**（rejected）+ **补上漏的**（human）。
+    #   真值 truth = 人工补充 ∪ (模型 − 人工删除)
+    #   P = |模型 ∩ truth| / |模型|   → FP 只来自"人工明确删掉的"
+    #   R = |模型 ∩ truth| / |truth|  → FN 只来自"人工补上而模型没报的"
+    # 人工完全没动过的维度**不计入**（没看过就不能判对错，与 _clip_compare 的"人工未标"一致）。
     for cid, rec in labeled.items():
         gt = rec.get("gt") or {}
         model = rec.get("model") or {}
+        rej = rec.get("rejected") or {}
+        _rev = bool(rec.get("reviewed"))
         for dim in _CLIP_BENCH_DIMS:
             h = set(gt.get(dim) or []) - {"unknown"}
             m = set(model.get(dim) or []) - {"unknown"}
-            _inter[dim] += len(h & m)
+            x = set(rej.get(dim) or []) - {"unknown"}
+            if not h and not x and not _rev:
+                continue                      # 人工没核对过 → 不计入
+            truth = h | (m - x)               # 核对过且无改动时 truth == m（认可模型）
+            _inter[dim] += len(m & truth)
             _m_all[dim] += len(m)
-            _h_all[dim] += len(h)
+            _h_all[dim] += len(truth)
         he = set(gt.get("events") or []) - {"unknown"}
         me = set(model.get("events") or []) - {"unknown"}
-        for e in (he | me):
-            a = _ev.setdefault(e, {"tp": 0, "fp": 0, "fn": 0})
-            if e in he and e in me:
-                a["tp"] += 1
-            elif e in me:
-                a["fp"] += 1
-            else:
-                a["fn"] += 1
+        xe = set(rej.get("events") or []) - {"unknown"}
+        if he or xe or _rev:                  # 事件维度同样：没核对过就不计入
+            te = he | (me - xe)
+            for e in (te | me):
+                a = _ev.setdefault(e, {"tp": 0, "fp": 0, "fn": 0})
+                if e in me and e in te:
+                    a["tp"] += 1
+                elif e in me:
+                    a["fp"] += 1
+                else:
+                    a["fn"] += 1
+    # 老记录里该类别叫「仅模型」（实为模型未报）—— 映射过来，别让历史标注白标
+    _LEGACY = {"仅模型": "模型未标"}
     for cid, rec in labeled.items():
-        for dim, v in (rec.get("compare") or {}).items():
+        # 现算而不是读存档：口径改过（2026-09-21 补 rejected），现算能保证新旧记录一致
+        _cmp = _clip_compare(rec.get("gt") or {},
+                             {k: set(v or []) for k, v in (rec.get("model") or {}).items()},
+                             rec.get("rejected") or {},
+                             bool(rec.get("reviewed")))
+        for dim, v in _cmp.items():
+            v = _LEGACY.get(v, v)
             if dim in agg and v in agg[dim]:
                 agg[dim][v] += 1
                 if v == "不一致":
@@ -9038,7 +11133,8 @@ def clip_label_report(project: str = Query("default")):
         return {"code": 200, "empty": True,
                 "msg": "还没有人工标注数据 —— 先到「人机打标评测」标几段（建议 ≥30 段）"}
 
-    CN = {"time": "时间", "weather": "天气", "road": "道路", "road_surface": "路面",
+    CN = {"time": "时间", "weather": "天气", "road_shape": "线形", "lane_count": "车道",
+          "junction": "路口", "road_marking": "标线", "road_surface": "路面",
           "scene": "场景", "risk": "风险", "traffic_sign": "交通标识",
           "objects": "目标", "events": "事件"}
     inter = {d: 0 for d in _CLIP_BENCH_DIMS}
@@ -9407,8 +11503,14 @@ def clips_stats(project: str = Query("default")):
         if c.get("video_id"):
             videos.add(c["video_id"])
         r = c.get("vlm_result") or {}
-        for dim, vals in (r.get("scene") or {}).items():
-            for v in (vals or []):
+        # ⚠️ 必须用 `_clip_model_sets` 统一口径（2026-09-21 修）：`traffic_sign` / `risk` 是
+        # **顶层字段、不在 scene 里**，而「道路」是四个轴（road_shape/lane_count/junction/
+        # road_marking）合并出来的一维。以前这里只遍历 `r["scene"]` → 覆盖看板与维度对照表里
+        # **「交通标识」永远不显示**（用户反馈："数据审核栏只有 6 个维度，证据链里却有交通信号灯"）。
+        _sets = _clip_model_sets(r)
+        for dim in ("time", "weather", "road", "road_surface", "scene", "risk",
+                    "traffic_sign", "lighting", "traffic_state"):
+            for v in (_sets.get(dim) or ()):
                 if v and v != "unknown":
                     scene.setdefault(dim, {})
                     scene[dim][v] = scene[dim].get(v, 0) + 1

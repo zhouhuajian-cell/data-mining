@@ -282,8 +282,10 @@
         .audit-stats { display: flex; gap: 14px; flex-wrap: wrap; margin: 6px 0 12px; }
         .audit-stat { background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 14px; font-size: 13px; }
         .audit-stat .v { font-size: 20px; font-weight: 800; color: var(--primary); }
+        .audit-tile { cursor: pointer; user-select: none; transition: all .15s; }
+        .audit-tile:hover { border-color: var(--primary); }
+        .audit-tile.active { border-color: var(--primary); background: rgba(59,130,246,.18); box-shadow: 0 0 0 1px var(--primary) inset; }
         .audit-detail { flex: 1; min-width: 380px; }
-        .audit-detail img.main { width: 100%; max-height: 340px; object-fit: contain; background: #000; border-radius: var(--radius-md); border: 1px solid var(--border); }
         /* 可放大的图片统一给 zoom-in 光标（放大动作由全局委托 imgZoomLayer 接管） */
         #auditPanel img, #hardCasePanel img, #dataAssetPanel img,
         #fusionSearchPanel img, #assetTablePanel img, #demandPanel img { cursor: zoom-in; }
@@ -429,7 +431,7 @@
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg></div>
                     数据审核 <span id="auditProjectTag" style="color: var(--primary); font-size: 13px;"></span>
                     <span style="flex:1;"></span>
-                    <button class="secondary" onclick="auditRefresh()" style="padding:4px 12px; font-size:12px;">刷新队列</button>
+                    
                     <button class="secondary" onclick="auditRunBatch()" style="padding:4px 12px; font-size:12px;" title="一键跑完两段：① 全部已入库帧的 AI检测(融合YOLO/DINO)+场景分析+自动决策；② 帧组成 Clip 后逐片段 VLM 场景判定">AI场景分析</button><button class="secondary" id="aiPauseBtn" onclick="aiTogglePause()" style="padding:4px 10px; font-size:12px; margin-left:6px;" title="暂停当前 AI 任务：帧间生效，不丢进度、不重载模型，点一下继续">暂停</button><button class="secondary" onclick="aiCancelBatch()" style="padding:4px 10px; font-size:12px; margin-left:4px; color:var(--danger); border-color:rgba(239,68,68,0.5);" title="临时终止当前 AI 任务：当前帧处理完即停，已处理的帧全部保留，重发时勾选「增量」即可续跑">终止</button><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiOnlyNew" checked> 增量（跳过已跑过的帧）</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="勾选=只跑还没做 AI 分析的帧（新入库的帧）；取消=全部重跑（改了提示词/本体后需要）"><input type="checkbox" id="aiFuseDetect" checked> 融合YOLO检测</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;"><input type="checkbox" id="aiDinoEnhance" title="开销较大（逐帧开放词推理），默认关；需要对小目标/长尾目标做第二证据源时手动勾选"> 增强DINO开放词</label><label style="font-size:11px;color:var(--text-muted);margin-left:10px;display:inline-flex;gap:4px;align-items:center;" title="② 段：每 N 帧组成一个 Clip 做 VLM 判定">Clip帧数 <input type="number" id="clipSizeInput" value="30" min="5" step="5" style="width:58px; padding:2px 4px;"></label>
                     </div>
 <div id="aiJobProg" style="display:none; margin-top:10px; padding:8px 12px; background:rgba(0,0,0,0.25); border:1px solid rgba(245,158,11,.4); border-radius:8px;">
@@ -444,84 +446,85 @@
                         <div id="aiJobMsg" style="font-size:11px; color:var(--text-muted); margin-top:4px;"></div>
                                 </div>
 <div class="audit-stats" id="auditStats">
-                    <div class="audit-stat">待审核 <div class="v" id="auditStatReview">-</div></div>
-                    <div class="audit-stat">AI自动通过 <div class="v" style="color:var(--success);" id="auditStatPass">-</div></div>
-                    <div class="audit-stat">已人工通过 <div class="v" style="color:var(--primary);" id="auditStatApproved">-</div></div>
-                    <div class="audit-stat">已驳回 <div class="v" style="color:var(--danger);" id="auditStatFilter">-</div></div>
+                    <div class="audit-stat audit-tile active" data-f="REVIEW" onclick="auditFilterBy(this)">待审核 <div class="v" id="auditStatReview">-</div></div>
+                    <div class="audit-stat audit-tile" data-f="AUTO_PASS" onclick="auditFilterBy(this)">模型通过 <div class="v" style="color:var(--success);" id="auditStatPass">-</div></div>
+                    <div class="audit-stat audit-tile" data-f="APPROVED" onclick="auditFilterBy(this)">已人工审核 <div class="v" style="color:var(--primary);" id="auditStatApproved">-</div></div>
+                    <div class="audit-stat audit-tile" data-f="FILTERED" onclick="auditFilterBy(this)">已驳回 <div class="v" style="color:var(--danger);" id="auditStatFilter">-</div></div>
                 </div>
                 <div class="audit-wrap"><!-- 左：队列 -->                    <div class="audit-queue" id="auditQueue">
-                        <div class="audit-empty">点击「刷新队列」加载待审核数据</div>
+                        <div class="audit-empty">正在加载待审核数据…（切到本模块会自动加载）</div>
                     </div><!-- 右：详情与操作 -->                    <div class="audit-detail" id="auditDetail">
                         <div class="audit-empty" id="auditDetailEmpty">选择左侧卡片查看详情，或直接进行审核操作</div>
                         <div id="auditDetailBody" style="display:none;"></div>
                     </div>
                 </div>
-            </div><!-- 👇 人机打标评测（金标采集 + 人机 P/R/F1 对比）—— 替换原 Hard Case 栏 👇 -->
+            </div><!-- 👇 模型Benchmark评测（金标采集 + 人机 P/R/F1 对比）—— 替换原 Hard Case 栏 👇 -->
             <div class="panel" id="hardCasePanel" style="border:2px solid rgba(59,130,246,0.5);">
                 <div class="panel-header" style="color:var(--primary);">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg></div>
-                    人机打标评测 <span id="clProj" style="color:var(--primary); font-size:13px;"></span>
+                    模型Benchmark评测 <span id="clProj" style="color:var(--primary); font-size:13px;"></span>
                     <span style="flex:1;"></span>
                     <span id="clProgress" style="font-size:12px; color:var(--text-muted); margin-right:10px;"></span>
                     <button class="secondary" onclick="clipLabelReport()" style="padding:4px 12px; font-size:12px;">📋 对比报告</button>
                     <button class="secondary" onclick="clipLabelShowStats()" style="padding:4px 12px; font-size:12px;">维度 P/R/F1</button>
-                    <button class="secondary" onclick="clipLabelOpen()" style="padding:4px 12px; font-size:12px;">开始 / 刷新</button>
+                    
                 </div>
                 <div id="clStats" style="display:none; margin-bottom:10px; font-size:12px;"></div>
                 <!-- 左右布局：左=画面（可播放）· 右=标签面板（独立滚动）—— 边看边标 -->
                 <div style="display:flex; gap:12px; align-items:stretch; height:max(460px, calc(100vh - 200px));">
                     <!-- 左：舞台 + 缩略图条 -->
                     <div style="flex:1; min-width:0; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:8px; background:rgba(148,163,184,0.05); border:1px solid rgba(148,163,184,.2); border-radius:10px; padding:10px;">
-                        <!-- 舞台：按 16:9 定高（与帧画面比例一致，不产生黑边），剩余高度留给缩略图条 -->
-                        <div style="flex:0 0 auto; aspect-ratio:16/9; position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:0;">
-                            <img id="clStageImg" src="" onclick="ivOpen(_cl.bigUrls, _cl.stageIdx)" style="width:100%; height:100%; object-fit:contain; cursor:zoom-in;" title="点击可放大（滚轮缩放 / ←→ 翻页）">
-                            <div style="position:absolute; left:0; right:0; bottom:0; padding:8px 12px; display:flex; gap:10px; align-items:center; background:linear-gradient(transparent, rgba(0,0,0,0.85));">
-                                <button class="secondary" onclick="clStageStep(-5)" style="padding:4px 10px; font-size:13px;" title="快退 5 帧">⏪</button>
-                                <button class="secondary" onclick="clStageStep(-1)" style="padding:4px 10px; font-size:13px;" title="上一帧（←）">⏮</button>
-                                <button id="clPlayBtn" class="secondary" onclick="clStageToggle()" style="padding:4px 14px; font-size:13px; min-width:76px;">▶ 播放</button>
-                                <button class="secondary" onclick="clStageStep(1)" style="padding:4px 10px; font-size:13px;" title="下一帧（→）">⏭</button>
-                                <button class="secondary" onclick="clStageStep(5)" style="padding:4px 10px; font-size:13px;" title="快进 5 帧">⏩</button>
-                                <input id="clSeek" type="range" min="0" max="0" value="0" oninput="clStageSeek(this.value)" style="flex:1; min-width:80px; cursor:pointer;">
-                                <select id="clSpeed" onchange="clStageSetSpeed(this.value)" style="font-size:12px; padding:3px 4px;" title="播放速度（快进）">
-                                    <option value="1000">0.5x</option>
-                                    <option value="500" selected>1x</option>
-                                    <option value="250">2x</option>
-                                    <option value="125">4x</option>
-                                    <option value="60">8x</option>
-                                </select>
-                                <label style="font-size:12px; color:#cbd5e1; display:inline-flex; align-items:center; gap:4px; cursor:pointer;" title="播完自动从头再播（默认关，避免一直占用解码）">
-                                    <input type="checkbox" id="clLoop" style="cursor:pointer;"> 循环
-                                </label>
-                                <span id="clStageInfo" style="font-size:12px; color:#cbd5e1; min-width:80px; text-align:right;"></span>
-                            </div>
-                        </div>
-                        <!-- 缩略图条：flex:1 吃掉左栏剩余高度（否则底部留白，与右侧标签区不齐） -->
-                        <div id="clFrames" style="flex:0 0 auto; max-height:118px; display:grid; grid-template-columns:repeat(auto-fill,minmax(74px,1fr)); gap:4px; overflow-y:auto; align-content:start;"></div>
+                        <!-- 舞台 + 缩略图条：由共用组件 stageHtml('cl') 生成（与人机评测/数据审核同一套控件） -->
+                        <div id="clStageHost" style="display:contents;"></div>
                         <div id="clMeta" style="font-size:12px; color:var(--text-muted);"></div>
+                        <!-- 模型判定的事件与证据：放在视频（含切换按钮）下方，边看边核对 -->
+                        <div id="clEvidence" style="font-size:12px; line-height:1.75;"></div>
+                        <div id="clChain" style="font-size:12px;"></div>
                     </div>
                     <!-- 右：标签面板（小窗，独立滚动，不挤画面） -->
                     <div style="flex:0 0 430px; display:flex; flex-direction:column; min-height:0; overflow:hidden; background:rgba(148,163,184,0.05); border:1px solid rgba(148,163,184,.2); border-radius:10px; padding:10px;">
                         <div style="font-size:13px; font-weight:700; margin-bottom:6px;">人工标签
                             <span style="font-weight:400; font-size:11px; color:var(--text-muted);">9 个维度都要过一遍（没有就留空）</span></div>
                         <div id="clDims" style="flex:1; overflow-y:auto; padding-right:4px;"></div>
-                        <div style="padding-top:8px; border-top:1px solid rgba(148,163,184,.25); display:flex; gap:8px; align-items:center;">
+                        <div style="padding-top:8px; border-top:1px solid rgba(148,163,184,.25);">
+                            <input id="clNote" oninput="_cl.note=this.value" placeholder="备注（例如：路口在中段才出现 / 画面里没有行人）" style="width:100%; box-sizing:border-box; padding:6px; margin-bottom:6px; font-size:12px;">
+                            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                             <button onclick="clipLabelSave()" style="padding:8px 18px; background:var(--primary); color:#fff; border:none; border-radius:6px; font-size:13px;">保存并对比</button>
-                            <button class="secondary" onclick="clipLabelNext()" style="padding:8px 12px; font-size:13px;">跳过</button>
+                            <button onclick="clipLabelSave(1)" style="padding:8px 14px; background:#059669; color:#fff; border:none; border-radius:6px; font-size:13px;" title="模型判得对、不做任何改动 → 也留一条“已核对”记录（这种段不做任何改动时后端会拒绝保存）">✔ 标记已核对（无改动）</button>
+                            <button class="secondary" onclick="clipLabelPrev()" style="padding:8px 12px; font-size:13px;" title="上一个 clip（不过滤）">◀ 上一个</button>
+                            <button class="secondary" onclick="clipLabelNextPlain()" style="padding:8px 12px; font-size:13px;" title="下一个 clip（不过滤）">下一个 ▶</button>
+                            <button class="secondary" onclick="clipLabelNext()" style="padding:8px 12px; font-size:13px;" title="跳到下一个还没标过的 clip">跳过</button>
                             <span id="clSavedMsg" style="font-size:12px;"></span>
+                            </div>
+                            <div id="clReviewedMsg" style="font-size:12px; color:var(--success); margin-top:4px;"></div>
                         </div>
                     </div>
                 </div>
                 <div id="clCompare" style="margin-top:10px; font-size:13px;"></div>
             </div>
             <!-- 👇 融合搜索（PRD 35：自然语言 + 结构化 + 语义）👇 -->            <div class="panel" id="fusionSearchPanel" style="border:2px solid rgba(0,212,255,0.5);">
+
                 <div class="panel-header" style="color:var(--primary);">
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></div>
                     融合语义搜索 <span id="fsProjectTag" style="font-size:13px;"></span>
                     <span style="flex:1;"></span>
                     <button class="secondary" id="fsGaveUpBtn" onclick="fsToggleGaveUp()" style="display:none; padding:4px 12px; font-size:12px; margin-right:6px;" title="被放弃的本体候选词放在这里，点标签即可放回">已放弃 0</button>
-                    <button class="secondary" onclick="fsLoadOntology()" style="padding:4px 12px; font-size:12px;">刷新</button>
+                    
                 </div>
-                <div class="control-group" style="flex-wrap:wrap;">
+                                <!-- Clip ID 全局搜索（与下面的自然语言搜索同款样式，都是跨项目全局） -->
+                                <!-- 搜索范围统一开关：默认全局（所有项目），取消则只搜当前项目 -->
+                <div style="margin:8px 0 2px; font-size:13px;">
+                    <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px;">
+                        <input type="checkbox" id="fsGlobalAll" checked> 全局（所有项目）
+                    </label>
+                </div>
+<div class="control-group" style="flex-wrap:wrap;">
+                    <input id="fsClipQ" type="text" placeholder="输入 clip ID 片段，如 EX5-001_20260806 或 00001（≥3 字符）"
+                           onkeydown="if(event.key==='Enter')fsSearchClip()" style="flex:2; min-width:240px;">
+                    <button onclick="fsSearchClip()">搜索</button>
+                </div>
+                <div id="fsClipRes" style="font-size:12px;"></div>
+<div class="control-group" style="flex-wrap:wrap;">
                     <input id="fsQuery" type="text" placeholder="自然语言，如：夜间下雨城市路口有行人横穿" style="flex:2; min-width:240px;"
                            onkeydown="if(event.key==='Enter')fsSearch()">
                     <button onclick="fsSearch()" style="background:rgba(0,212,255,0.2); border:1px solid var(--primary); color:var(--primary);">融合搜索</button>
@@ -542,7 +545,7 @@
                     <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></div>
                     数据资产管理 <span id="daProjectTag" style="font-size:13px; color:var(--primary);"></span>
                     <span style="flex:1;"></span>
-                    <button class="secondary" onclick="daRefresh()" style="padding:4px 12px; font-size:12px;">刷新</button>
+                    
                 </div>
                 <div class="audit-actions" style="margin-top:0;">
                     <label style="font-size:12px;">导出格式
@@ -678,8 +681,9 @@
                 <div class="divider"></div>
                 <div class="section-label">Phase 2: DINO / YOLO 目标检索 (精筛)</div>
                 <div class="control-group" style="margin-bottom: 12px;">
-                    <input type="text" id="dinoPrompt" placeholder="DINO 开放词汇提示词，支持中文输入 (如: 锥桶. 卡车.)" style="min-width: 260px;">
+                    <input type="text" id="dinoPrompt" placeholder="开放词汇提示词（DINO / YOLO-World 共用）；中文即可，多词用 . 或 、 分隔 (如: 锥桶. 卡车. 限速牌)" style="min-width: 260px;">
                     <button id="btnDino" onclick="runDinoBatch()" disabled>启动 DINO 检索 (需先执行 Phase 1)</button>
+                    <button id="btnYw" onclick="runYoloWorldBatch()" disabled>启动 YOLO-World 检索 (需先执行 Phase 1)</button>
                     <button id="btnYolo" class="yolo-btn" onclick="runYoloBatch()" disabled>启动 YOLO 检索</button>
                 </div><!-- 目标检测 / VLM 专用进度条（支持中途急停） -->                <div id="detectStatusWrapper" style="display: none; margin-bottom: 24px; background: rgba(0,0,0,0.25); padding: 10px 16px; border-radius: 8px; border: 1px solid rgba(245, 158, 11, 0.35);">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
@@ -1666,6 +1670,7 @@
             const img = t.closest('img');
             if (!img) return;
             if (img.closest('#imageModal') || img.closest('#fsLightbox')) return;  // 各自已有弹层
+            if (img.closest('#imgViewer')) return;   // 新查看器（数据审核/人机评测）自己处理点击返回
             if (img.closest('[onclick]')) return;      // 图集缩略图自带带检测框的弹窗
             // 注意：卡片若用 JS 赋 onclick（card.onclick=...）而不是 HTML 属性，上面的
             // [onclick] 选择器匹配不到，必须给它的 <img> 标 data-nozoom="1"，
@@ -1732,6 +1737,8 @@
                 document.getElementById('btnDino').disabled = false;
 
                 document.getElementById('btnDino').innerText = "启动 DINO 检索";
+                const btnYw = document.getElementById('btnYw');
+                if (btnYw) { btnYw.disabled = false; btnYw.innerText = "启动 YOLO-World 检索"; }
 
                 document.getElementById('btnYolo').disabled = false;
 
@@ -2909,6 +2916,78 @@
         }
 
 
+
+        // 🚀 YOLO-World 开放词表检索（2026-09-22 用户要求）：与 DINO 同一套交互，
+        // 但快两个数量级（CPU 0.32 秒/帧 vs DINO 13 秒/帧）→ 适合先跑它做初筛。
+        // 与 DINO 共用上面那个提示词输入框；结果形状一致，框渲染/阈值直接复用。
+        // 刻意独立成函数、不动 runDinoBatch 一行：稳定优先，DINO 那条路是你在用的。
+        async function runYoloWorldBatch() {
+            let targetList = currentMode === 'browse' ? currentResults : allFrontendData;
+            if (currentMode === 'search') targetList = allFrontendData.filter(item => item.score >= currentClipThreshold);
+            if (!targetList.length) return alert('当前没有待检测图片。');
+            const prompt = document.getElementById('dinoPrompt').value;
+            if (!prompt || !prompt.trim()) return alert('请填写提示词（与 DINO 共用上面那个框；多个词用 . 或 、 分隔）');
+            const promptTrim = prompt.trim();
+            await ensureDetectionsLoaded();
+            const reuse = [], fresh = [];
+            targetList.forEach(it => {
+                const c = cachedDetections[String(it.id)] || it.detections;
+                // 只复用「同引擎(yoloworld) + 同 prompt」的缓存；换 prompt 旧框作废
+                const usable = c && c.engine === 'yoloworld' && (c.prompt || '') === promptTrim;
+                if (usable) { it.detections = c; reuse.push(it); }
+                else { if (it.detections) it.detections = null; fresh.push(it); }
+            });
+            if (!confirm(`当前队列共 ${targetList.length} 张：\n复用历史缓存：${reuse.length} 张（秒回，不调 GPU）\n本次 YOLO-World 推理：${fresh.length} 张（分块上 GPU，可随时中止）\n\n确定开始吗？`)) return;
+            isDetectCancelled = false;
+            const wrapper = document.getElementById('detectStatusWrapper');
+            const stopBtn = document.getElementById('detectStopBtn');
+            const pContainer = document.getElementById('detectProgressContainer');
+            const pBar = document.getElementById('detectProgressBar');
+            const status = document.getElementById('detectStatus');
+            if (wrapper) wrapper.style.display = 'block';
+            if (stopBtn) stopBtn.style.display = 'inline-block';
+            if (pContainer) pContainer.style.display = 'block';
+            if (pBar) pBar.style.width = '0%';
+            if (status) status.style.color = 'var(--warning)';
+            document.body.style.cursor = 'wait';
+            let processed = 0;
+            const YW_CHUNK = 32;   // 每块几张，块间可中止；后端内部还会再按 60 帧分块推理
+            for (let c0 = 0; c0 < fresh.length; c0 += YW_CHUNK) {
+                if (isDetectCancelled) break;
+                const chunk = fresh.slice(c0, c0 + YW_CHUNK);
+                const hi = Math.min(c0 + chunk.length, fresh.length);
+                if (status) status.innerText = `YOLO-World 推理中… ${c0 + 1}-${hi}/${fresh.length} 张（可点⏹️中止，已完成的保留）`;
+                if (pBar) pBar.style.width = `${Math.round((c0 / Math.max(1, fresh.length)) * 100)}%`;
+                const fd = new FormData();
+                fd.append('project', currentProject);
+                fd.append('image_ids', chunk.map(i => i.id).join(','));
+                fd.append('text_prompt', promptTrim);
+                try {
+                    const res = await fetch(`${API_BASE}/api/yoloworld_detect_batch`, { method: 'POST', body: fd });
+                    const data = await res.json();
+                    if (data && data.code !== 200) { alert(data.msg || 'YOLO-World 批量推理失败'); break; }
+                    else if (data && data.results) {
+                        Object.entries(data.results).forEach(([idStr, det]) => {
+                            const it = targetList.find(x => String(x.id) === idStr);
+                            if (it) it.detections = det;
+                        });
+                    }
+                } catch (e) { alert('YOLO-World 请求异常: ' + e.message); break; }
+                processed += chunk.length;
+            }
+            updateSelectionStats();
+            renderGallery();
+            document.body.style.cursor = 'default';
+            if (stopBtn) stopBtn.style.display = 'none';
+            if (pBar) pBar.style.width = '100%';
+            const doneCount = targetList.filter(i => i._selected).length;
+            if (isDetectCancelled) {
+                if (status) { status.innerText = `YOLO-World 已中止：已处理 ${processed}/${fresh.length} 张，结果已保留`; status.style.color = 'var(--danger)'; }
+            } else {
+                if (status) { status.innerText = `YOLO-World 完成：总 ${targetList.length}（复用 ${reuse.length} / 新检 ${fresh.length}），检出 ${doneCount}`; status.style.color = 'var(--success)'; }
+            }
+            setTimeout(() => { if (wrapper) wrapper.style.display = 'none'; if (pContainer) pContainer.style.display = 'none'; }, 300);
+        }
 
         // 🚀 增量断点续跑版：批量目标检测（已有历史记录的帧直接复用，不再调 GPU；支持中途急停）
 
@@ -4174,6 +4253,19 @@ function initModules() {
         if (fp && ma) { ma.insertBefore(fp, ma.firstChild); }
     })();
     }
+// 切到模块时自动加载该模块里的面板（刷新按钮已取消，默认不用人点）
+function autoLoadActiveModule() {
+  const mod = document.querySelector('.module-page.active');
+  if (!mod) return;
+  const has = function (id) { return !!mod.querySelector('#' + id); };
+  if (has('auditQueue')) { try { auditRefresh(); } catch (e) {} }
+  if (has('clDims')) { try { clipLabelOpen(); } catch (e) {} }          // 模型Benchmark评测
+  if (has('fusionSearchPanel')) { try { fsLoadOntology(); } catch (e) {} }
+  if (has('dataAssetPanel')) { try { daRefresh(); } catch (e) {} }
+  if (mod.id === 'mod-analytics') {
+    try { if (typeof demandRefreshOverview === 'function') demandRefreshOverview(); } catch (e) {}
+  }
+}
     // tab 切换事件
     if (tabs) {
         tabs.querySelectorAll('button').forEach(function(btn) {
@@ -4181,6 +4273,9 @@ function initModules() {
                 tabs.querySelectorAll('button').forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
                 Object.keys(mods).forEach(k => mods[k].classList.toggle('active', k === btn.dataset.mod));
+                autoLoadActiveModule();
+// 首屏也自动加载一次（默认激活的模块）
+window.addEventListener('load', function () { setTimeout(autoLoadActiveModule, 300); });
                 // 切模块后立即刷新悬浮翻页器（它只在数据挖掘模块显示）
                 if (window.updateFloatingPager) window.updateFloatingPager();
                 // 切到数据挖掘时若旧代码依赖可见刷新
@@ -4204,7 +4299,7 @@ function buildDemandPanel() {
             <div class="panel-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"></path><path d="M18 17V9M13 17V5M8 17v-3"></path></svg></div>
             数据场景分布 <span style="color:var(--primary); font-size:13px;" id="demandProjectTag"></span>
             <span style="flex:1;"></span>
-            <button class="secondary" onclick="demandRefreshOverview()" style="padding:4px 12px; font-size:12px;">刷新</button>
+            
         </div>
         <div class="widget-grid" id="demandKpi">
             <div class="widget"><div class="widget-title">加载中</div><div class="widget-value">-</div></div>
@@ -4224,7 +4319,8 @@ async function demandRefreshOverview() {
     if (tag) tag.textContent = ' · 项目: ' + ((window.projDisplay && window.projDisplay[proj]) || proj);
     const DIM = { time: '时间', weather: '天气', area: '场景', road_type: '道路',
                   surface: '路面', lighting: '光照', traffic_state: '交通',
-                  road: '道路', road_surface: '路面', objects: '目标', events: '事件', risk: '风险', scene: '场景' };
+                  road: '道路', road_surface: '路面', objects: '目标', events: '事件', risk: '风险',
+                  scene: '场景', traffic_sign: '交通标识' };
     const fmt = function(map, cls) {
         const arr = Object.entries(map || {}).sort(function(a, b) { return b[1] - a[1]; });
         if (!arr.length) return '<span style="color:var(--text-muted);">暂无</span>';
@@ -4251,7 +4347,11 @@ async function demandRefreshOverview() {
         };
         kpi.innerHTML =
             w('资产总量(帧)', ov.total_assets != null ? ov.total_assets : '-') +
-            w('已通过', ov.approved_count != null ? ov.approved_count : '-', 'var(--success)') +
+            w('帧已通过', ov.approved_count != null ? ov.approved_count : '-', 'var(--success)') +
+            // Clip 的决策也并入（与审核面板同口径）：模型通过 = 帧AI通过 + Clip AUTO_PASS；
+            // 已人工通过 = 帧人工通过 + Clip APPROVED。只算帧侧会显示成 0，看着像没有通过的段。
+            w('模型通过', (ov.approved_auto_count != null ? ov.approved_auto_count : (ov.approved_count || 0)) + (dec.AUTO_PASS || 0), 'var(--success)') +
+            w('已人工通过', (ov.approved_human_count || 0) + (dec.APPROVED || 0), 'var(--primary)') +
             w('待审核', ov.pending_count != null ? ov.pending_count : (ov.review_count != null ? ov.review_count : '-'), 'var(--warning)') +
             w('Clip 总数', st.total != null ? st.total : '-') +
             w('Clip 已判定', st.total != null ? (st.total - (dec.undecided || 0)) : '-', 'var(--primary)') +
@@ -4264,7 +4364,8 @@ async function demandRefreshOverview() {
     const fd = (ov.distributions) || {};
     const cs = (st.scene) || {};
     if (covBox) {
-        const dims = ['time', 'weather', 'road', 'road_surface', 'scene', 'objects', 'events', 'risk'];
+        // 与「人机打标评测」的 9 维保持一致（之前漏了 traffic_sign → 交通标识这一维在覆盖看板里不显示）
+        const dims = ['time', 'weather', 'road', 'road_surface', 'scene', 'risk', 'traffic_sign', 'objects', 'events'];
         const cards = dims.map(function(dim) {
             const f = fd[dim] || {};
             const alias = { road: ['road_type'], road_surface: ['surface'], scene: ['area', 'traffic_state', 'lighting'] }[dim] || [];
@@ -4291,7 +4392,8 @@ async function demandRefreshOverview() {
     // ⑤ 明细（已挪到「数据管理明细表」面板）：维度对照表 + 视频明细
     const rowsBox = document.getElementById('demandDistRows');
     if (rowsBox) {
-        const dims = ['time', 'weather', 'road', 'road_surface', 'scene', 'objects', 'events', 'risk'];
+        // 与「人机打标评测」的 9 维保持一致（之前漏了 traffic_sign → 交通标识这一维在覆盖看板里不显示）
+        const dims = ['time', 'weather', 'road', 'road_surface', 'scene', 'risk', 'traffic_sign', 'objects', 'events'];
         const body = dims.map(function(dim) {
             const f = fd[dim] || {};
             const alias = { road: ['road_type'], road_surface: ['surface'], scene: ['area', 'traffic_state', 'lighting'] }[dim] || [];
@@ -4445,7 +4547,7 @@ async function hcSave(caseId) {
 
 async function bmRefresh() {
     // Benchmark 栏已于 2026-09-20 移除（帧级评测口径已过时：新架构帧级只做检测，
-    // 场景/事件在 Clip 段级 → 统一走「人机打标评测」）。这里留保护避免历史调用报错。
+    // 场景/事件在 Clip 段级 → 统一走「模型Benchmark评测」）。这里留保护避免历史调用报错。
     if (!document.getElementById('bmResult')) return;
 
     const proj = currentProject || 'default';
@@ -5522,7 +5624,7 @@ function fsOpen(it) {
 
     img.src = fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id);
 
-    meta.innerHTML = '<button class="secondary" style="font-size:11px; padding:2px 8px; margin-right:8px;" onclick="fsPlayFrameContext(' + it.id + ')" title="播放这一帧所属的那一段（30 帧序列；源视频不再使用）">▶ 播放所在段</button>'
+    meta.innerHTML = ''
         + '<b>#' + it.id + '</b> · score ' + it.score + ' · ' + (it.filename || '') + ' <span style="margin-left:12px;">(点击关闭)</span>';
 
     lb.style.display = 'block';
@@ -5531,6 +5633,67 @@ function fsOpen(it) {
 
 </script><script>
 /* ============ 数据资产管理（导出/布局） ============ */
+// clip ID 全局搜索：列出命中项 → 点开看该段的抽帧与判定证据链
+async function daSearchClip() {
+    const q = (document.getElementById('fsClipQ').value || '').trim();
+    const box = document.getElementById('fsClipRes');
+    if (q.length < 3) { box.innerHTML = '<span style="color:var(--warning);">至少输入 3 个字符</span>'; return; }
+    box.innerHTML = '<span style="color:var(--text-muted);">搜索中…（跨项目扫描，首次可能几秒）</span>';
+    const _g = document.getElementById('fsGlobalAll');
+    const all = _g ? _g.checked : true;      // 顶部统一开关：默认全局
+    let d = null;
+    try {
+        d = await auditFetch('/api/clips/search?q=' + encodeURIComponent(q)
+            + (all ? '' : '&project=' + encodeURIComponent(currentProject || '')) + '&limit=50');
+    } catch (e) { box.innerHTML = '<span style="color:var(--danger);">搜索失败: ' + e.message + '</span>'; return; }
+    if (!d || d.code !== 200) { box.innerHTML = '<span style="color:var(--danger);">' + ((d && d.msg) || '搜索失败') + '</span>'; return; }
+    const its = d.items || [];
+    if (!its.length) { box.innerHTML = '<span style="color:var(--text-muted);">没有匹配的 clip</span>'; return; }
+    box.innerHTML = '<div style="color:var(--text-muted); margin-bottom:6px;">命中 ' + its.length + ' 段（最多显示 50）</div>'
+        + its.map(function (it, i) {
+            const ev = (it.events || []).filter(Boolean);
+            return '<div style="display:flex; gap:10px; align-items:center; padding:6px 8px; margin-bottom:5px; '
+              + 'background:rgba(148,163,184,.06); border:1px solid var(--border); border-radius:6px;">'
+              + '<span data-i="' + i + '" onclick="daOpenClip(this)" '
+              + 'style="flex:1; min-width:0; cursor:pointer; color:var(--primary); word-break:break-all;">'
+              + it.clip_id + '</span>'
+              + '<span style="color:var(--text-muted);">' + it.project + '</span>'
+              + '<span style="color:' + (it.decision === 'AUTO_PASS' ? 'var(--success)' : (it.decision === 'REVIEW' ? 'var(--warning)' : 'var(--text-muted)')) + ';">'
+              + (it.decision || '未判定') + '</span>'
+              + '<span style="color:var(--text-muted);">' + it.frame_count + ' 帧</span>'
+              + '<span style="color:var(--accent);">' + ev.join('/') + '</span>'
+              + '</div>';
+        }).join('');
+    window._daClipHits = its;
+}
+async function daOpenClip(el) {
+    const it = (window._daClipHits || [])[parseInt(el.dataset.i)];
+    if (!it) return;
+    const box = document.getElementById('fsClipRes');
+    box.innerHTML = '<span style="color:var(--text-muted);">正在读取该段详情…</span>';
+    let g = null;
+    try {
+        g = await auditFetch('/api/clips/get?project=' + encodeURIComponent(it.project)
+            + '&clip_id=' + encodeURIComponent(it.clip_id));
+    } catch (e) { }
+    const c = (g && g.item) || null;
+    if (!c) { box.innerHTML = '<span style="color:var(--danger);">读取失败</span>'; return; }
+    const urls = (c.frame_ids || []).map(function (f) {
+        return '/api/image/' + encodeURIComponent(it.project) + '/' + f + '?w=1600';
+    });
+    box.innerHTML = '<div style="border:1px solid var(--border); border-radius:8px; padding:10px;">'
+        + '<div style="margin-bottom:6px;"><b>' + it.clip_id + '</b> <span style="color:var(--text-muted);">'
+        + it.project + ' · ' + (c.decision || '未判定') + ' · ' + (c.frame_ids || []).length + ' 帧</span></div>'
+        + (urls.length ? '<div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">'
+            + urls.slice(0, 12).map(function (u, i) {
+                return '<img src="' + u.replace('w=1600', 'w=240') + '" onclick="ivOpen(window._daClipUrls,' + i + ')" '
+                  + 'style="width:96px; height:54px; object-fit:cover; border-radius:4px; background:#000; cursor:zoom-in;">';
+              }).join('') + '</div>' : '')
+        + clipChainBlock(c.vlm_result, ((c.vlm_result || {})._diag || {}).det)
+        + '<button class="secondary" onclick="daSearchClip()" style="margin-top:8px; font-size:12px;">← 返回搜索结果</button>'
+        + '</div>';
+    window._daClipUrls = urls;
+}
 async function daRefresh() {
     const proj = currentProject || 'default';
     const tag = document.getElementById('daProjectTag');
@@ -5838,6 +6001,16 @@ function atGo(delta) { atRefresh(atPage + delta); }
 /* ============ AI 场景审核中心（PRD 19-23） ============ */
 let auditQueueData = [];
 let auditCurrentItem = null;
+// 审核队列的分类筛选：待审核 / 模型通过(AUTO_PASS) / 已人工审核(APPROVED) / 已驳回(FILTERED)
+let _auditFilter = 'REVIEW';
+function auditFilterBy(el) {
+  const f = (el && el.dataset && el.dataset.f) || 'REVIEW';
+  _auditFilter = f;
+  document.querySelectorAll('#auditStats .audit-tile').forEach(function (t) {
+    t.classList.toggle('active', t.dataset.f === f);
+  });
+  auditRefresh();
+}
 async function auditFetch(path, formData) {
     const opt = { method: formData ? 'POST' : 'GET' };
     if (formData) opt.body = formData;
@@ -5849,18 +6022,39 @@ async function auditRefresh() {
     const tag = document.getElementById('auditProjectTag');
     if (tag) tag.textContent = ' · 项目: ' + ((window.projDisplay && window.projDisplay[proj]) || proj);
     try {
-        const data = await auditFetch('/api/review/queue?project=' + encodeURIComponent(proj) + '&page=1&size=100');
-        const frameItems = ((data && data.items) || []).map(x => { x._kind = 'frame'; return x; });
+        // 这四个请求彼此独立 —— 串行发等于把各自的服务端耗时相加（实测各 ~0.5s，串完全程 1.0s+），
+        // 并发后总耗时≈最慢的那一个。
+        const _q = encodeURIComponent(proj);
+        const _f = _auditFilter || 'REVIEW';
+        const [data, cd, ov, st] = await Promise.all([
+            auditFetch('/api/review/queue?project=' + _q + '&page=1&size=100').catch(() => null),
+            // 待审段走**服务端筛选** + mini 轻量投影：过去是把全部段拉回浏览器再自己 filter，
+            // 南美 2.8 万段 = 十几个请求 / 2.7MB，而真正待审的只有几十条。
+            // 当前筛选类别（服务端筛）：待审核=REVIEW，其余=模型通过/已人工/已驳回
+            auditFetch('/api/clips/list?project=' + _q + '&decision=' + _f + '&mini=1&size=200&page=1').catch(() => null),
+            auditFetch('/api/analytics/overview?project=' + _q + '&light=1').catch(() => null),   // light：只取计数，跳过用不到的分布统计
+            // 各决策计数由后端算好（clips/stats，14ms），不再为统计把全部段遍历一遍
+            auditFetch('/api/clips/stats?project=' + _q).catch(() => null),
+        ]);
+        // 帧只混进「待审核」这一类（帧的状态分类要走另一个接口，暂不在本页筛）
+        const frameItems = (_f === 'REVIEW')
+            ? ((data && data.items) || []).map(x => { x._kind = 'frame'; return x; })
+            : [];
         // Clip 与帧进同一队列：待人工审核(REVIEW)的 Clip 接在帧之后
-        let clips = [];
-        try { clips = await clipLoadCache(); } catch (e0) {}
-        const pendingClips = clips.filter(c => clipDecisionKey(c) === 'REVIEW').map(clipToItem);
+        let pendingClips = ((cd && cd.items) || []).map(clipMiniToItem);
+        let clipDec = (st && st.decisions) || null;
+        // 待审段超过一页才补取（正常只有几十条，一页就够）
+        for (let page = 2; pendingClips.length < ((cd && cd.total) || 0) && page <= 10; page++) {
+            const more = await auditFetch('/api/clips/list?project=' + _q
+                + '&decision=' + _f + '&mini=1&size=200&page=' + page).catch(() => null);
+            const its = (more && more.items) || [];
+            if (!its.length) break;
+            pendingClips = pendingClips.concat(its.map(clipMiniToItem));
+        }
         auditQueueData = frameItems.concat(pendingClips);
-        // 统一统计：帧 + Clip 合并计数
-        let ov = null;
-        try { ov = await auditFetch('/api/analytics/overview?project=' + encodeURIComponent(proj)); } catch (e2) {}
-        const cnt = { AUTO_PASS: 0, APPROVED: 0, FILTERED: 0 };
-        clips.forEach(c => { const k = clipDecisionKey(c); if (cnt[k] != null) cnt[k]++; });
+        const cnt = { AUTO_PASS: (clipDec && clipDec.AUTO_PASS) || 0,
+                      APPROVED: (clipDec && clipDec.APPROVED) || 0,
+                      FILTERED: (clipDec && clipDec.FILTERED) || 0 };
         const putNum = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
         // 四个数字都用后端给的真口径（帧 + Clip 合并）：
         //   待审核   = 后端待审总数(data.total)，不是当前页条数——分页取 100 条时它会被钉死在 100+Clip，审多少都不动
@@ -5878,7 +6072,7 @@ async function auditRefresh() {
             auditQueueData = [];
             auditCurrentItem = null;
             const q = document.getElementById('auditQueue');
-            if (q) q.innerHTML = '<div class="audit-empty">暂无待审核数据（REVIEW 状态为空）</div>';
+            if (q) q.innerHTML = '<div class="audit-empty">当前类别（' + _f + '）没有数据</div>';
             const d = document.getElementById('auditDetailBody');
             const e = document.getElementById('auditDetailEmpty');
             if (d) d.style.display = 'none';
@@ -5908,7 +6102,7 @@ function renderAuditQueue() {
             <div class="audit-card-info">
                 <div><b>#${it.id}</b> <span style="color:${statusColor};">${it.status || ''}</span></div>
                 <div>${reason || ''}</div>
-                <div style="font-size:12px; margin-top:2px;"><b style="color:${it.ai_score >= 70 ? '#10b981' : '#f59e0b'};">${it.ai_score != null ? it.ai_score + '分' : '-'}</b>　目标:${(it.ai_tags && it.ai_tags.objects && it.ai_tags.objects.length) ? it.ai_tags.objects.map(t => t.tag || t).slice(0, 4).join('、') : '无'}　事件:${(it.ai_tags && it.ai_tags.events && it.ai_tags.events.length) ? it.ai_tags.events.map(t => t.tag || t).slice(0, 2).join('、') : '无'}</div>
+                <div style="font-size:12px; margin-top:2px;"><b style="color:${it.ai_score >= 70 ? '#10b981' : '#f59e0b'};">${it.ai_score != null ? it.ai_score + '分' : ((it.risk && it.risk.length) ? '风险:' + it.risk[0] : '-')}</b>　目标:${(it.ai_tags && it.ai_tags.objects && it.ai_tags.objects.length) ? it.ai_tags.objects.map(t => t.tag || t).slice(0, 4).join('、') : '无'}　事件:${(it.ai_tags && it.ai_tags.events && it.ai_tags.events.length) ? it.ai_tags.events.map(t => t.tag || t).slice(0, 2).join('、') : '无'}</div>
                 <div style="color:var(--primary);">${(it.final_tags && it.final_tags.weather) ? (Array.isArray(it.final_tags.weather) ? it.final_tags.weather.map(t=>t.tag||t).join('、') : '') : (it.ai_tags && it.ai_tags.weather ? (Array.isArray(it.ai_tags.weather)? it.ai_tags.weather.map(t=>t.tag||t).join('、') : '') : '未标注')}</div>
             </div>`;
 
@@ -5936,6 +6130,25 @@ async function auditSelect(i) {
 
 
 
+// 轻量队列项 → 审核卡形状。完整详情（vlm_result / frame_ids / sample_urls）在点开这张卡时
+// 才用 /api/clips/get 取回来，队列因此不必把每一段的大字段全下放。
+function clipMiniToItem(m) {
+    return {
+        _kind: 'clip', _mini: true,
+        id: m.clip_id, clip_id: m.clip_id, isSeq: !!m.is_seq,
+        img_url: m.preview_url || '',
+        status: m.decision || 'REVIEW',
+        decision_reason: (m.is_seq ? '图片序列' : 'Clip 片段') + ' · ' + (m.frame_count || 0) + ' 帧',
+        ai_score: m.score,
+        asset_id: m.clip_id,
+        lineage: { source_type: m.is_seq ? 'image_seq' : 'video', relative_path: m.video_id || '' },
+        risk: m.risk || [],
+        ai_tags: { objects: (m.objs || []).map(t => ({ tag: t })),
+                   events: (m.events || []).map(t => ({ tag: t })),
+                   weather: (m.weather || []).map(t => ({ tag: t })) },
+        human_tags: {}, final_tags: {},
+    };
+}
 async function auditShowCard(it) {
 
     const body = document.getElementById('auditDetailBody');
@@ -5955,7 +6168,19 @@ async function auditShowCard(it) {
 
     let detail = it;
 
-    if (it._kind !== 'clip') try {   // Clip 的详情就在自身字段里，无需再查 asset_info
+    if (it._kind === 'clip') {
+
+        // 队列里的 Clip 是轻量项 → 取这一段的完整详情并回填（之后再看这张卡不必重复请求）
+        if (it._mini) {
+            try {
+                const g = await auditFetch('/api/clips/get?project=' + encodeURIComponent(currentProject)
+                    + '&clip_id=' + encodeURIComponent(it.clip_id));
+                if (g && g.code === 200 && g.item) { Object.assign(it, clipToItem(g.item)); it._mini = false; }
+            } catch (e) {}
+        }
+        detail = it;
+
+    } else try {   // 帧：详情要另查 asset_info
 
         const d = await auditFetch('/api/asset_info?project=' + encodeURIComponent(currentProject) + '&image_id=' + it.id);
 
@@ -5971,52 +6196,44 @@ async function auditShowCard(it) {
 
     const finalTags = detail.final_tags || {};
 
-    const dimOrder = ['time', 'weather', 'road', 'road_surface', 'objects', 'events', 'risk', 'traffic_sign', 'scene'];
+    // 维度顺序与中文名**必须与「人机打标评测」的 9 维一致**（用户 2026-09-21 要求统一）：
+    // 时间/天气/道路/路面/场景/风险/交通标识/目标/事件
+    const dimOrder = ['time', 'weather', 'road', 'road_surface', 'scene', 'risk', 'traffic_sign', 'objects', 'events'];
 
-    const dimNames = {time:'时间', weather:'天气', road:'道路', road_surface:'路面', objects:'目标', events:'事件', risk:'风险', traffic_sign:'交通标识信号', scene:'场景'};
+    const dimNames = {time:'时间', weather:'天气', road:'道路', road_surface:'路面', scene:'场景', risk:'风险', traffic_sign:'交通标识', objects:'目标', events:'事件'};
 
 
 
-    let aiScoreHtml = (detail.ai_score != null)
-        ? `<div class="audit-chip ai" style="font-size:13px; padding:4px 12px; margin-bottom:8px; display:inline-block;">
-             AI分: <b style="color:${detail.ai_score >= 70 ? '#10b981' : '#f59e0b'};">${detail.ai_score}分</b>
-             ${detail.ai_score >= 70 ? '<span style="color:#10b981;"> ✓ AI_PASS</span>' : '<span style="color:#f59e0b;"> 需人工</span>'}
-           </div>`
-        : '';
-// Clip 段的“5 帧 × 判定”对照：把模型实际输入的 5 张采样帧和它给出的事件证据并排，
-// 用于人工判断模型到底有没有在看图（而不是套模板）
-let vsHtml = '';
-if (it.sample_urls && it.sample_urls.length) {
-    // 审核卡图片点开 = 与人机评测同一套查看器（滚轮缩放/拖动/←→翻页/0复位/Esc）
-    window._auditViewerUrls = it.sample_urls.map(function (s2) {
-        return String(s2.url).replace(/\?w=\d+/, '') + '?w=1600';
-    });
-    const r0 = it.vlm_result || {};
-    const evs = (r0.events || []);
-    vsHtml = '<div style="background:rgba(0,0,0,0.3); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px; margin-bottom:8px;">' +
-        '<div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">模型实际输入的 ' + it.sample_urls.length + ' 帧（均匀采样），可点击放大对照：</div>' +
-        '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-        it.sample_urls.map(function(s, i) {
-            return '<div style="text-align:center;">' +
-                '<img src="' + fullUrl(s.url) + '" style="width:118px; height:66px; object-fit:cover; border-radius:4px; background:#000; border:1px solid var(--border); cursor:zoom-in;" ' +
-                'onclick="ivOpen(window._auditViewerUrls, ' + i + ')" title="点击放大（滚轮缩放 / ←→ 翻页 / Esc 关闭）" onerror="this.style.visibility=\'hidden\'">' +
-                '<div style="font-size:10px; color:var(--text-muted); margin-top:2px;">F' + (i + 1) + '（第 ' + s.pos + ' 帧）</div>' +
-            '</div>';
-        }).join('') +
-        '</div>' +
-        (evs.length
-            ? '<div style="margin-top:8px; border-top:1px dashed rgba(255,255,255,0.12); padding-top:6px;">' +
-              evs.map(function(e) {
-                  return '<div style="font-size:12px; margin:2px 0;"><b style="color:var(--accent);">' + e.type + '</b> ' +
-                      '<span style="color:var(--text-muted);">' + (e.confidence != null ? e.confidence : '') + '</span>' +
-                      '<div style="font-size:12px; color:var(--text-main); margin-top:2px;">' +
-                      (e.evidence || []).map(function(t) { return '· ' + String(t).replace(/^F\d+:/, ''); }).join('　') + '</div></div>';
-              }).join('') +
-              '<div style="font-size:11px; color:var(--text-muted); margin-top:4px;">↑ 请对照上方 5 帧判断这些描述是否属实</div></div>'
-            : '<div style="margin-top:6px; font-size:12px; color:var(--text-muted);">该片段无事件证据</div>') +
-    '</div>';
-}
-let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" style="cursor:zoom-in;" title="点击放大（滚轮缩放 / ←→ 翻页 / Esc 关闭）" onclick="ivOpen((window._auditViewerUrls && window._auditViewerUrls.length) ? window._auditViewerUrls : ['${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}'], 0)" onerror="this.style.visibility='hidden'">`;
+    // AI 分标头已去掉（用户 2026-09-20：卡片开头堆一个"AI分/AI_PASS"标签太占地方，
+    // 分数在左侧队列卡片上已有，详情里不必重复）
+// 审核卡的画面：只留**一个**播放器（原先"8 帧图排 + 主图 + 播放器"三处重复画面，太乱）。
+// 8 帧 = 实际送模型的那几帧（审核"它看到的就是这几帧"），30 帧 = 整段连续画面，一键切换。
+// 事件证据是文本、不重复画面，留在播放器下方作为判定对照。
+const _r0 = it.vlm_result || {};
+const _evs = (_r0.events || []);
+// 送模型的帧数按实际取（AD_CLIP_PICK，当前 8）
+const _nModel = (it.sample_urls || []).length;
+// 模型判定的事件 + 证据链：放在播放器**下方**（原位），铺满整行
+const auEvHtml = _evs.length
+    ? '<div style="margin-top:8px; border-top:1px dashed rgba(255,255,255,0.12); padding-top:6px; font-size:12px; line-height:1.75;">'
+      + '<div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">↑ 请对照上方 '
+      + (_nModel || '') + ' 帧判断这些描述是否属实</div>'
+      + clipEventsHtml(_evs)
+      + '</div>'
+    : '';
+const auStageHtml = '<div style="background:rgba(0,0,0,0.3); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px; margin-bottom:8px;">'
+    // 画面铺满整行（不限宽）
+    + '<div id="auStageHost" style="display:flex; flex-direction:column; gap:8px;"></div>'
+    // 8 帧 / 整段切换放在视频下面
+    + '<div style="margin-top:8px; display:flex; align-items:center; gap:10px;">'
+    + '<button class="secondary" id="auSrcBtn" onclick="auStageToggleSrc()" style="padding:5px 14px; font-size:13px; display:none;"></button>'
+    + '<span id="auStageNote" style="font-size:11px; color:var(--text-muted);"></span>'
+    + '</div>'
+    + auEvHtml
+    // 判定依据（证据链）：以单 clip 为单位折叠展示，含逐帧观察/判定理由/核验结论/当时的检测摘要
+    + clipChainBlock(it.vlm_result, ((it.vlm_result || {})._diag || {}).det)
+    + '</div>';
+let html = auStageHtml;
 
 
 
@@ -6043,7 +6260,7 @@ let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url |
                 const tagName = typeof t === 'string' ? t : (t.tag || '');
 
                 const isVLM = typeof t === 'object' && t.source === 'VLM';
-                  const conf = (!isVLM && typeof t === 'object' && t.confidence) ? `<span class="c">${(t.confidence*100).toFixed(0)}%</span>` : (isVLM ? '<span class="c" style="opacity:.7">VLM</span>' : '');
+                  const conf = (!isVLM && typeof t === 'object' && t.confidence) ? `<span class="c">${(t.confidence*100).toFixed(0)}%</span>` : '';
 
                 return `<span class="audit-chip ${kind}">${tagName}${conf}</span>`;
 
@@ -6061,6 +6278,7 @@ let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url |
 
 
 
+
     html += `<div class="audit-actions">
         <button onclick="auditAction('confirm')" style="background:#10b981; color:#fff;">确认通过</button>
         <button onclick="auditAction('reject')" style="background:#ef4444; color:#fff;">驳回</button>
@@ -6070,8 +6288,7 @@ let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url |
             <option value="time">时间</option><option value="objects">目标</option>
             <option value="events">事件</option><option value="risk">风险</option>
         </select>
-        <button class="secondary" onclick="fsPlayClipItem()" title="视频片段回放原始连续画面；图片序列段逐帧回放">▶ 播放本段</button>
-        <button class="secondary" onclick="auditAction('add')">添加/修正标签</button>
+        <button class="secondary" onclick="auditAction('add')">添加标签</button>
         <button onclick="auditNext()">下一张</button>
     </div>`;
 
@@ -6090,6 +6307,7 @@ let html = aiScoreHtml + vsHtml + `<img class="main" src="${fullUrl(it.img_url |
 
     </div>`;
     body.innerHTML = html;
+    auStageLoad(it);      // 装载本条抽帧序列（宿主刚进 DOM，必须在此之后）
 }
 async function auditAction(action) {
     if (!auditCurrentItem) return;
@@ -6366,8 +6584,23 @@ function clipToItem(c) {
         // 播放本段用：整段的库内帧号（后端 light 模式保留 frame_ids）
         segment: { frame_ids: c.frame_ids || [], frame_count: c.frame_count || (c.frame_ids || []).length },
         ai_tags: {
-            time: keep(sc.time), weather: keep(sc.weather), road: keep(sc.road_type), road_surface: keep(sc.surface),
-            scene: keep(sc.area).concat(keep(sc.traffic_state), keep(sc.lighting)),
+            // ⚠️ 键名必须用 vlm_clip.py 归一化后的**统一维度名**：road / road_surface / scene。
+            // 旧代码读 road_type / surface / area（那是更早的字段名，归一化后已不存在），
+            // 结果道路、路面永远为空，场景只捡到 lighting 的值（显示成"正常照明"）——
+            // 这就是"场景不准"的直接原因（2026-09-20 查实）。
+            // ⚠️ 2026-09-21 修：以前这里**漏装了 traffic_sign 与 risk**（这两个是 vlm_result 的
+            // **顶层字段**，不在 scene 里），而且「道路」直接读 sc.road（拆轴后模型不再写它）——
+            // 于是审核卡的 AI 标签只剩 6 维有值，而证据链读的是 r.traffic_sign 所以看得见，
+            // 表现为"证据链里有交通信号灯、数据审核栏却没有交通标识"（用户反馈）。
+            // 现在与「人机打标」的 9 维完全对齐，且「道路」= 四轴并集（与后端 _clip_model_sets 一致）。
+            time: keep(sc.time), weather: keep(sc.weather),
+            road: [].concat(sc.road || [], sc.road_shape || [], sc.lane_count || [],
+                            sc.junction || [], sc.road_marking || []).filter(v => v && v !== 'unknown'),
+            road_shape: keep(sc.road_shape), lane_count: keep(sc.lane_count),
+            junction: keep(sc.junction), road_marking: keep(sc.road_marking),
+            road_surface: keep(sc.road_surface),
+            scene: keep(sc.scene), lighting: keep(sc.lighting), traffic_state: keep(sc.traffic_state),
+            risk: keep(r.risk), traffic_sign: keep(r.traffic_sign),
             objects: (r.objects || []).map(o => ({ tag: o.type, state: o.state, confidence: o.confidence })),
             events: (r.events || []).map(e => ({ tag: e.type, confidence: e.confidence })),
         },
@@ -6376,6 +6609,144 @@ function clipToItem(c) {
         vlm_result: r, sample_urls: c.sample_urls || [],
     };
 }
+
+// ===== 事件核验标记：把后端程序化闸门的结论显示出来 =====
+// ungrounded = 检测不支持这条事件（目标缺失/帧数不足/无横向位移）；
+// motion     = 闸门实测到的横向位移占比（通过才有）；
+// generic    = 证据疑似把判据换成了结论式套话（不含任何具体画面锚点）；
+// repeat     = 段内两条证据一模一样。
+// 事件列表**统一渲染**（2026-09-21 用户要求）：横排（以前两处各自写 <div> 竖着堆），
+// 数据审核卡（auEvHtml）与人机评测（clEvidence）**共用这一个函数**，样式不会再漂移。
+// ⚠️ 证据链（clipChainHtml）**不用这个**：它保持竖排详情（用户明确"证据链不用改"）。
+function clipEsc(s) {
+  return String(s == null ? '' : s).replace(/[<>&]/g, function (c) {
+    return ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' })[c];
+  });
+}
+function clipEventsHtml(evs) {
+  const list = (evs || []).filter(function (e) { return e && e.type; });
+  if (!list.length) return '';
+  const items = list.map(function (e) {
+    const conf = (e.confidence != null) ? ' <span style="color:var(--text-muted);">' + e.confidence + '</span>' : '';
+    let s = '<div style="flex:0 1 auto; max-width:100%; border:1px solid rgba(148,163,184,.28);'
+          + ' border-radius:8px; padding:4px 9px; background:rgba(148,163,184,.06); line-height:1.65;">'
+          + '<span style="display:block;"><b style="color:var(--accent);">' + clipEsc(e.type) + '</b>'
+          + conf + clipEventBadge(e) + clipEvidenceBadge(e) + '</span>';
+    const ev = (e.evidence || []).map(function (t) { return String(t).replace(/^F\d+\s*[:：]\s*/, ''); });
+    if (ev.length) s += '<span style="display:block; color:var(--text-main);">· ' + clipEsc(ev.join('　')) + '</span>';
+    if (e.check) s += '<span style="display:block; color:var(--danger); font-size:11px;">核验：' + clipEsc(e.check) + '</span>';
+    return s + '</div>';
+  }).join('');
+  return '<div style="display:flex; flex-wrap:wrap; gap:6px 10px; align-items:flex-start;">' + items + '</div>';
+}
+function clipEventBadge(e) {
+  const f = (e && e.flags) || {};
+  if (f.ungrounded) return ' <span style="color:var(--danger); font-size:11px;" title="程序化核验未通过：YOLO 不支持这条事件">⚠ YOLO 不支持</span>';
+  if (f.motion != null) return ' <span style="color:var(--success); font-size:11px;" title="检测实测到的横向位移占画面宽比例">✓ 位移验证 ' + Math.round(f.motion * 100) + '%</span>';
+  return ' <span style="color:var(--text-muted); font-size:11px;" title="这类事件无法用检测可靠核验，只能靠证据是否可核对">未验证</span>';
+}
+function clipEvidenceBadge(e) {
+  const f = (e && e.flags) || {};
+  const w = [];
+  if (f.generic) w.push('模板复述');
+  if (f.repeat) w.push('证据重复');
+  return w.length ? ' <span style="color:var(--warning); font-size:11px;" title="这条依据不足以拿去核对画面">⚠ ' + w.join(' / ') + '</span>' : '';
+}
+// ===== 判定依据（证据链）：一屏看清模型"看到了什么 → 判成什么 → 为什么" =====
+// 数据审核卡与模型Benchmark评测共用；以**单 clip 为单位**，折叠展示。
+// 四段：① 逐帧观察（模型先看） ② 事件结论 + 证据 + 判定理由 + 程序化核验结论
+//      ③ 场景/风险判定 ④ 当时注入给模型的检测摘要（对照它有没有在用检测）
+function _chainFmtFrames(frames) {
+  return (frames || []).map(function (t) {
+    return '· ' + String(t).replace(/^F(\d+)\s*[:：]\s*/, '<b>F$1</b> ');
+  }).join('<br>');
+}
+function clipChainHtml(vr, det) {
+  const r = vr || {};
+  const frames = r.frames || [];
+  const evs = r.events || [];
+  const sc = r.scene || {};
+  // 「道路」对外仍是一维（人工打标口径）：模型输出的是四个单一轴，这里必须先合并再显示，
+  // 否则这一行永远是空的（旧代码读 sc.road，而拆轴后模型不再写这个字段 —— 漏了 road_marking 同理）
+  const _road = [].concat(sc.road || [], sc.road_shape || [], sc.lane_count || [],
+                          sc.junction || [], sc.road_marking || [])
+                      .filter(function (x) { return x !== 'unknown'; });
+  const sceneRows = [['时间', sc.time], ['天气', sc.weather], ['道路', _road],
+                     ['路面', sc.road_surface], ['场景', sc.scene],
+                     ['照明', sc.lighting], ['交通', sc.traffic_state]]
+    .map(function (kv) {
+      const v = [].concat(kv[1] || []).filter(function (x) { return x !== 'unknown'; });
+      return v.length ? (kv[0] + ':' + v.join('/')) : '';
+    }).filter(Boolean).join('　');
+  const rk = (r.risk || []).filter(function (v) { return v !== 'unknown'; });
+  const sg = (r.traffic_sign || []).filter(function (v) { return v !== 'unknown'; });
+  const T = 'font-size:11px;color:var(--text-muted);margin:8px 0 3px;';
+  let h = '';
+  h += '<div style="' + T + '">① 事件结论 · 判定依据 · 核验</div>';
+  if ((r._diag || {}).basis) {
+    h += '<div style="font-size:12px;color:var(--text-muted);">判定依据：' + r._diag.basis + '</div>';
+  }
+  if (!r.events) {
+    return h + '<div style="font-size:12px;color:var(--warning);">'
+      + '这一段还没取到完整判定详情（列表用的是轻量数据）。翻到这一段后会自动补取；'
+      + '若一直这样，点「✓ 对比报告」刷新一下。</div>';
+  }
+  h += evs.length
+    ? evs.map(function (e) {
+        // ⚠️ 证据链**保持竖排详情**（用户 2026-09-21 明确："证据链不用改"）——
+        // 它要逐条读参照物/理由/核验，横排反而看不全。横排只用于数据审核与人机评测两处。
+        let s = '<div style="font-size:12px;line-height:1.7;margin-bottom:5px;">'
+          + '<b style="color:var(--accent);">' + e.type + '</b> '
+          + '<span style="color:var(--text-muted);">' + (e.confidence != null ? e.confidence : '') + '</span>'
+          + clipEventBadge(e) + clipEvidenceBadge(e);
+        if ((e.evidence || []).length) {
+          s += '<div style="color:var(--text-main);">'
+            + e.evidence.map(function (t) { return '· ' + String(t).replace(/^F\d+\s*[:：]\s*/, ''); }).join('　')
+            + '</div>';
+        }
+        if (e.anchor) {
+          s += '<div style="color:var(--text-muted);">画面参照物：' + e.anchor + '</div>';
+        }
+        s += e.reason
+          ? '<div style="color:var(--text-main);">判定理由：' + e.reason + '</div>'
+          : '<div style="color:var(--warning);">未给出判定理由</div>';
+        if (e.check) s += '<div style="color:var(--danger);font-size:11px;">核验：' + e.check + '</div>';
+        return s + '</div>';
+      }).join('')
+    : '<div style="font-size:12px;color:var(--text-muted);">本段未判定出事件</div>';
+  const objs = (r.objects || []).map(function (o) { return o && o.type; }).filter(Boolean);
+  h += '<div style="' + T + '">② 场景 · 风险 · **识别到的目标**</div>'
+    + (objs.length
+        ? '<div style="font-size:12px;line-height:1.75;">目标：' + objs.join('、') + '</div>'
+        : '<div style="font-size:12px;color:var(--warning);">本段没有识别出目标</div>')
+    + '<div style="font-size:12px;line-height:1.75;margin-top:3px;">'
+    + (sceneRows || '（场景全 unknown）')
+    + (rk.length ? '　风险:' + rk.join('/') : '')
+    + (sg.length ? '　标识:' + sg.join('/') : '') + '</div>';
+  if (det && det.length) {
+    h += '<div style="' + T + '">③ 当时注入给模型的 YOLO 摘要（逐帧）</div>'
+      + '<div style="font-size:12px;line-height:1.75;">'
+      + det.map(function (t, i) { return 'F' + (i + 1) + (t ? '：' + t : '：（该帧无 YOLO）'); }).join('<br>')
+      + '</div>';
+  }
+  return h;
+}
+function clipChainBlock(vr, det) {
+  const r = vr || {};
+  const nf = (r.frames || []).length
+    || ((r.events || []).reduce(function (a, e) { return a + (e.evidence || []).length; }, 0));
+  const nev = (r.events || []).length;
+  // 默认**折叠**（用户 2026-09-20 要求手动展开）。之前"点了打不开"是空数据分支里
+  // 引用了未定义变量 nv 抛错导致的，已修，所以折叠点开正常。
+  return '<details style="margin-top:8px;">'
+    + '<summary style="cursor:pointer;font-size:12px;color:var(--primary);user-select:none;">'
+    + '模型判断证据链'
+    + '<span style="color:var(--text-muted);font-weight:400;">（事件 ' + nev + ' 个）</span>'
+    + '</summary>'
+    + '<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:6px;">'
+    + clipChainHtml(r, det) + '</div></details>';
+}
+
 async function clipReview(clipId, action) {
     const fd = new FormData();
     fd.append('project', currentProject);
@@ -6478,7 +6849,7 @@ async function taskOvRefresh() {
     const rows = [];
     const seen = {};
     // 1) 抽帧 / 视频 / 向量化 / 打包（实时池，带 x/y 计数）
-    const kindOf = { video: '视频抽帧', extract: '视频抽帧', vectorize: '向量化索引', delivery: '数据打包', clip_judge: '段级判定(VLM)', import: '数据导入' };
+    const kindOf = { video: '视频抽帧', extract: '视频抽帧', vectorize: '向量化索引', delivery: '数据打包', clip_judge: 'VLM场景综合判断', sign_detect: 'YOLO批量检测', sign_judge: 'VLM场景综合判断', import: '数据导入' };
     Object.keys(pool || {}).forEach(function (k) {
         const v = pool[k] || {};
         if (!v.is_running) return;   // 已完成/已停止的不再展示（任务状态自动清除）
@@ -6580,14 +6951,14 @@ async function taskOvStopJob(projEnc) {
 setInterval(taskOvRefresh, 4000);
 </script>
 
-<!-- ===== Clip 段级人机打标评测（金标采集 + 人机逐维度自动对比）===== -->
+<!-- ===== Clip 段级模型Benchmark评测（金标采集 + 人机逐维度自动对比）===== -->
 <script>
 const CLIP_BENCH_DIMS = [
   { key: 'time', cn: '时间' }, { key: 'weather', cn: '天气' }, { key: 'road', cn: '道路' },
   { key: 'road_surface', cn: '路面' }, { key: 'scene', cn: '场景' }, { key: 'risk', cn: '风险' },
   { key: 'traffic_sign', cn: '交通标识' }, { key: 'objects', cn: '目标' }, { key: 'events', cn: '事件' }
 ];
-let _cl = { dims: [], queue: [], idx: 0, gt: {}, cur: null, labeledIds: {}, labeledTotal: 0, saved: false, showAll: false };
+let _cl = { dims: [], queue: [], idx: 0, gt: {}, rejected: {}, model: {}, loadedFor: null, dimSrc: [], cur: null, labeledIds: {}, labeledTotal: 0, saved: false, showAll: false };
 let _cl_enum_loaded = false;
 async function clipLabelOpen() {
   if (!_cl_enum_loaded) {
@@ -6598,16 +6969,23 @@ async function clipLabelOpen() {
       _cl_enum_loaded = true;
     } catch (e) { return alert('本体枚举加载失败: ' + e.message); }
   }
+  // 只取"有模型判定结果"的段（服务端筛 has_vlm），且只取轻量列表 mini：
+  // 过去是 40 页 × 100 条全量拉回来再在浏览器里 filter（4.66MB / 42 个请求），
+  // 真正能标的只有判定过的那一部分；每段的完整详情在翻到它时才取。
   let q = [];
   for (let page = 1; page <= 40; page++) {
     let d = null;
-    try { d = await auditFetch('/api/clips/list?project=' + encodeURIComponent(currentProject) + '&page=' + page + '&size=100&light=1'); } catch (e) { break; }
+    try { d = await auditFetch('/api/clips/list?project=' + encodeURIComponent(currentProject) + '&has_vlm=1&mini=1&size=200&page=' + page); } catch (e) { break; }
     const items = (d && d.items) || [];
     if (!items.length) break;
-    q = q.concat(items.filter(c => c.vlm_result));
-    if (items.length < 100) break;
+    // 只收**新格式**的段（有 reason/risk）。旧格式是历史判定留下的，没有理由/参照物字段，
+    // 拿来做人机对比没有意义（打开证据链就是空的）——这正是"证据链打开没内容"的原因。
+    const _old = items.filter(function (c) { return !c.v2; }).length;
+    if (_old && !window._clOldSkipped) { window._clOldSkipped = _old; }
+    q = q.concat(items.filter(function (c) { return c.v2; }));
+    if (q.length >= ((d && d.total) || 0)) break;
   }
-  _cl.queue = q; _cl.idx = 0; _cl.gt = {}; _cl.saved = false;
+  _cl.queue = q; _cl.idx = 0; _cl.gt = {}; _cl.rejected = {}; _cl.model = {}; _cl.loadedFor = null; _cl.saved = false;
   try {
     const st = await auditFetch('/api/benchmark/clip_label/stats?project=' + encodeURIComponent(currentProject));
     _cl.labeledIds = {}; ((st && st.labeled_ids) || []).forEach(id => _cl.labeledIds[id] = 1);
@@ -6619,68 +6997,202 @@ async function clipLabelOpen() {
   clipLabelRender();
 }
 function clipLabelCur() { return _cl.queue[_cl.idx] || null; }
+// 当前段的完整详情按需取（mini 列表里只有 clip_id / 帧数等轻量字段）
+async function clipLabelEnsure(i) {
+  const c = _cl.queue[i];
+  if (!c || c.vlm_result) return c || null;      // 已是完整对象
+  try {
+    const g = await auditFetch('/api/clips/get?project=' + encodeURIComponent(currentProject)
+      + '&clip_id=' + encodeURIComponent(c.clip_id));
+    if (g && g.code === 200 && g.item) { _cl.queue[i] = g.item; return g.item; }
+  } catch (e) {}
+  return c;
+}
 function clipLabelToggleAll() { _cl.showAll = !_cl.showAll; clipLabelRender(); }
-// ===== 面板内嵌播放器：左边看画面（可播）· 右边点标签 —— 边看边标 =====
-function clStageShow(idx) {
-  const urls = _cl.stageUrls || _cl.bigUrls || [];
+// ===== 通用内嵌播放器：抽帧序列逐帧回放（人机评测 / 数据审核共用同一套逻辑与控件）=====
+// 源视频不参与播放（NAS 上取流慢、常播不了）。两处共用一份实现，避免行为漂移。
+// 每个宿主用一个前缀区分（人机评测 'cl'、数据审核 'au'），状态存在 _STG[pfx]。
+const _STG = {};
+function _stg(pfx) { return _STG[pfx] || (_STG[pfx] = { urls: [], bigUrls: [], thumbs: [], idx: 0, playing: false, speed: 500, timer: null }); }
+function stageHtml(pfx) {
+  const B = 'padding:4px 10px; font-size:13px;';
+  const btn = function (act, label, tip) {
+    return '<button class="secondary" style="' + B + '" onclick="' + act + '" title="' + tip + '">' + label + '</button>';
+  };
+  return '<div style="flex:0 0 auto; aspect-ratio:16/9; position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:0;">'
+    + '<img id="' + pfx + 'StageImg" src="" onclick="stageZoom(\'' + pfx + '\')" style="width:100%; height:100%; object-fit:contain; cursor:zoom-in;" title="点击可放大（滚轮缩放 / ←→ 翻页）">'
+    + '<div style="position:absolute; left:0; right:0; bottom:0; padding:8px 12px; display:flex; gap:10px; align-items:center; background:linear-gradient(transparent, rgba(0,0,0,0.85));">'
+    + btn('stageStep(\'' + pfx + '\',-5)', '⏪', '快退 5 帧')
+    + btn('stageStep(\'' + pfx + '\',-1)', '⏮', '上一帧（←）')
+    + '<button id="' + pfx + 'PlayBtn" class="secondary" style="padding:4px 14px; font-size:13px; min-width:76px;" onclick="stageToggle(\'' + pfx + '\')">▶ 播放</button>'
+    + btn('stageStep(\'' + pfx + '\',1)', '⏭', '下一帧（→）')
+    + btn('stageStep(\'' + pfx + '\',5)', '⏩', '快进 5 帧')
+    + '<input id="' + pfx + 'Seek" type="range" min="0" max="0" value="0" oninput="stageSeek(\'' + pfx + '\',this.value)" style="flex:1; min-width:80px; cursor:pointer;">'
+    + '<select id="' + pfx + 'Speed" onchange="stageSetSpeed(\'' + pfx + '\',this.value)" style="font-size:12px; padding:3px 4px;" title="播放速度（快进）">'
+    + '<option value="1000">0.5x</option><option value="500" selected>1x</option><option value="250">2x</option><option value="125">4x</option><option value="60">8x</option></select>'
+    + '<label style="font-size:12px; color:#cbd5e1; display:inline-flex; align-items:center; gap:4px; cursor:pointer;" title="播完自动从头再播（默认关，避免一直占用解码）">'
+    + '<input type="checkbox" id="' + pfx + 'Loop" style="cursor:pointer;"> 循环</label>'
+    + '<span id="' + pfx + 'Info" style="font-size:12px; color:#cbd5e1; min-width:80px; text-align:right;"></span>'
+    + '</div></div>'
+    + '<div id="' + pfx + 'Frames" style="flex:0 0 auto; max-height:118px; display:grid; grid-template-columns:repeat(auto-fill,minmax(74px,1fr)); gap:4px; overflow-y:auto; align-content:start;"></div>';
+}
+// 装载新的一段：复位播放器 + 重建缩略图条（默认 1x、循环关、停在第 1 帧）
+function stageInit(pfx, urls, bigUrls, thumbs) {
+  const st = _stg(pfx);
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+  st.urls = urls || []; st.bigUrls = bigUrls || st.urls; st.thumbs = thumbs || st.urls;
+  st.idx = 0; st.playing = false; st.speed = 500;
+  const fr = document.getElementById(pfx + 'Frames');
+  if (fr) fr.innerHTML = st.thumbs.map(function (u, i) {
+    return '<img data-fi="' + i + '" src="' + u + '" onclick="stageSeek(\'' + pfx + '\',' + i + ')" '
+      + 'style="width:100%; border-radius:4px; display:block; cursor:pointer; background:#000;" title="跳到第 ' + (i + 1) + ' 帧">';
+  }).join('');
+  const sp = document.getElementById(pfx + 'Speed'); if (sp) sp.value = '500';
+  const lp = document.getElementById(pfx + 'Loop'); if (lp) lp.checked = false;
+  stagePause(pfx);
+  stageShow(pfx, 0);
+}
+function stageShow(pfx, idx) {
+  const st = _stg(pfx), urls = st.urls;
   if (!urls.length) return;
   idx = Math.max(0, Math.min(parseInt(idx) || 0, urls.length - 1));
-  _cl.stageIdx = idx;
-  const img = document.getElementById('clStageImg');
+  st.idx = idx;
+  const img = document.getElementById(pfx + 'StageImg');
   if (img) img.src = urls[idx];
-  const seek = document.getElementById('clSeek');
+  const seek = document.getElementById(pfx + 'Seek');
   if (seek) { seek.max = Math.max(0, urls.length - 1); seek.value = idx; }
-  const info = document.getElementById('clStageInfo');
+  const info = document.getElementById(pfx + 'Info');
   if (info) info.textContent = (idx + 1) + ' / ' + urls.length + ' 帧';
-  document.querySelectorAll('#clFrames img[data-fi]').forEach(function (el) {
+  document.querySelectorAll('#' + pfx + 'Frames img[data-fi]').forEach(function (el) {
     const on = parseInt(el.dataset.fi) === idx;
     el.style.outline = on ? '2px solid var(--primary)' : 'none';
     el.style.opacity = on ? '1' : '0.6';
   });
 }
-function clStagePlay() {
-  const urls = _cl.stageUrls || _cl.bigUrls || [];
-  if (urls.length < 2) return;
-  if (_cl.stageIdx >= urls.length - 1) clStageShow(0);
-  _cl.playing = true;
-  const b = document.getElementById('clPlayBtn');
-  if (b) b.textContent = '⏸ 暂停';
-  if (_cl.timer) clearInterval(_cl.timer);
-  _cl.timer = setInterval(function () {
-    if (_cl.stageIdx + 1 >= urls.length) {
-      const loop = document.getElementById('clLoop');
-      if (loop && loop.checked) { clStageShow(0); return; }   // 循环（默认关）
-      clStagePause();
-      return;
-    }
-    clStageShow(_cl.stageIdx + 1);
-  }, _cl.speed || 500);
-}
-function clStagePause() {
-  _cl.playing = false;
-  if (_cl.timer) { clearInterval(_cl.timer); _cl.timer = null; }
-  const b = document.getElementById('clPlayBtn');
+function stagePause(pfx) {
+  const st = _stg(pfx);
+  st.playing = false;
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+  const b = document.getElementById(pfx + 'PlayBtn');
   if (b) b.textContent = '▶ 播放';
 }
-function clStageToggle() { if (_cl.playing) clStagePause(); else clStagePlay(); }
-function clStageSeek(v) { clStagePause(); clStageShow(v); }
-// 逐帧/跳帧（⏮⏭ 单帧、⏪⏩ 跳 5 帧）
-function clStageStep(d) { clStagePause(); clStageShow((_cl.stageIdx || 0) + (parseInt(d) || 0)); }
-// 倍速（快进）：改播放间隔；播放中立即按新速度重启
-function clStageSetSpeed(ms) {
-  _cl.speed = parseInt(ms) || 500;
-  if (_cl.playing) { clStagePause(); clStagePlay(); }
+function stagePlay(pfx) {
+  const st = _stg(pfx), urls = st.urls;
+  if (urls.length < 2) return;
+  if (st.idx >= urls.length - 1) stageShow(pfx, 0);
+  st.playing = true;
+  const b = document.getElementById(pfx + 'PlayBtn');
+  if (b) b.textContent = '⏸ 暂停';
+  if (st.timer) clearInterval(st.timer);
+  st.timer = setInterval(function () {
+    if (st.idx + 1 >= urls.length) {
+      const loop = document.getElementById(pfx + 'Loop');
+      if (loop && loop.checked) { stageShow(pfx, 0); return; }   // 循环（默认关）
+      stagePause(pfx);
+      return;
+    }
+    stageShow(pfx, st.idx + 1);
+  }, st.speed || 500);
+}
+function stageToggle(pfx) { _stg(pfx).playing ? stagePause(pfx) : stagePlay(pfx); }
+function stageSeek(pfx, v) { stagePause(pfx); stageShow(pfx, v); }
+function stageStep(pfx, d) { stagePause(pfx); stageShow(pfx, (_stg(pfx).idx || 0) + (parseInt(d) || 0)); }
+function stageSetSpeed(pfx, ms) {           // 倍速（快进）：播放中立即按新速度重启
+  const st = _stg(pfx);
+  st.speed = parseInt(ms) || 500;
+  if (st.playing) { stagePause(pfx); stagePlay(pfx); }
+}
+function stageZoom(pfx) { const st = _stg(pfx); ivOpen(st.bigUrls, st.idx); }
+// 键盘：只驱动当前可见面板那一个舞台（输入框内不抢键；全屏查看器开着时交给它）
+function _activeStagePfx() {
+  const vw = document.getElementById('imgViewer');
+  if (vw && vw.style.display === 'block') return null;
+  if (document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return null;
+  const hc = document.getElementById('hardCasePanel');
+  if (hc && hc.offsetParent !== null && document.getElementById('clStageImg')) return 'cl';
+  const au = document.getElementById('mod-audit');
+  if (au && au.classList.contains('active') && document.getElementById('auStageImg')) return 'au';
+  return null;
 }
 document.addEventListener('keydown', function (e) {
-  const panel = document.getElementById('hardCasePanel');
-  if (!panel || panel.offsetParent === null) return;
-  const vw = document.getElementById('imgViewer');
-  if (vw && vw.style.display === 'block') return;   // 全屏查看器开着时由它处理
-  if (document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
-  if (e.key === ' ') { e.preventDefault(); clStageToggle(); }
-  else if (e.key === 'ArrowRight') { e.preventDefault(); clStageStep(e.shiftKey ? 5 : 1); }
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); clStageStep(e.shiftKey ? -5 : -1); }
+  const pfx = _activeStagePfx();
+  if (!pfx) return;
+  if (e.key === ' ') { e.preventDefault(); stageToggle(pfx); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); stageStep(pfx, e.shiftKey ? 5 : 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); stageStep(pfx, e.shiftKey ? -5 : -1); }
 });
+// ---- 人机评测面板的薄包装（保留原调用名，内部走共用组件）----
+function clStageShow(i) { stageShow('cl', i); }
+function clStagePause() { stagePause('cl'); }
+function clStageToggle() { stageToggle('cl'); }
+function clStageStep(d) { stageStep('cl', d); }
+function clStageSeek(v) { stageSeek('cl', v); }
+function clStageSetSpeed(ms) { stageSetSpeed('cl', ms); }
+// ---- 数据审核：装载当前卡片的抽帧序列（Clip 播整段；单帧找它所在的段，找不到用相邻帧近似）----
+// ===== 数据审核：画面回放（一个播放器，8 帧 / 整段 30 帧 一键切换）=====
+// 8 帧 = 实际送模型的那几帧（模型看到的就是这几帧，审核的就是它）；30 帧 = 整段连续画面。
+// 帧集合：Clip 条目自带 frame_ids + sample_urls（pos 是段内下标）；单帧条目去定位它所属的段。
+const _AU = { model: [], seg: [], mode: 'model', seq: 0 };
+let _auLoadSeq = 0;
+async function auStageLoad(it) {
+  const host = document.getElementById('auStageHost');
+  if (!host) return;
+  if (!host.innerHTML) host.innerHTML = stageHtml('au');
+  const _seq = ++_auLoadSeq;      // 快速切卡片时，早先那次的异步结果不许覆盖后一次
+  _AU.model = []; _AU.seg = []; _AU.mode = 'model';
+  if (!it) { auStagePaint(); auStageApply(); return; }
+  const segFids = ((it.segment && it.segment.frame_ids) || []).slice();
+  // 送模型的帧：用 sample_urls 的 pos 落到段内真实帧号（拿不到就退回 url 里的帧号）
+  const modelFids = (it.sample_urls || []).map(function (s) {
+    if (s && s.pos != null && segFids[s.pos] != null) return segFids[s.pos];
+    const m = String((s && s.url) || '').match(/\/api\/image\/[^/]+\/(\d+)/);
+    return m ? parseInt(m[1]) : null;
+  }).filter(function (v) { return v != null; });
+  let seg = segFids, tag = '';
+  if (!seg.length && it._kind !== 'clip' && it.id != null) {
+    try {   // 服务端查"这一帧属于哪一段"，不再把全部 clip 拉下来自己找
+      const r = await auditFetch('/api/clips/for_frame?project=' + encodeURIComponent(currentProject) + '&fid=' + it.id);
+      if (r && (r.frame_ids || []).length) { seg = r.frame_ids.slice(); tag = '所在段'; }
+    } catch (e) { }
+    if (!seg.length) {   // 兜底：相邻库内帧（id 是全局序号，相邻通常同属一段画面）
+      const half = 15, lo = Math.max(0, it.id - half);
+      seg = [];
+      for (let i = lo; i <= it.id + half; i++) seg.push(i);
+      tag = '无段记录，相邻帧近似';
+    }
+  }
+  if (_seq !== _auLoadSeq) return;
+  _AU.seg = seg;
+  _AU.model = modelFids.length ? modelFids : seg.slice();   // 单帧条目没有"送模型的 N 帧"，只有一段
+  _AU.mode = modelFids.length ? 'model' : 'seg';            // 默认看"送模型的那几帧"
+  _AU.tag = tag;
+  auStagePaint();
+  auStageApply();
+}
+function auStageToggleSrc() {
+  _AU.mode = _AU.mode === 'model' ? 'seg' : 'model';
+  auStagePaint();
+  auStageApply();
+}
+function auStagePaint() {
+  const btn = document.getElementById('auSrcBtn');
+  const both = _AU.model.length && _AU.seg.length && _AU.seg.length !== _AU.model.length;
+  if (btn) {
+    btn.style.display = both ? '' : 'none';
+    if (both) btn.textContent = _AU.mode === 'model'
+      ? ('切到整段 ' + _AU.seg.length + ' 帧 ▶') : ('◀ 切回送模型的 ' + _AU.model.length + ' 帧');
+  }
+}
+function auStageApply() {
+  const note = document.getElementById('auStageNote');
+  const fids = _AU.mode === 'model' ? _AU.model : _AU.seg;
+  if (!fids.length) { stageInit('au', [], [], []); if (note) note.textContent = '该条目没有可播放的抽帧序列'; return; }
+  const mk = function (w) {
+    return fids.map(function (f) { return '/api/image/' + encodeURIComponent(currentProject) + '/' + f + '?w=' + w; });
+  };
+  stageInit('au', mk(800), mk(1600), mk(240));
+  if (note) note.textContent = '';   // 帧数/来源说明在切换按钮上已能看出，不再重复一行文字
+}
 function clipLabelPlay() {
   const c = clipLabelCur();
   if (!c) return;
@@ -6688,8 +7200,10 @@ function clipLabelPlay() {
   // 连续画面，按相机节奏回放即可还原过程，且不依赖源视频可访问性。
   fsPlaySeqFrames(clipToItem(c));
 }
-function clipLabelRender() {
-  const c = clipLabelCur();
+async function clipLabelRender() {
+  const _i = _cl.idx;
+  const c = await clipLabelEnsure(_i);
+  if (_cl.idx !== _i) return;      // 取详情期间用户已经翻到别的段了，这次作废
   const box = document.getElementById('clDims');
   if (!c) { box.innerHTML = '<div style="padding:20px; color:var(--text-muted);">没有可打标的段（需要有模型判定结果的 Clip）</div>'; return; }
   const _ptxt = '第 ' + (_cl.idx + 1) + '/' + _cl.queue.length + ' 段 · 已标注 ' + (_cl.labeledTotal || 0) + ' 段' + (_cl.labeledIds[c.clip_id] ? ' · 本段已标过(可修订)' : '');
@@ -6708,34 +7222,67 @@ function clipLabelRender() {
   _cl.bigUrls = _mk(1600);     // 点开放大：1600 看细节
   _cl.thumbs = _mk(240);       // 缩略图条
   (_cl.stageUrls || []).forEach(function (u) { var _im = new Image(); _im.src = u; });   // 预加载（800px 体积小）
-  document.getElementById('clFrames').innerHTML = (_cl.thumbs || []).map(function (u, i) {
-    return '<img data-fi="' + i + '" src="' + u + '" onclick="clStageSeek(' + i + ')" '
-      + 'style="width:100%; border-radius:4px; display:block; cursor:pointer; background:#000;" title="跳到第 ' + (i + 1) + ' 帧">';
-  }).join('');
-  clStageShow(0);
+  const _sh = document.getElementById('clStageHost');       // 共用播放器：首次渲染时生成控件
+  if (_sh && !_sh.innerHTML) _sh.innerHTML = stageHtml('cl');
+  stageInit('cl', _cl.stageUrls, _cl.bigUrls, _cl.thumbs);  // 装载本段帧序列（默认 1x / 循环关 / 停首帧）
   document.getElementById('clMeta').innerHTML = 'clip: ' + c.clip_id + '<br>帧数: ' + (c.frame_count || 0)
     + '<div style="margin-top:6px; display:flex; gap:6px;">'
     + '<button class="secondary" onclick="clipLabelToggleAll()" style="padding:3px 10px; font-size:11px;">' + (_cl.showAll ? '◀ 只看送模型的 ' + ((c.sample_urls || []).length) + ' 帧' : '看整段 ' + ((c.frame_ids || []).length) + ' 帧 ▶') + '</button>'
     + '</div>';
-  _cl.compare = null; _cl.saved = false;
-  const _lp = document.getElementById('clLoop'); if (_lp) _lp.checked = false;
-  const _sp = document.getElementById('clSpeed'); if (_sp) _sp.value = '500';
-  _cl.speed = 500;
-  clStagePause();
+  // 模型判定的事件 + 证据链（与数据审核同一套呈现）：放在视频下方，方便边看边核对
+  const _evs = ((c.vlm_result || {}).events) || [];
+  const _nShow = _fidList.length;
+  document.getElementById('clEvidence').innerHTML = _evs.length
+    ? '<div style="border-top:1px dashed rgba(255,255,255,0.12); padding-top:6px;">'
+      + '<div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">↑ 请对照上方 '
+      + _nShow + ' 帧判断这些描述是否属实</div>'
+      + clipEventsHtml(_evs)
+      + '</div>'
+    : '<div style="border-top:1px dashed rgba(255,255,255,0.12); padding-top:6px; font-size:11px; color:var(--text-muted);">本段模型未判定出事件</div>';
+  // 判定依据（证据链）：与数据审核同一套组件，单 clip 折叠展示
+  document.getElementById('clChain').innerHTML = clipChainBlock(c.vlm_result, ((c.vlm_result || {})._diag || {}).det);
+  // 换段才重置：回看已标过的段要把人工标签/人工否决带出来，才能接着改
+  if (_cl.loadedFor !== c.clip_id) {
+    _cl.loadedFor = c.clip_id;
+    _cl.gt = JSON.parse(JSON.stringify(c.human_tags || {}));
+    _cl.rejected = JSON.parse(JSON.stringify(c.human_rejected || {}));
+    _cl.model = clipLabelModelTags(c);
+    _cl.note = ''; _cl.reviewed = false;
+    const _ne0 = document.getElementById('clNote'); if (_ne0) _ne0.value = '';
+    const _rm0 = document.getElementById('clReviewedMsg'); if (_rm0) _rm0.textContent = '';
+    // 回读同一份记录（与人机打标共用）：显示上次的备注与"已核对"状态
+    (function (cid) {
+      auditFetch('/api/benchmark/clip_label/one?project=' + encodeURIComponent(currentProject)
+        + '&clip_id=' + encodeURIComponent(cid)).then(function (r) {
+        if (_cl.loadedFor !== cid) return;                 // 期间换段了，丢弃
+        const rec = (r && r.record) || null;
+        if (!rec) return;
+        _cl.note = rec.note || ''; _cl.reviewed = !!rec.reviewed;
+        const ne = document.getElementById('clNote'); if (ne) ne.value = _cl.note;
+        const rm = document.getElementById('clReviewedMsg');
+        if (rm) rm.textContent = (_cl.reviewed ? '✔ 已核对（认可模型）' : '上次保存') + (rec.ts ? '（' + rec.ts + '）' : '');
+      }).catch(function () {});
+    })(c.clip_id);
+  }
+  _cl.compare = null; _cl.saved = false;   // 播放器的复位（倍速/循环/暂停）由 stageInit 统一做
   document.getElementById('clSavedMsg').textContent = '';
   document.getElementById('clCompare').innerHTML = '';
   // ⚠️ 必须用 _cl.dims（带本体枚举 values）；CLIP_BENCH_DIMS 只有中英文名，
   // 用它渲染会导致一个标签都显示不出来（2026-09-20 实测踩坑）。
   const _dimSrc = (_cl.dims && _cl.dims.length) ? _cl.dims : CLIP_BENCH_DIMS;
-  box.innerHTML = _dimSrc.map(function (d) {
+  _cl.dimSrc = _dimSrc;
+  box.innerHTML = clipLabelLegend() + _dimSrc.map(function (d) {
     const vals = d.values || [];
-    const sel = _cl.gt[d.key] || [];
-    const chips = vals.map(function (v) {
-      const on = sel.includes(v);
+    // 枚举里没有但模型/人工已经标了的值，也要显示出来（否则"模型判的"看不见、无从取消）
+    const _extra = [];
+    [(_cl.model[d.key] || []), (_cl.gt[d.key] || []), (_cl.rejected[d.key] || [])].forEach(function (arr) {
+      arr.forEach(function (v) { if (v && vals.indexOf(v) < 0 && _extra.indexOf(v) < 0) _extra.push(v); });
+    });
+    const all = vals.concat(_extra);
+    const chips = all.map(function (v) {
+      const st = clipLabelState(d.key, v);
       return '<span data-dim="' + d.key + '" data-val="' + v + '" onclick="clipLabelToggle(this)" '
-        + 'style="display:inline-block; padding:4px 12px; margin:3px; font-size:13px; border-radius:14px; cursor:pointer; '
-        + 'border:1px solid ' + (on ? 'var(--primary)' : 'rgba(148,163,184,.35)') + '; '
-        + 'background:' + (on ? 'rgba(59,130,246,.25)' : 'transparent') + '; color:' + (on ? 'var(--primary)' : 'var(--text-muted)') + ';">' + v + '</span>';
+        + 'title="' + clipLabelHint(st) + '" class="clchip" style="' + clipLabelStyle(st, false) + '">' + v + '</span>';
     }).join('');
     return '<div style="margin-bottom:12px; padding:8px 10px; background:rgba(148,163,184,0.05); border-radius:8px;">'
       + '<div style="margin-bottom:4px;"><b style="font-size:13px; color:var(--text-main);">' + d.cn + '</b>'
@@ -6744,61 +7291,150 @@ function clipLabelRender() {
       + '<div style="line-height:1.9;">' + (chips || '<span style="font-size:12px; color:var(--text-muted);">（本体无枚举，暂不可标）</span>') + '</div></div>';
   }).join('');
 }
+// 模型判定 → {dim: [值]}，与后端 _clip_model_sets 同一映射（存的是数组，可直接 includes）
+function clipLabelModelTags(c) {
+  const r = (c && c.vlm_result) || {};
+  const sc = r.scene || {};
+  const m = {};
+  ['time', 'weather', 'road_surface', 'scene', 'risk', 'traffic_sign'].forEach(function (k) {
+    const v = (k === 'risk' || k === 'traffic_sign') ? r[k] : sc[k];
+    m[k] = Array.isArray(v) ? v.slice() : (v ? [String(v)] : []);
+  });
+  // 道路：模型输出四个单一轴（含路面标线），对外仍是 9 维里的「道路」一维 → 合并成一个集合再对比
+  m.road = [].concat(sc.road_shape || [], sc.lane_count || [], sc.junction || [],
+                     sc.road_marking || [], sc.road || [])
+             .filter(Boolean);
+  m.objects = (r.objects || []).map(function (o) { return o && o.type; }).filter(Boolean);
+  m.events = (r.events || []).map(function (e) { return e && e.type; }).filter(Boolean);
+  return m;
+}
+// 单个 chip 的四态：人工(绿) / 仅模型(黄) / 已被人工否决(灰删除线) / 未标(灰)
+function clipLabelState(dim, val) {
+  if ((_cl.gt[dim] || []).indexOf(val) >= 0) return 'human';
+  if ((_cl.rejected[dim] || []).indexOf(val) >= 0) return 'rejected';
+  if ((_cl.model[dim] || []).indexOf(val) >= 0) return 'model';
+  return 'empty';
+}
+function clipLabelStyle(st, off) {
+  const S = {
+    human:    ['rgba(34,197,94,.22)',  'var(--success)',      '1px solid var(--success)',           ''],
+    model:    ['rgba(234,179,8,.20)',  'var(--warning)',      '1px dashed var(--warning)',          ''],
+    rejected: ['rgba(148,163,184,.10)', 'var(--text-muted)',  '1px dashed rgba(148,163,184,.5)',    'text-decoration:line-through; opacity:.65;'],
+    empty:    ['transparent',          'var(--text-muted)',   '1px solid rgba(148,163,184,.35)',    '']
+  }[st] || ['transparent', 'var(--text-muted)', '1px solid rgba(148,163,184,.35)', ''];
+  const dim = off ? 'opacity:.35;' : '';
+  return 'display:inline-block; padding:4px 12px; margin:3px; font-size:13px; border-radius:14px; cursor:pointer; '
+    + 'border:' + S[2] + '; background:' + S[0] + '; color:' + S[1] + ';' + S[3] + dim;
+}
+function clipLabelHint(st) {
+  return { human: '人工标注（点击取消）', model: '模型判定（点击取消这条模型标签）',
+           rejected: '已被人工取消的模型标签（点击恢复）', empty: '点击标为人工标签' }[st] || '';
+}
+function clipLabelLegend() {
+  return '<div style="display:flex; gap:14px; align-items:center; margin-bottom:10px; padding:6px 10px; '
+    + 'background:rgba(148,163,184,0.06); border-radius:8px; font-size:12px; color:var(--text-muted);">'
+    + '<span style="' + clipLabelStyle('human', false) + ' cursor:default;">人工</span>'
+    + '<span style="' + clipLabelStyle('model', false) + ' cursor:default;">模型</span>'
+    + '<span style="' + clipLabelStyle('empty', false) + ' cursor:default;">未标</span>'
+    + '<span style="margin-left:auto;">最终标签 = 人工 ∪ 模型</span></div>';
+}
 function clipLabelToggle(el) {
   const dim = el.dataset.dim, val = el.dataset.val;
-  const arr = _cl.gt[dim] || (_cl.gt[dim] = []);
-  const i = arr.indexOf(val);
-  if (i >= 0) arr.splice(i, 1); else arr.push(val);
-  const on = arr.indexOf(val) >= 0;
-  el.style.border = '1px solid ' + (on ? 'var(--primary)' : 'rgba(148,163,184,.35)');
-  el.style.background = on ? 'rgba(59,130,246,.25)' : 'transparent';
-  el.style.color = on ? 'var(--primary)' : 'var(--text-muted)';
+  const st = clipLabelState(dim, val);
+  const _pull = function (o, k, v) { const a = o[k] || (o[k] = []); const i = a.indexOf(v); if (i >= 0) a.splice(i, 1); };
+  if (st === 'human') {                       // 人工 → 取消人工（退回模型/未标）
+    _pull(_cl.gt, dim, val);
+  } else if (st === 'model') {                // 模型 → 人工取消这条模型标签
+    (_cl.rejected[dim] || (_cl.rejected[dim] = [])).push(val);
+  } else if (st === 'rejected') {             // 被否 → 恢复模型标签
+    _pull(_cl.rejected, dim, val);
+  } else {                                    // 未标 → 标为人工
+    (_cl.gt[dim] || (_cl.gt[dim] = [])).push(val);
+  }
+  clipLabelRenderChips(dim);
 }
 function clipLabelClear(el) {
   const dim = el.dataset.dim;
   delete _cl.gt[dim];
+  delete _cl.rejected[dim];
   clipLabelRenderChips(dim);
 }
 function clipLabelRenderChips(dim) {
-  const sel = _cl.gt[dim] || [];
   document.querySelectorAll('#clDims span[data-dim]').forEach(function (sp) {
     if (sp.dataset.dim !== dim) return;
-    const on = sel.indexOf(sp.dataset.val) >= 0;
-    sp.style.border = '1px solid ' + (on ? 'var(--primary)' : 'rgba(148,163,184,.35)');
-    sp.style.background = on ? 'rgba(59,130,246,.25)' : 'transparent';
-    sp.style.color = on ? 'var(--primary)' : 'var(--text-muted)';
+    const st = clipLabelState(dim, sp.dataset.val);
+    sp.setAttribute('style', clipLabelStyle(st, false));
+    sp.setAttribute('title', clipLabelHint(st));
   });
 }
-async function clipLabelSave() {
+async function clipLabelSave(reviewed) {
+  // reviewed=1：「模型判得对、我不做任何改动」也要能存下（用户口径：人工没标 = 认为模型对）。
+  // 没有这个开关时，模型判对的段一条都存不下来 → 人工白看、P/R/F1 也没法统计。
   const c = clipLabelCur();
   if (!c) return;
-  const gt = {};
+  const gt = {}, rej = {};
   let any = false;
-  CLIP_BENCH_DIMS.forEach(function (d) { if ((_cl.gt[d.key] || []).length) { gt[d.key] = _cl.gt[d.key]; any = true; } });
-  if (!any) return alert('至少标注一个维度');
+  CLIP_BENCH_DIMS.forEach(function (d) {
+    if ((_cl.gt[d.key] || []).length) { gt[d.key] = _cl.gt[d.key]; any = true; }
+    if ((_cl.rejected[d.key] || []).length) { rej[d.key] = _cl.rejected[d.key]; any = true; }
+  });
+  const _ne = document.getElementById('clNote');
+  const note = _ne ? _ne.value : (_cl.note || '');
+  _cl.note = note;
+  if (!any && !reviewed && !String(note || '').trim()) {
+    return alert('还没有任何改动（点标签才有效果：绿=人工、黄=模型、点黄=取消模型）；'
+      + '若确认模型判得对，请点「✔ 标记已核对（无改动）」');
+  }
   const fd = new FormData();
   fd.append('project', currentProject);
   fd.append('clip_id', c.clip_id);
   fd.append('gt', JSON.stringify(gt));
+  fd.append('rejected', JSON.stringify(rej));
+  fd.append('note', note || '');
+  if (reviewed) fd.append('reviewed', '1');
   let r = null;
   try { r = await auditFetch('/api/benchmark/clip_label', fd); } catch (e) { return alert('保存失败: ' + e.message); }
   if (!r || r.code !== 200) return alert('保存失败: ' + ((r && r.msg) || '?'));
   _cl.compare = r.compare; _cl.model = r.model; _cl.saved = true;
+  _cl.reviewed = !!reviewed;
   _cl.labeledIds[c.clip_id] = 1; _cl.labeledTotal = (_cl.labeledTotal || 0) + 1;
+  const _rm = document.getElementById('clReviewedMsg');
+  if (_rm) _rm.textContent = reviewed ? '✔ 已标记核对（认可以模型判定为准，无改动）' : '已保存本次改动';
   CLIP_BENCH_DIMS.forEach(function (d) {
     const el = document.getElementById('cmp_' + d.key);
     if (!el) return;
     const v = r.compare[d.key];
     if (v === 'both_empty') { el.innerHTML = '<span style="color:var(--text-muted);">（双方均无）</span>'; return; }
-    const col = v === '一致' ? 'var(--success)' : (v === '部分一致' ? 'var(--warning)' : 'var(--danger)');
+    const _VCOL = { '一致': 'var(--success)', '部分一致': 'var(--warning)', '不一致': 'var(--danger)',
+                    '人工未标': 'var(--text-muted)', '模型未标': 'var(--danger)' };
+    const col = _VCOL[v] || 'var(--text-muted)';
+    const _rejv = (_cl.rejected[d.key] || []);
     el.innerHTML = '<span style="color:' + col + '; font-weight:700;">' + v + '</span>'
-      + ' 人工: <b>' + ((_cl.gt[d.key] || []).join('、') || '无') + '</b>'
-      + ' · 模型: <b>' + ((r.model[d.key] || []).join('、') || '无') + '</b>';
+      + ' 人工: <b style="color:var(--success);">' + ((_cl.gt[d.key] || []).join('、') || '无') + '</b>'
+      + ' · 模型: <b style="color:var(--warning);">' + ((r.model[d.key] || []).join('、') || '无') + '</b>'
+      + (_rejv.length ? ' · 已取消: <b style="color:var(--text-muted); text-decoration:line-through;">' + _rejv.join('、') + '</b>' : '');
   });
-  document.getElementById('clSavedMsg').innerHTML = '✅ 已保存：人工标签已<b style="color:var(--success);">覆盖模型结果</b>（final_tags）· 本段 ' + r.agree + '/' + r.total + ' 维一致';
+  const _fsum = Object.keys((r && r.merged) || {}).map(function (k) {
+    const cn = (CLIP_BENCH_DIMS.filter(function (d) { return d.key === k; })[0] || {}).cn || k;
+    return cn + ':' + r.merged[k].join('/');
+  }).join('  ');
+  document.getElementById('clSavedMsg').innerHTML = '✅ 已保存：最终标签 = <b style="color:var(--success);">人工</b> ∪ '
+    + '<b style="color:var(--warning);">模型</b>（剔除人工取消）· 本段 ' + r.agree + '/' + r.total + ' 维一致'
+    + (_fsum ? '<div style="font-size:12px; color:var(--text-muted); margin-top:3px;">合并后：' + _fsum + '</div>' : '');
+}
+// 上一个 / 下一个：纯翻页，不过滤已标的（"跳过"才跳到下一个未标的）
+function clipLabelPrev() {
+  if (!_cl.queue.length) return;
+  _cl.idx = (_cl.idx - 1 + _cl.queue.length) % _cl.queue.length;
+  clipLabelRender();
+}
+function clipLabelNextPlain() {
+  if (!_cl.queue.length) return;
+  _cl.idx = (_cl.idx + 1) % _cl.queue.length;
+  clipLabelRender();
 }
 function clipLabelNext() {
-  _cl.gt = {}; _cl.compare = null; _cl.saved = false;
+  _cl.gt = {}; _cl.rejected = {}; _cl.loadedFor = null; _cl.compare = null; _cl.saved = false;
   let guard = 0;
   do { _cl.idx = (_cl.idx + 1) % Math.max(1, _cl.queue.length); guard++; }
   while (guard < _cl.queue.length && _cl.labeledIds[clipLabelCur() && clipLabelCur().clip_id]);
@@ -6882,14 +7518,14 @@ async function clipLabelShowStats() {
   <div id="ivStage" style="position:absolute; inset:0; overflow:hidden; display:flex; align-items:center; justify-content:center; cursor:grab;">
     <img id="ivImg" src="" draggable="false" style="max-width:100%; max-height:100%; transform-origin:0 0; user-select:none; pointer-events:none;">
   </div>
-  <button onclick="ivClose()" style="position:absolute; top:14px; right:18px; padding:6px 14px; font-size:14px; background:rgba(30,41,59,.9); color:#e2e8f0; border:1px solid rgba(148,163,184,.4); border-radius:6px; cursor:pointer;">✕ 关闭 (Esc)</button>
+  <button onclick="ivClose()" style="position:absolute; top:14px; right:18px; padding:6px 14px; font-size:14px; background:rgba(30,41,59,.9); color:#e2e8f0; border:1px solid rgba(148,163,184,.4); border-radius:6px; cursor:pointer;">✕ 关闭（单击画面亦可）</button>
   <div id="ivBar" style="position:absolute; bottom:0; left:0; right:0; padding:12px 16px; text-align:center; color:#cbd5e1; font-size:13px; background:linear-gradient(transparent, rgba(0,0,0,.8)); pointer-events:none;">
     <b id="ivInfo"></b>
-    <span style="margin-left:16px; color:#94a3b8;">滚轮/±缩放 · 拖动平移 · ← → 翻页 · 0 复位 · Esc 关闭</span>
+    <span style="margin-left:16px; color:#94a3b8;">单击关闭 · 滚轮/±缩放 · 拖动平移 · ← → 翻页 · 0 复位 · Esc 关闭</span>
   </div>
 </div>
 <script>
-let _iv = { urls: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0 };
+let _iv = { urls: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0, down: null };
 function ivOpen(urls, idx) {
   _iv.urls = (urls || []).filter(Boolean);
   if (!_iv.urls.length) return;
@@ -6940,6 +7576,7 @@ function ivClose() {
     ivZoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - r.left, e.clientY - r.top);
   }, { passive: false });
   stage.addEventListener('mousedown', function (e) {
+    _iv.down = { x: e.clientX, y: e.clientY };   // 记下按下位置，用来区分"单击返回"与"拖动平移"
     if (_iv.scale <= 1) return;
     _iv.drag = true; _iv.sx = e.clientX - _iv.tx; _iv.sy = e.clientY - _iv.ty;
     stage.style.cursor = 'grabbing';
@@ -6956,7 +7593,15 @@ function ivClose() {
       if (st) st.style.cursor = _iv.scale > 1 ? 'grab' : 'default';
     }
   });
-  stage.addEventListener('dblclick', function () { _iv.scale = 1; _iv.tx = 0; _iv.ty = 0; ivApply(); });
+  // 鼠标点击返回（用户 2026-09-20 要求；数据审核与人机评测共用这个查看器）：
+  // 在画面上单击 = 关闭。拖动平移（放大后）不触发 —— 按位移判断，>5px 视为拖拽。
+  stage.addEventListener('mouseup', function (e) {
+    const d = _iv.down;
+    _iv.down = null;
+    if (!d) return;
+    if (Math.abs(e.clientX - d.x) > 5 || Math.abs(e.clientY - d.y) > 5) return;
+    ivClose();
+  });
 })();
 window.addEventListener('keydown', function (e) {
   const v = document.getElementById('imgViewer');

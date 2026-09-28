@@ -141,13 +141,26 @@ def ensure_siglip():
         return None, None
 
 
-def free_siglip():
-    """替代原 _free_siglip - 真卸载(显存互斥用): 仅 release 不减引用, 必须把模型移出显存"""
+def _unload_real(model_name: str, label: str):
+    """**真卸载**：把权重移出显存并归还，而不是只减引用计数。
+
+    ⚠️ 2026-09-21 修（这是 OOM 循环的根因，别再退回去）：
+    原来 free_vlm / free_dino / free_yolo 都只调 `mgr.release()`（引用计数 -1），
+    权重仍留在显存里 —— 而 app 层还会把自己的全局引用置空，于是"看起来已释放、
+    显存其实没还"。后果是 make_room_for 声称"腾出空间"却腾不动：
+    批量检测跑完后 YOLO 的约 6G 一直占着，7B VLM（约 8.8G）加载不进去 →
+    **每逢检测之后做段级判定就整段整段 OOM**（实测：一次 1,687 帧的重检跑完，
+    紧接着判定 10 段成功后就连续 OOM，重启服务才恢复；也是 2026-09-20
+    "10 帧联合推理 OOM / 8 帧是安全边界"那天量到的同一个现象）。
+    只有 free_siglip 从一开始就是真卸载（作者注释写着"必须把模型移出显存"），
+    这里把另外三个统一成同一套做法：先 `.cpu()` 强制把张量搬出显存（否则 app 层
+    持有的引用会让 `del` 释放不掉），再清 loaded/ref_count，最后 empty_cache。"""
     mgr = get_gpu_manager()
     try:
         _models = getattr(mgr, "_models", None)
+        _did = False
         if _models:
-            info = _models.get(ModelName.SIGLIP.value)
+            info = _models.get(model_name)
             if info and info.get("model") is not None:
                 try:
                     info["model"] = info["model"].cpu()
@@ -157,13 +170,25 @@ def free_siglip():
                 info["processor"] = None
                 info["loaded"] = False
                 info["ref_count"] = 0
+                _did = True
         import torch
-        torch.cuda.empty_cache()
-        print("[GPU] SigLIP 已卸载释放显存", flush=True)
+        if _did:
+            # ⚠️ 只在**真的卸下来了**才打这行。原来无条件打印，于是空操作也会留日志，
+            # 排查时会被当成"发生过驱逐"的证据（2026-09-20 已被这类日志误导过一次）。
+            print("[GPU] %s 已卸载释放显存" % label, flush=True)
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
     except Exception as e:
-        print(f"[GPU] SigLIP 卸载异常: {e}", flush=True)
+        print(f"[GPU] {label} 卸载异常: {e}", flush=True)
     finally:
-        mgr.release(ModelName.SIGLIP.value)
+        mgr.release(model_name)
+
+
+def free_siglip():
+    """替代原 _free_siglip - 真卸载(显存互斥用): 仅 release 不减引用, 必须把模型移出显存"""
+    _unload_real(ModelName.SIGLIP.value, "SigLIP")
 
 
 def ensure_yolo():
@@ -188,9 +213,9 @@ def ensure_yolo():
     return None
 
 def free_yolo():
-    """替代原 _free_yolo"""
-    mgr = get_gpu_manager()
-    mgr.release(ModelName.YOLO.value)
+    """替代原 _free_yolo - 真卸载（见 _unload_real 的说明：只 release 不还显存，
+    是"检测跑完→判定 OOM"的根因）"""
+    _unload_real(ModelName.YOLO.value, "YOLO")
 
 
 def ensure_dino():
@@ -207,9 +232,8 @@ def ensure_dino():
 
 
 def free_dino():
-    """替代原 _free_dino"""
-    mgr = get_gpu_manager()
-    mgr.release(ModelName.DINO.value)
+    """替代原 _free_dino - 真卸载（同上）"""
+    _unload_real(ModelName.DINO.value, "DINO")
 
 
 def ensure_vlm():
@@ -226,9 +250,8 @@ def ensure_vlm():
 
 
 def free_vlm():
-    """替代原 _free_vlm"""
-    mgr = get_gpu_manager()
-    mgr.release(ModelName.VLM.value)
+    """替代原 _free_vlm - 真卸载（同上）"""
+    _unload_real(ModelName.VLM.value, "VLM")
 
 
 # ============================================================
