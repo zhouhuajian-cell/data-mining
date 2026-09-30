@@ -7774,13 +7774,22 @@ async function clipLabelShowStats() {
   <button onclick="ivClose()" style="position:absolute; top:14px; right:18px; padding:6px 14px; font-size:14px; background:rgba(30,41,59,.9); color:#e2e8f0; border:1px solid rgba(148,163,184,.4); border-radius:6px; cursor:pointer;">✕ 关闭（单击画面亦可）</button>
   <div id="ivBar" style="position:absolute; bottom:0; left:0; right:0; padding:12px 16px; text-align:center; color:#cbd5e1; font-size:13px; background:linear-gradient(transparent, rgba(0,0,0,.8)); pointer-events:none;">
     <b id="ivInfo"></b>
+    <span id="ivPlayWrap" style="margin-left:16px; display:none; pointer-events:auto;">
+      <button id="ivPlayBtn" onclick="ivTogglePlay()" style="padding:3px 12px; font-size:12px; background:rgba(30,41,59,.9); color:#e2e8f0; border:1px solid rgba(148,163,184,.4); border-radius:6px; cursor:pointer;">▶ 播放</button>
+      <select id="ivSpeed" onchange="ivSetSpeed(this.value)" style="font-size:12px; padding:3px 4px; cursor:pointer;" title="播放速度">
+        <option value="1000">0.5x</option><option value="500" selected>1x</option>
+        <option value="250">2x</option><option value="125">4x</option><option value="67">8x</option>
+      </select>
+      <label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;">
+        <input type="checkbox" id="ivLoop" style="cursor:pointer;"> 循环</label>
+    </span>
     <label style="margin-left:16px; display:inline-flex; align-items:center; gap:4px; cursor:pointer; pointer-events:auto;" title="框太多会挡住物体时可关掉">
       <input type="checkbox" id="ivBoxCb" style="cursor:pointer;" onchange="fsPlayToggleBoxes(this.checked)"> 检测框</label>
     <span style="margin-left:16px; color:#94a3b8;">单击关闭 · 滚轮/±缩放 · 拖动平移 · ← → 翻页 · 0 复位 · Esc 关闭</span>
   </div>
 </div>
 <script>
-let _iv = { urls: [], fids: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0, down: null };
+let _iv = { urls: [], fids: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0, down: null, timer: null };
 function ivOpen(urls, idx, fids) {
   _iv.urls = (urls || []).filter(Boolean);
   _iv.fids = fids || [];
@@ -7789,6 +7798,10 @@ function ivOpen(urls, idx, fids) {
   document.getElementById('imgViewer').style.display = 'block';
   const cb = document.getElementById('ivBoxCb');
   if (cb) cb.checked = _fsBoxesOn;
+  // 多帧才给"放大后播放"（用户 2026-09-30：审核/评测点开放大后也要能连续播）
+  const pw = document.getElementById('ivPlayWrap');
+  if (pw) pw.style.display = _iv.urls.length > 1 ? 'inline-block' : 'none';
+  ivPause();
   ivShow();
 }
 function ivShow() {
@@ -7819,10 +7832,43 @@ function ivDrawBoxes() {
     });
 }
 function ivClose() {
+  ivPause();
   document.getElementById('imgViewer').style.display = 'none';
   const layer = document.getElementById('ivBoxes');
   if (layer) { layer.innerHTML = ''; layer.dataset.on = ''; layer.style.display = 'none'; }
   _iv.urls = []; _iv.fids = [];
+}
+// 放大后播放：与 stage 同一套节奏（1x=500ms），翻页时框随帧重画
+function ivTogglePlay() { _iv.timer ? ivPause() : ivPlay(); }
+function ivPlay() {
+  if (!_iv.urls || _iv.urls.length < 2 || _iv.timer) return;
+  const b = document.getElementById('ivPlayBtn');
+  if (b) b.textContent = '⏸ 暂停';
+  _iv.timer = setInterval(function () {
+    if (_iv.i + 1 >= _iv.urls.length) {
+      const loop = document.getElementById('ivLoop');
+      if (loop && loop.checked) { ivShow2(0); return; }
+      ivPause();
+      return;
+    }
+    ivShow2(_iv.i + 1);
+  }, parseInt((document.getElementById('ivSpeed') || {}).value, 10) || 500);
+}
+function ivPause() {
+  if (_iv.timer) { clearInterval(_iv.timer); _iv.timer = null; }
+  const b = document.getElementById('ivPlayBtn');
+  if (b) b.textContent = '▶ 播放';
+}
+function ivShow2(i) {   // 播放翻页：不重置缩放/平移（用户放大看细节时连播不跳回原位）
+  _iv.i = i;
+  const img = document.getElementById('ivImg');
+  img.src = _iv.urls[_iv.i];
+  ivDrawBoxes();
+  const info = document.getElementById('ivInfo');
+  if (info) info.textContent = '第 ' + (_iv.i + 1) + ' / ' + _iv.urls.length + ' 张';
+}
+function ivSetSpeed(v) {   // 变速立即生效：按新速度重启
+  if (_iv.timer) { ivPause(); ivPlay(); }
 }
 function ivApply() {
   const img = document.getElementById('ivImg');
