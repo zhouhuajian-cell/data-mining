@@ -167,6 +167,10 @@ MTSD_RULES = [
                      "do-not-stop", "give-way", "stop", "height-limit", "width-limit",
                      "weight-limit", "road-closed", "end-of-prohibition", "parking-restrictions",
                      "tow-away-zone", "yield"]),
+    # ⚠️ complementary-- 细分语义（2026-09-28）：不是所有附加板都该进 guide ——
+    #    chevron（急弯导向标）/obstacle-delineator（障碍物标）本质是**警告**类（放在弯道/障碍前），
+    #    其余 complementary（go-left/keep-left/distance 等）维持 guide（指路）。
+    #    规则按顺序匹配：这两条必须排在 mandatory/guide 之前（warning 表里有 chevron 已覆盖一部分）。
     ("warning", ["warning--", "chevron", "obstacle-delineator", "accident-area", "road-bump",
                  "children", "horizontal-alignment", "curve", "bend", "slippery", "narrow",
                  "steep", "railway", "school", "risk", "danger"]),

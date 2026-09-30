@@ -1,13 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-数据根目录配置（支持 NAS / 网盘挂载点）
-优先级：环境变量 > 项目根 data_config.json > 默认 <项目>/workspace
+数据根目录 + 数据库配置
+优先级：环境变量 > 项目根 data_config.json > 默认值
 
-  AD_DATA_ROOT  - 媒体/项目仓根目录（原图、抽帧帧、向量 json/faiss、AutodriveData 导出树）
-  AD_DB_PATH    - SQLite 数据库文件路径（建议保留本地 SSD；网盘 SMB 上 SQLite 锁性能差）
+  AD_DATA_ROOT     - 媒体/项目仓根目录
+  AD_DB_TYPE       - 数据库类型: sqlite / postgresql (默认 sqlite)
+  AD_PG_HOST       - PostgreSQL 主机
+  AD_PG_PORT       - PostgreSQL 端口
+  AD_PG_DB         - PostgreSQL 数据库名
+  AD_PG_USER       - PostgreSQL 用户名
+  AD_PG_PASSWORD   - PostgreSQL 密码
+  AD_CH_HOST       - ClickHouse 主机
+  AD_CH_PORT       - ClickHouse 端口
+  AD_CH_DB         - ClickHouse 数据库名
 
 config.json（重启后端生效）:
-  { "data_root": "Z:/AutodriveData", "db_path": null }
+  {
+    "data_root": "Z:/AutodriveData",
+    "db_path": null,
+    "db_type": "postgresql",
+    "pg": {"host": "localhost", "port": 5432, "db": "ad_mining", "user": "ad_mining", "password": "***"},
+    "ch": {"host": "localhost", "port": 9000, "db": "ad_mining"}
+  }
 """
 
 import os
@@ -30,13 +44,20 @@ def load_config() -> dict:
     return {}
 
 
-def save_config(data_root: str = None, db_path: str = None) -> dict:
+def save_config(data_root: str = None, db_path: str = None,
+               db_type: str = None, pg: dict = None, ch: dict = None) -> dict:
     """持久化配置到 data_config.json（可只更新单字段，None 表示不动）"""
     cfg = load_config()
     if data_root is not None:
         cfg["data_root"] = data_root
     if db_path is not None:
         cfg["db_path"] = db_path or None
+    if db_type is not None:
+        cfg["db_type"] = db_type
+    if pg is not None:
+        cfg["pg"] = pg
+    if ch is not None:
+        cfg["ch"] = ch
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     return cfg
@@ -53,6 +74,15 @@ def data_root() -> str:
     return DEFAULT_ROOT
 
 
+def db_type() -> str:
+    """数据库类型：AD_DB_TYPE env > config.db_type > sqlite"""
+    env = os.environ.get("AD_DB_TYPE", "").strip()
+    if env:
+        return env
+    cfg = load_config()
+    return cfg.get("db_type", "sqlite")
+
+
 def db_path() -> str:
     """SQLite 库路径：AD_DB_PATH env > config.db_path > <data_root>/mining.db"""
     env = os.environ.get("AD_DB_PATH", "").strip()
@@ -62,6 +92,32 @@ def db_path() -> str:
     if isinstance(cfg, dict) and cfg.get("db_path"):
         return str(cfg["db_path"])
     return os.path.join(data_root(), "mining.db")
+
+
+def pg_config() -> dict:
+    """PostgreSQL 连接配置"""
+    cfg = load_config()
+    pg = cfg.get("pg", {})
+    return {
+        "host": os.environ.get("AD_PG_HOST", "") or pg.get("host", "localhost"),
+        "port": int(os.environ.get("AD_PG_PORT", "") or pg.get("port", 5432)),
+        "db": os.environ.get("AD_PG_DB", "") or pg.get("db", "ad_mining"),
+        "user": os.environ.get("AD_PG_USER", "") or pg.get("user", "ad_mining"),
+        "password": os.environ.get("AD_PG_PASSWORD", "") or pg.get("password", ""),
+    }
+
+
+def ch_config() -> dict:
+    """ClickHouse 连接配置"""
+    cfg = load_config()
+    ch = cfg.get("ch", {})
+    return {
+        "host": os.environ.get("AD_CH_HOST", "") or ch.get("host", "localhost"),
+        "port": int(os.environ.get("AD_CH_PORT", "") or ch.get("port", 9000)),
+        "db": os.environ.get("AD_CH_DB", "") or ch.get("db", "ad_mining"),
+        "user": os.environ.get("AD_CH_USER", "") or ch.get("user", "default"),
+        "password": os.environ.get("AD_CH_PASSWORD", "") or ch.get("password", ""),
+    }
 
 
 def config_info() -> dict:
@@ -80,9 +136,16 @@ def config_info() -> dict:
         "config_file": CONFIG_FILE,
         "data_root": data_root(),
         "data_root_source": src,
+        "db_type": db_type(),
         "db_path": db_path(),
         "db_path_source": db_src,
-        "env": {"AD_DATA_ROOT": env_root or None, "AD_DB_PATH": env_db or None},
+        "pg": pg_config(),
+        "ch": ch_config(),
+        "env": {
+            "AD_DATA_ROOT": env_root or None,
+            "AD_DB_PATH": env_db or None,
+            "AD_DB_TYPE": os.environ.get("AD_DB_TYPE", "") or None,
+        },
         "config_json": cfg,
     }
 

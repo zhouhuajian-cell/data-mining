@@ -35,21 +35,67 @@ def log(m):
 
 
 def backup_db():
-    src = _db_path()
+    import settings as _S
     os.makedirs(DB_BAK, exist_ok=True)
-    dst = os.path.join(DB_BAK, "mining_%s.db" % _dt.date.today().strftime("%Y%m%d"))
+    day = _dt.date.today().strftime("%Y%m%d")
     t0 = _dt.datetime.now()
-    con = sqlite3.connect(src)
-    try:
-        con.execute("VACUUM INTO ?", (dst,))
-    finally:
-        con.close()
+    if _S.db_type() == "postgresql":
+        # PG 模式下 mining.db 不再更新：再对它 VACUUM INTO 就是每天备份一个冻结的旧库（静默失效，
+        # 出事才发现备份是废的）→ 必须改 pg_dump。cron 不继承 systemd 的 env，见 /etc/cron.d 里先 source。
+        pg = _S.pg_config()
+        dst = os.path.join(DB_BAK, "pg_%s.dump" % day)
+        env = dict(os.environ)
+        env["PGPASSWORD"] = pg["password"]
+        subprocess.run(["pg_dump", "-Fc", "-h", pg["host"], "-p", str(pg["port"]),
+                        "-U", pg["user"], "-d", pg["db"], "-f", dst], check=True, env=env)
+        prefix = "pg_"
+    else:
+        dst = os.path.join(DB_BAK, "mining_%s.db" % day)
+        # VACUUM INTO 目标已存在会直接报 "output file already exists" —— 同一天手动重跑一次
+        # 就会失败（cron 每天一次所以没暴露）。先删目标，保证可重复执行。
+        if os.path.exists(dst):
+            os.remove(dst)
+        con = sqlite3.connect(_db_path())
+        try:
+            con.execute("VACUUM INTO ?", (dst,))
+        finally:
+            con.close()
+        prefix = "mining_"
     log("DB 备份 -> %s (%.0f MB, %.1fs)" % (dst, os.path.getsize(dst) / 1048576,
                                            (_dt.datetime.now() - t0).total_seconds()))
-    olds = sorted(os.listdir(DB_BAK))[:-KEEP]
+    # 只清同前缀的旧备份：切换引擎后别把另一边的备份顺手删掉（回退时还要用）
+    olds = sorted(f for f in os.listdir(DB_BAK) if f.startswith(prefix))[:-KEEP]
     for f in olds:
         os.remove(os.path.join(DB_BAK, f))
         log("清理旧备份 %s" % f)
+
+
+def _db_reader():
+    """返回 (项目名->id, 数 assets 的函数, 关闭函数)。PG 和 SQLite 各一套。"""
+    import settings as _S
+    if _S.db_type() == "postgresql":
+        import psycopg2
+        pg = _S.pg_config()
+        con = psycopg2.connect(host=pg["host"], port=pg["port"], dbname=pg["db"],
+                              user=pg["user"], password=pg["password"])
+
+        def names():
+            cur = con.cursor()
+            cur.execute("select name, id from projects")
+            return dict(cur.fetchall())
+
+        def count_assets(pid):
+            cur = con.cursor()
+            cur.execute("select count(*) from assets where project_id=%s", (pid,))
+            return cur.fetchone()[0]
+
+        return names(), count_assets, con.close
+    db = sqlite3.connect("file:%s?mode=ro" % _db_path(), uri=True)
+
+    def count_assets(pid):
+        return db.execute("select count(*) from assets where project_id=?", (pid,)).fetchone()[0]
+
+    return dict(db.execute("select name, id from projects").fetchall()), count_assets, db.close
 
 
 def snapshot_index_store():
@@ -68,9 +114,7 @@ def snapshot_index_store():
 
 def integrity_check():
     """三方对账：ntotal == len(metadata) == DB assets 数。任何不一致都写 ⚠️ 行。"""
-    import sqlite3 as _sq
-    db = _sq.connect("file:%s?mode=ro" % _db_path(), uri=True)
-    db_names = dict(db.execute("select name, id from projects").fetchall())
+    db_names, count_assets, db_close = _db_reader()
     problems = []
     for name in sorted(os.listdir(_A.LOCAL_INDEX_STORE)):
         idx_p = os.path.join(_A.LOCAL_INDEX_STORE, name, "index.faiss")
@@ -82,8 +126,7 @@ def integrity_check():
             nm = len(json.load(open(meta_p, encoding="utf-8")))
             nd = 0
             if name in db_names:
-                nd = db.execute("select count(*) from assets where project_id=?",
-                                (db_names[name],)).fetchone()[0]
+                nd = count_assets(db_names[name])
             tag = "OK" if nt == nm == nd else "⚠️"
             if tag != "OK":
                 problems.append((name, nt, nm, nd))
@@ -91,7 +134,7 @@ def integrity_check():
         except Exception as e:
             problems.append((name, -1, -1, -1))
             log("⚠️ %-20s 校验异常: %s" % (name, e))
-    db.close()
+    db_close()
     if problems:
         log("⚠️⚠️ 一致性对账发现 %d 处不一致: %s —— 处理前先看 AGENTS.md「索引损坏」章节，"
             "禁用向量化并人工介入" % (len(problems), problems))

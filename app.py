@@ -790,7 +790,7 @@ def make_room_for(model: str, need_gb: float = 2.0):
     """显存互斥调度：加载 model 前把与之不能共存的模型全部释放并归还显存。
     12G 卡上 VLM(7B-4bit 约 8G) 与 SigLIP/DINO/YOLO 尽量不共存。
     返回腾完后的可用显存(GB)。"""
-    keep = {"vlm": ("siglip", "dino", "yolo", "yoloworld", "sign"), "siglip": ("vlm", "dino"),
+    keep = {"vlm": ("siglip", "dino", "yolo", "yoloworld", "sign", "fine"), "siglip": ("vlm", "dino"),
             "dino": ("vlm", "yolo"), "yolo": ("vlm", "dino"),
             # ⚠️ 2026-09-22 优化：**YOLO-World（约 1.5G）在检测阶段常驻**（不被 yolo/dino 驱逐，
             # 否则每个检测批次都要重载一次、每次 17 秒 ≈ 全量白烧 5 小时）。
@@ -807,7 +807,7 @@ def make_room_for(model: str, need_gb: float = 2.0):
         _free_vlm()
     if "siglip" in keep:
         _free_siglip()
-    for _m in ("dino", "yolo", "yoloworld", "sign"):
+    for _m in ("dino", "yolo", "yoloworld", "sign", "fine"):
         if _m in keep:
             fn = globals().get("_free_" + _m)
             if callable(fn):
@@ -1644,12 +1644,24 @@ def perf_stats():
 _DB_STATS_INFLIGHT = set()   # 正在后台刷新的项目：同一项目同时只允许一个扫描线程
 def _db_stats_refresh(project: str, img_dir: str):
     try:
-        _DB_STATS_CACHE[project] = (time.time(), _db_stats_scan(img_dir))
+        _DB_STATS_CACHE[project] = (time.time(), _db_stats_count(project, img_dir))
         _db_stats_save()
     except Exception:
         pass
     finally:
         _DB_STATS_INFLIGHT.discard(project)
+def _db_stats_count(project: str, img_dir: str) -> int:
+    """原始帧数 = 扫盘数，但**不低于 metadata 条数**。
+    为什么（2026-09-30）：就地登记(AD_IMPORT_INPLACE)的图片根本不在 img_dir 里，
+    只扫盘会把 30 万张的项目显示成 3 万；而抽帧类项目盘上帧数 >= 已登记数，
+    取 max 不改变它原来的语义（盘上还有没入库的帧时，仍是扫盘值）。"""
+    n = _db_stats_scan(img_dir)
+    try:
+        _ctx = load_project_context(project)
+        n = max(n, len(_ctx.get("metadata") or []))
+    except Exception:
+        pass
+    return n
 def _db_stats_raw_count(project: str, img_dir: str) -> int:
     """带缓存的原始帧数：命中缓存直接返回；有旧值但过期 -> 先用旧值、后台线程刷新；
     完全没有缓存（首次）才同步扫一次。这样接口不会因为扫网盘目录卡 20 秒。
@@ -1670,7 +1682,7 @@ def _db_stats_raw_count(project: str, img_dir: str) -> int:
             except Exception:
                 _DB_STATS_INFLIGHT.discard(project)
         return _c[1]
-    n = _db_stats_scan(img_dir)
+    n = _db_stats_count(project, img_dir)
     _DB_STATS_CACHE[project] = (time.time(), n)
     _db_stats_save()
     return n
@@ -1807,6 +1819,11 @@ def _extract_and_index_unlocked(ctx, image_paths: List[str], frame_meta: dict = 
                     except Exception:
                         pass
                 extracted_records.append(_rec)
+                # 面板实时进度：原来 processed_count 只在整段跑完后赋值一次（见直导 worker 尾部），
+                # 前端全程显示 0，用户据此报「向量化没跑」——实测 124 张/秒在跑却看不出来。
+                # 这里逐图回写；只在当前是直导任务时才写，抽帧/搜索路径的语义不受影响。
+                if task_status.get("is_running") and task_status.get("task_type") == "import":
+                    task_status["processed_count"] = len(extracted_records)
     if extracted_feats:
         _n_in = len(extracted_records)
         _t_enc = time.time() - _t_enc0
@@ -1873,6 +1890,77 @@ def background_full_pipeline_worker(project: str, source_path: str):
         src_map = {}  # 文件名 -> (原始源目录, 相对父目录链)
         cancelled = False
         videos = []  # 发现的视频(直导后自动排队抽帧)
+        # ⚡ 登记并发化（2026-09-30）：原来逐个 shutil.copy2 是**单线程**，实盘实测 20 张/秒，
+        #   27.7 万张要 3.8 小时，是直导的绝对瓶颈。改成线程池后实测 41 张/秒（约 2 倍）。
+        #   ⚠️ 别再拿「本地盘目标」的速度外推：离线基准测出并行 6.2ms/张（8 倍），那是因为
+        #   目标写在本地 NVMe；真实目标是同一个 CIFS 盘，每张要两趟往返，
+        #   单线程 ~200ms/张（≈5 张/秒）纯延迟受限 —— 所以**线程数才是杠杆**，默认给 32。
+        #   PIL 校验一并入池——它每张也要读一次盘，留在外面会变成新的串行点。
+        #   并发数 AD_IMPORT_COPY_WORKERS 可调；共享结构用锁保护。
+        from concurrent.futures import ThreadPoolExecutor
+        _imp_lock = threading.Lock()
+        _imp_inplace = os.environ.get("AD_IMPORT_INPLACE", "0") == "1"
+        _imp_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(os.environ.get("AD_IMPORT_COPY_WORKERS", "32")))
+        )
+
+        def _import_one_image(file_path, f, root, p):
+            if task_status.get("is_cancelled"):
+                return None
+            with _imp_lock:
+                if f in existing_filenames:
+                    return None
+                existing_filenames.add(f)   # 先占位：原来靠顺序执行隐式去重，并发下不占位会重复登记
+            try:
+                # ⚠️ 别对每张都做 PIL 校验：那是一次网盘读。27.6 万张实测把 CIFS 打到
+                #    线程全部 D 状态、100 秒零字节吞吐（校验比拷贝还致命，因为它发生在回拷之前）。
+                #    就地模式 + 已知图片后缀直接放行——后缀足够判定，坏图由向量化那步的异常兜底；
+                #    无后缀/数字后缀（.224 这类）仍然靠 PIL 试出来。
+                _need_probe = not (_imp_inplace and os.path.splitext(f)[1].lower()
+                                   in (".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+                if _need_probe:
+                    # 强行用 PIL 试探一下它到底是不是图，打得开就收编入库！
+                    with Image.open(file_path) as img:
+                        img.verify()
+                # 登记到原始数据池：复制进项目图片目录。
+                # ⚠️ 必须分桶（与抽帧一致）：平铺会把几万张图堆进 images/ 顶层，
+                # CIFS 上 listdir/建文件退化到秒级（老的 11 万张扁平帧就是这么来的）。
+                # 桶名取"源目录相对导入根的子路径"（压平分隔符），一个叶子目录一个桶。
+                _rel = os.path.relpath(root, p)
+                _bucket = re.sub(
+                    r"[^0-9A-Za-z_.\-一-鿿]+", "_",
+                    os.path.basename(p) if _rel in (".", "") else _rel.replace(os.sep, "_"),
+                )[:64]
+                if _imp_inplace:
+                    # 🚀 就地登记（AD_IMPORT_INPLACE=1）：不回拷进项目池，直接把**源路径**记进 metadata。
+                    #    为什么：这块网盘对「小文件创建」实测封顶约 42 个/秒（8 线程 41、32 线程 43，
+                    #    加并发无效），27.6 万张回拷要 1.8 小时；而全链路读图都按 metadata 里的 path 走
+                    #    （见 /api/image 的 "优先读取原路径"），原地读完全等价。
+                    #    代价：项目不自持图片 —— 源目录被删/改名就断图；面板计数走 _db_stats_count 的下限口径。
+                    return (file_path, f, root, _rel)
+                _out_dir = os.path.join(ctx["img_dir"], _bucket or "import")
+                os.makedirs(_out_dir, exist_ok=True)
+                dst_file = os.path.join(_out_dir, f)
+                shutil.copy2(file_path, dst_file)
+                return (dst_file, f, root, _rel)
+            except Exception:
+                with _imp_lock:
+                    existing_filenames.discard(f)   # 失败放回，保持"只有成功才占名"的原语义
+                return None
+
+        _IMP_BATCH = 512
+        _futs = []
+
+        def _drain_import_futs():
+            """把已提交的拷贝结果收进 new_saved_paths / src_map（就地清空，避免残留引用）。"""
+            for _fu in _futs:
+                _res = _fu.result()
+                if _res:
+                    _dst, _fn, _rt, _rel = _res
+                    new_saved_paths.append(_dst)
+                    src_map[_fn] = (_rt, _rel)   # (源目录, 相对父目录链)
+            _futs.clear()
+
         for p in paths:
             if not os.path.exists(p):
                 task_status["msg"] = f"服务器端未找到路径: {p}"
@@ -1904,36 +1992,17 @@ def background_full_pipeline_worker(project: str, source_path: str):
                     ):
                         if f in existing_filenames:
                             continue
-                        try:
-                            # 强行用 PIL 试探一下它到底是不是图，打得开就收编入库！
-                            with Image.open(file_path) as img:
-                                img.verify()
-                            # 登记到原始数据池：复制进项目图片目录。
-                            # ⚠️ 必须分桶（与抽帧一致）：平铺会把几万张图堆进 images/ 顶层，
-                            # CIFS 上 listdir/建文件退化到秒级（老的 11 万张扁平帧就是这么来的）。
-                            # 桶名取"源目录相对导入根的子路径"（压平分隔符），一个叶子目录一个桶。
-                            _rel = os.path.relpath(root, p)
-                            _bucket = re.sub(
-                                r"[^0-9A-Za-z_.\-一-鿿]+", "_",
-                                os.path.basename(p) if _rel in (".", "") else _rel.replace(os.sep, "_"),
-                            )[:64]
-                            _out_dir = os.path.join(ctx["img_dir"], _bucket or "import")
-                            os.makedirs(_out_dir, exist_ok=True)
-                            dst_file = os.path.join(_out_dir, f)
-                            shutil.copy2(file_path, dst_file)
-                            new_saved_paths.append(dst_file)
-                            src_map[f] = (
-                                root,
-                                os.path.relpath(root, p),
-                            )  # (源目录, 相对父目录链)
-                            existing_filenames.add(f)
-                        except Exception:
-                            # 打不开说明真不是图片，直接跳过
-                            continue
+                        _futs.append(_imp_pool.submit(_import_one_image, file_path, f, root, p))
+                        # 有界排队：源可能是「单目录几十万张」（东南亚就是 83 万张挤在一个目录里），
+                        # 全量 submit 会堆出几十万个 future（数百 MB 常驻），按批消化掉
+                        if len(_futs) >= _IMP_BATCH:
+                            _drain_import_futs()
+                _drain_import_futs()
                 if cancelled:
                     break
             if cancelled:
                 break
+        _imp_pool.shutdown(wait=True)
         # 2. 扫描登记完成后，无缝自动触发特征提取（在线向量化，点燃 RTX 4070 Ti）
         task_status["total_count"] = len(new_saved_paths)
         if cancelled:
@@ -4249,28 +4318,52 @@ def yolo_detect(project: str = Form("default"), image_id: int = Form(...)):
         return res
     except Exception as e:
         return {"scores": [], "labels": [], "boxes": [], "width": 1920, "height": 1080}
-def _preload_images(paths, rgb=True, workers=8):
+def _preload_images(paths, rgb=True, workers=8, max_px=0):
     """线程池并行解码一批图片为 ndarray（RGB 或 BGR）。返回 list，元素为 (arr, w, h)，失败为 None。
 
-    并行解码避免 CPU 串行读图成为 GPU 瓶颈；解码后直接喂 GPU，批量推理更易把占用顶高。"""
+    并行解码避免 CPU 串行读图成为 GPU 瓶颈；解码后直接喂 GPU，批量推理更易把占用顶高。
+
+    max_px>0 时把最长边限制到 max_px：先用 PIL 的 draft() 让 JPEG **原生按比例缩解码**
+    （5312x2988 的帧直接按 1/4 解，省掉全分辨率解码），再按需 bilinear 收到 max_px。
+    ⚠️ 返回的 (w, h) 仍是**原图**尺寸（保持调用方契约不变），所以 arr 的空间比原图小 ——
+    调用方必须把模型输出的框按 arr.shape 与 (w,h) 的比例**缩回原图空间**，否则牌面裁剪和
+    前端框定位全会偏（下面两处取框点已这么做）。
+    """
     from concurrent.futures import ThreadPoolExecutor
     def load(p):
         try:
-            img = Image.open(p).convert("RGB")
+            img = Image.open(p)
+            ow, oh = img.size          # draft 之后 img.size 会变小，先把原尺寸记下来
+            if max_px:
+                try:
+                    img.draft("RGB", (max_px, max_px))   # JPEG 缩解码；非 JPEG 是 no-op
+                except Exception:
+                    pass
+            img = img.convert("RGB")
+            if max_px and max(img.size) > max_px:
+                r = float(max_px) / float(max(img.size))
+                img = img.resize(
+                    (max(1, int(round(img.width * r))), max(1, int(round(img.height * r)))),
+                    Image.BILINEAR,
+                )
             arr = np.asarray(img)
             if rgb:
                 arr = np.ascontiguousarray(arr)
             else:
                 arr = np.ascontiguousarray(arr[:, :, ::-1])  # RGB -> BGR
-            return (arr, img.width, img.height)
+            return (arr, ow, oh)
         except Exception:
             return None
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         return list(ex.map(load, paths))
-def _preload_bgr(paths, workers=8):
-    return _preload_images(paths, rgb=False, workers=workers)
-def _preload_rgb(paths, workers=8):
-    return _preload_images(paths, rgb=True, workers=workers)
+def _detect_load_px():
+    """检测读图的最长边上限（0=原图）。缩图能把 ultralytics 的 letterbox 成本降一个量级，
+    且 GPU 功率实测只有 37W/285W —— 时间花在 CPU 预处理上，不在算力。"""
+    return _env_int("AD_DETECT_LOAD_PX", 0, lo=0, hi=4096)
+def _preload_bgr(paths, workers=8, max_px=0):
+    return _preload_images(paths, rgb=False, workers=workers, max_px=max_px)
+def _preload_rgb(paths, workers=8, max_px=0):
+    return _preload_images(paths, rgb=True, workers=workers, max_px=max_px)
 @app.post("/api/yolo_detect_batch")
 def yolo_detect_batch(
     project: str = Form("default"),
@@ -4342,6 +4435,7 @@ def _yolo_detect_batch_locked(
         except Exception:
             pass
     out = {}
+    _t_stage0 = time.time()   # 分环节计时：提速前先量，别凭猜（2026-09-30 检测慢排查）
     with _detections_lock:
         # 必须自己分块：ultralytics 收到"内存数组列表"时会忽略 batch 参数，
         # 把整份列表堆成单个张量再上 GPU（2034 张 640x640 ≈ 10G，fp16 转换峰值 ≈ 18.6G），
@@ -4349,7 +4443,8 @@ def _yolo_detect_batch_locked(
         for _s in range(0, len(paths), bs):
             _cp = paths[_s:_s + bs]
             _ci = idxs[_s:_s + bs]
-            _items = _preload_bgr(_cp, workers=min(8, max(1, len(_cp))))
+            _items = _preload_bgr(_cp, workers=min(8, max(1, len(_cp))),
+                                  max_px=_detect_load_px())
             _keep = [k for k in range(len(_ci)) if _items[k] is not None]
             if not _keep:
                 continue
@@ -4373,10 +4468,20 @@ def _yolo_detect_batch_locked(
                     if r is None or r.boxes is None:
                         continue
                     w, h = _sizes.get(_idx, (1920, 1080))
+                    # ⚠️ 加载时若缩过图（AD_DETECT_LOAD_PX），模型框在"小图空间"里，
+                    #    必须按 arr/原图 比例缩回去 —— 否则牌面裁剪与前端框定位全偏。
+                    _it0 = _items[_k]
+                    _aw = _it0[0].shape[1] if _it0 is not None else w
+                    _ah = _it0[0].shape[0] if _it0 is not None else h
+                    _sx = (float(w) / _aw) if _aw else 1.0
+                    _sy = (float(h) / _ah) if _ah else 1.0
                     cls_indices = r.boxes.cls.cpu().numpy().astype(int).tolist()
                     _sc = r.boxes.conf.cpu().numpy().tolist()
                     _lb = [r.names[c] for c in cls_indices]
                     _bx = r.boxes.xyxy.cpu().numpy().tolist()
+                    if _sx != 1.0 or _sy != 1.0:
+                        _bx = [[float(b[0]) * _sx, float(b[1]) * _sy,
+                                float(b[2]) * _sx, float(b[3]) * _sy] for b in _bx]
                     _K = _yolo_keep(_lb, _sc)      # ⚠️ 批量路径也必须过滤（pipeline 走的就是这条）
                     res = {
                         "image_id": _idx,
@@ -4394,6 +4499,7 @@ def _yolo_detect_batch_locked(
                     continue
             del _arr, _items      # 及时释放这一块的 BGR 数组（每张 1080p 约 6MB）
         _persist_detections()  # 全部块跑完一次落盘，避免逐张反复写文件
+    _t_yolo = time.time() - _t_stage0
     # 用户 2026-09-22：检测阶段顺带跑一趟 YOLO-World（开放词表：目标物 + 设施）。
     # 用户 2026-09-23：闭集标志模型也接进检测阶段（"牌子这一路换成它"），并**合并成一次跑**：
     #   两路共用一次读盘/解码（原先是各读一遍，实测 0.46 秒/帧里约 0.15~0.2 秒是重复 IO）。
@@ -4402,6 +4508,17 @@ def _yolo_detect_batch_locked(
         _yw_sign_batch_fill(project, list(out.keys()))
     except Exception as _e:
         _log("[检测] 开放词表+闭集标志 批量失败(不影响 YOLO): %s" % str(_e)[:140])
+    _t_sig = time.time() - _t_stage0 - _t_yolo
+    # 2026-09-29 用户拍板接入：检测阶段顺带跑牌面细分类+数字识别（加性字段 fine，
+    # 不动上面的语义路由；必须在 sign fill 之后对同一批 ids 调，见 _fine_digit_fill 幂等说明）
+    try:
+        _fine_digit_fill(project, list(out.keys()))
+    except Exception as _e:
+        _log("[检测] 细分类+数字识别 批量失败(不影响检测): %s" % str(_e)[:140])
+    _t_fine = time.time() - _t_stage0 - _t_yolo - _t_sig
+    if out:
+        _log("[检测计时] %d 帧：YOLO %.1fs | 词表+闭集 %.1fs | 细分类+数字 %.1fs | 合计 %.1fs"
+             % (len(out), _t_yolo, _t_sig, _t_fine, _t_yolo + _t_sig + _t_fine))
     return {"code": 200, "results": out, "count": len(out)}
 @app.post("/api/dino_detect_batch")
 def dino_detect_batch(
@@ -4637,6 +4754,7 @@ _SIGN_MAP = {"speed_limit": "限速", "prohibition": "禁令标志", "warning": 
 # 单帧偶发误检会把广告牌（实测 KFC 风格店招能到 0.75）写成整段的语义。
 # 实测：阈值 0.15→0.30 且要求 ≥2 帧后，每段平均语义值 3.9 → **2.5**；禁令标志 90% → 73% 段。
 _SIGN_SEM_CONF = float(os.environ.get("AD_SIGN_SEM_CONF", "0.30"))
+_FINE_SEM_CONF = float(os.environ.get("AD_FINE_SEM_CONF", "0.45"))   # 细标签进段级 9 维的置信门槛（与检测 fill 一致）
 _SIGN_SEM_MIN_FRAMES = _env_int("AD_SIGN_SEM_MIN_FRAMES", 2, lo=1, hi=20)
 # **替换口径**：这几个 YW 类别从此由闭集模型接管 —— 合并时把 YW 的对应框丢掉（用户明确"不要并存"）。
 # 灯类**不在**此列：红绿灯继续由 YOLO(COCO)/YW 负责（闭集模型的 signal 类只有越南 900 个框，弱）。
@@ -4681,6 +4799,194 @@ def _free_sign():
         except Exception:
             pass
     _log("[GPU] 闭集交通标志模型已卸载释放显存")
+
+
+# ===== 牌面细分类 + 数字识别（2026-09-29 用户拍板接入）=====
+# 细分类：58 类语义（禁停/让行/环岛…）定牌型；数字头：11 类数值（限速5~80/限高4.5/限重5）读数值。
+# 两者都是 yolov8s-cls 小模型（各 ~10MB），只在 sign 框的 crop 上推理，失败不影响检测记录。
+_FINE_WEIGHTS = os.environ.get("AD_FINE_MODEL", "/opt/datasets/cls_runs/tsr_fine_cls/weights/best.pt")
+_DIGIT_WEIGHTS = os.environ.get("AD_DIGIT_MODEL", "/opt/datasets/cls_runs/digit_cls/weights/best.pt")
+_FINE_CONF = float(os.environ.get("AD_FINE_CONF", "0.45"))
+_DIGIT_CONF = float(os.environ.get("AD_DIGIT_CONF", "0.45"))
+_FINE_MARGIN = 0.08   # 框外扩比例，牌面裁剪留点边
+fine_model = None
+digit_model = None
+FINE_CN = {"animal": "注意动物", "bicycle_crossing": "非机动车横穿", "chevron_left": "急弯箭头(左)",
+           "chevron_right": "急弯箭头(右)", "children": "注意儿童", "comp_generic": "组合牌",
+           "curve_left": "向左急弯", "curve_right": "向右急弯", "dead_end": "断头路",
+           "delineator": "导流标", "distance_plate": "距离牌", "go_left": "直行或左转",
+           "go_right": "直行或右转", "go_straight": "直行", "height_limit": "限高",
+           "hospital": "医院", "information": "信息牌", "keep_left": "靠左行驶",
+           "keep_right": "靠右行驶", "motorway": "高速公路", "narrow_road": "窄路",
+           "no_bicycle": "禁非机动车", "no_entry": "禁止驶入", "no_left_turn": "禁左转",
+           "no_motorcycle": "禁摩托车", "no_overtaking": "禁止超车", "no_parking": "禁止停车",
+           "no_pedestrian": "禁行人", "no_right_turn": "禁右转", "no_stopping": "禁止临停",
+           "no_truck": "禁货车", "no_turn_on_red": "红灯禁转", "no_u_turn": "禁掉头",
+           "no_vehicle": "禁机动车", "one_way": "单行道", "other_danger": "其他警告",
+           "other_regulatory": "其他禁令", "other_warning": "其他警告类", "parking": "停车场",
+           "pass_either": "两侧通行", "ped_crossing": "人行横道", "priority_road": "优先道路",
+           "road_bump": "减速带", "road_closed": "道路封闭", "roadworks": "道路施工",
+           "roundabout": "环岛", "school_zone": "学校区域", "slippery": "易滑",
+           "speed_limit_1": "限速", "speed_limit_2": "限速", "speed_limit_3": "限速",
+           "stop": "停车让行", "tow_away": "禁拖车", "traffic_signals": "注意信号灯",
+           "turn_left": "左转", "turn_right": "右转", "weight_limit": "限重", "yield": "减速让行"}
+# 数值牌：细分类只定"这是限速/限高/限重"，具体数值由数字头读；数字头没读出来时回退这个泛称
+_NUMERIC_FINE = {"speed_limit_1": "限速", "speed_limit_2": "限速", "speed_limit_3": "限速",
+                 "height_limit": "限高", "weight_limit": "限重"}
+def _ensure_fine():
+    """按需加载细分类+数字头。**必须走 make_room_for**（与 _ensure_sign 同理，别绕过显存仲裁）。"""
+    global fine_model, digit_model
+    if fine_model is not None and digit_model is not None:
+        return True
+    if not os.path.exists(_FINE_WEIGHTS) or not os.path.exists(_DIGIT_WEIGHTS):
+        _log("[检测] 细分类/数字头权重缺失: %s / %s（AD_FINE_MODEL/AD_DIGIT_MODEL 可指定）"
+             % (_FINE_WEIGHTS, _DIGIT_WEIGHTS))
+        return False
+    try:
+        make_room_for("fine", 0.5)
+    except Exception:
+        pass
+    try:
+        from ultralytics import YOLO as _YOLO_C
+        fine_model = _YOLO_C(_FINE_WEIGHTS)
+        digit_model = _YOLO_C(_DIGIT_WEIGHTS)
+        _log("[检测] 牌面细分类(%d类)+数字头已加载 conf>=%.2f/%.2f" % (len(FINE_CN), _FINE_CONF, _DIGIT_CONF))
+        return True
+    except Exception as e:
+        fine_model = digit_model = None
+        _log("[检测] 细分类/数字头加载失败(不影响检测): %s" % str(e)[:150])
+        return False
+def _free_fine():
+    global fine_model, digit_model
+    if fine_model is None and digit_model is None:
+        return
+    fine_model = digit_model = None
+    if DEVICE == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    _log("[GPU] 细分类/数字头已卸载释放显存")
+def _fine_digit_fill(project, ids):
+    """对记录里已有的 `src=="sign"` 框跑细分类+数字头，写进 rec["fine"]（**加性字段**）。
+
+    rec["fine"] = [{"box":[x1,y1,x2,y2], "label":"限速60", "conf":0.91}, ...] —— 前端按坐标
+    匹配 sign 框后缀显示；不动 labels/src，不进语义路由（_sign_cn_of_frames 不读它）。
+    红绿灯框跳过（它的标签本就具体，细分类只会添乱）。
+    幂等：每次对传入 ids 全量重算 rec["fine"] —— sign 框重跑会被摘掉重加，旧 fine 会成孤儿，
+    所以**必须在 _yw_sign_batch_fill 之后对同一批 ids 调用**（检测链已这么挂）。
+    """
+    global fine_model, digit_model
+    if not ids or os.environ.get("AD_FINE_ON", "1") == "0":
+        return 0
+    sub = detections_cache.setdefault(project or "default", {})
+    todo = []
+    for _i in ids:
+        try:
+            _i = int(_i)
+        except Exception:
+            continue
+        rec = sub.get(str(_i)) or {}
+        sb = [b for l, s, b in zip(rec.get("labels") or [], rec.get("src") or [],
+                                   rec.get("boxes") or [])
+              if str(s) == "sign" and str(l) != "红绿灯"]
+        if sb:
+            todo.append((_i, rec, sb))
+    if not todo:
+        return 0
+    if not _ensure_fine():
+        return 0
+    n = 0
+    for _i, rec, sb in todo:
+        try:
+            _p = (load_project_context(project).get("metadata") or [])[int(_i)]["path"]
+        except Exception:
+            continue
+        if not _p or not os.path.exists(_p):
+            continue
+        img = cv2.imread(_p)
+        if img is None:
+            continue
+        H, W = img.shape[:2]
+        crops, meta = [], []
+        for b in sb:
+            x1, y1, x2, y2 = [float(v) for v in b]
+            mw, mh = (x2 - x1) * _FINE_MARGIN, (y2 - y1) * _FINE_MARGIN
+            cx1, cy1 = max(0, int(x1 - mw)), max(0, int(y1 - mh))
+            cx2, cy2 = min(W, int(x2 + mw)), min(H, int(y2 + mh))
+            if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+                continue
+            cr = img[cy1:cy2, cx1:cx2]
+            crops.append(cr); meta.append((b, cr))
+        if not crops:
+            continue
+        try:
+            fr = fine_model.predict(source=crops, imgsz=224, verbose=False)
+        except Exception as e:
+            _log("[检测] 细分类批量失败(%s): %s" % (_i, str(e)[:100])); continue
+        out, d_crops, d_meta = [], [], []
+        for (b, cr), r in zip(meta, fr):
+            try:
+                cf = float(r.probs.top1conf); key = str(r.names[int(r.probs.top1)]).lower().strip()
+            except Exception:
+                continue
+            if cf < _FINE_CONF:
+                continue
+            gen = _NUMERIC_FINE.get(key)
+            if gen:
+                d_crops.append(cr); d_meta.append((b, gen))
+            else:
+                out.append({"box": [round(v, 1) for v in b],
+                            "label": FINE_CN.get(key, key), "conf": round(cf, 2)})
+        if d_crops:
+            try:
+                dr = digit_model.predict(source=d_crops, imgsz=128, verbose=False)
+                for (b, gen), r in zip(d_meta, dr):
+                    try:
+                        dcf = float(r.probs.top1conf); dlab = str(r.names[int(r.probs.top1)])
+                    except Exception:
+                        continue
+                    if dcf >= _DIGIT_CONF:
+                        out.append({"box": [round(v, 1) for v in b], "label": dlab, "conf": round(dcf, 2)})
+            except Exception as e:
+                _log("[检测] 数字头失败(%s): %s" % (_i, str(e)[:100]))
+        rec["fine"] = out
+        sub[str(_i)] = rec
+        n += 1
+    _persist_detections()
+    if n:
+        _log("[检测] 牌面细分类+数字识别完成 %d/%d 帧" % (n, len(todo)))
+    return n
+
+
+def _signal_recheck(src_img, bxx):
+    """红绿灯(signal)框复核：把框 crop 喂回 sign 模型，若检出 guide≥0.7 → 是"注意信号灯"
+    三角警示牌上的**图案**而非灯（实测欧洲/mapillary 166 个 sign 灯框：高置信警示牌误检
+    0.71~0.90 的 crop 上 guide 0.78~0.90 全命中，真灯头 0 命中，tools/_verify_light_sign.py）。
+    用户 2026-09-29 报"红绿灯误检多"后引入；AD_SIGNAL_RECHECK=0 可关。
+    注意：低置信段（<0.45）大多是真灯，**不要**对 signal 提检测阈值 —— 提阈值砍的是真灯。
+    src_img 传帧图 numpy 数组或帧路径（批量链有数组传数组，单帧链只有路径）。
+    """
+    if os.environ.get("AD_SIGNAL_RECHECK", "1") == "0":
+        return True
+    try:
+        arr = src_img if isinstance(src_img, np.ndarray) else cv2.imread(src_img)
+        if arr is None:
+            return True
+        H, W = arr.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bxx]
+        m = max(10, int((x2 - x1) * 0.6))
+        crop = arr[max(0, y1 - m):min(H, y2 + m), max(0, x1 - m):min(W, x2 + m)]
+        if crop.size == 0:
+            return True
+        r = sign_model.predict(source=crop, imgsz=640, conf=0.5, verbose=False)[0]
+        for bb in r.boxes:
+            nm = str(r.names[int(bb.cls[0])]).lower().strip()
+            if nm == "guide" and float(bb.conf[0]) >= 0.7:
+                return False
+    except Exception:
+        pass
+    return True
 
 
 def _sign_batch_fill(project, ids):
@@ -4733,6 +5039,8 @@ def _sign_batch_fill(project, ids):
             bx = [float(x) for x in b.xyxy[0].tolist()]
             if cn == "红绿灯" and any(_iou(bx, hb) >= 0.5 for hb in _lights):
                 continue
+            if cn == "红绿灯" and not _signal_recheck(_p, bx):
+                continue
             _lb.append(cn); _sc.append(cf); _bx.append(bx); _sr.append("sign")
         rec.update({"image_id": _i, "engine": ("yolo+yoloworld+sign" if _yw_on() else "yolo+sign"),
                     "width": int(r.orig_shape[1]), "height": int(r.orig_shape[0]),
@@ -4782,12 +5090,21 @@ def _yw_sign_batch_fill(project, ids):
     n_yw = n_sg = replaced = 0
     for _s in range(0, len(sel), _bs):
         part = sel[_s:_s + _bs]
-        _items = _preload_bgr([p for _i, p in part], workers=min(8, max(1, len(part))))
+        _items = _preload_bgr([p for _i, p in part], workers=min(8, max(1, len(part))),
+                              max_px=_detect_load_px())
         keep = [(i, it) for (i, _p), it in zip(part, _items) if it is not None]
         if not keep:
             continue
         _arr = [it[0] for _i, it in keep]
         _idxs = [i for i, _it in keep]
+        # 缩图时模型框在小图空间：每帧记回缩比例。
+        # ⚠️ IoU 去重要跟 YOLO 那些**已缩回原图空间**的框比，所以取到框就立刻乘回来；
+        #    只有 _signal_recheck 例外 —— 它拿 _arr 裁图，必须喂小图空间的框。
+        _sc_map = {}
+        for _i, _it in keep:
+            _a = _it[0]
+            _sc_map[_i] = ((float(_it[1]) / _a.shape[1]) if _a.shape[1] else 1.0,
+                           (float(_it[2]) / _a.shape[0]) if _a.shape[0] else 1.0)
         _ry = _rs = None
         if _yw_ok:
             try:
@@ -4831,6 +5148,9 @@ def _yw_sign_batch_fill(project, ids):
                         replaced += 1
                         continue
                     bxx = [float(x) for x in b.xyxy[0].tolist()]
+                    _sxf, _syf = _sc_map.get(_i, (1.0, 1.0))   # 小图空间 -> 原图空间
+                    if _sxf != 1.0 or _syf != 1.0:
+                        bxx = [bxx[0] * _sxf, bxx[1] * _syf, bxx[2] * _sxf, bxx[3] * _syf]
                     _dup = False
                     for _kk, (_cn2, _nm2, _cf2, _bx2) in enumerate(_yw):
                         if _cn2 == cn and _iou(bxx, _bx2) >= 0.5:
@@ -4860,8 +5180,13 @@ def _yw_sign_batch_fill(project, ids):
                     cn = _SIGN_MAP.get(nm)
                     if not cn or cf < _SIGN_CONF:
                         continue
-                    bxx = [float(x) for x in b.xyxy[0].tolist()]
+                    bxx_a = [float(x) for x in b.xyxy[0].tolist()]   # 小图空间（喂 recheck 裁图）
+                    _sxf, _syf = _sc_map.get(_i, (1.0, 1.0))
+                    bxx = ([bxx_a[0] * _sxf, bxx_a[1] * _syf, bxx_a[2] * _sxf, bxx_a[3] * _syf]
+                           if (_sxf != 1.0 or _syf != 1.0) else bxx_a)   # 原图空间（入库/IoU）
                     if cn == "红绿灯" and any(_iou(bxx, hb) >= 0.5 for hb in _lights):
+                        continue
+                    if cn == "红绿灯" and not _signal_recheck(_arr[_k], bxx_a):
                         continue
                     _lb.append(cn); _sc.append(cf); _bx.append(bxx); _sr.append("sign")
                 n_sg += 1
@@ -4889,6 +5214,7 @@ def _sign_cn_of_frames(project, fids):
     """
     sub = detections_cache.get(project or "default") or {}
     cnt = {}
+    fine_cnt = {}      # (大类, 细标签) -> 帧数。2026-09-29 用户要求：细分类语义（限速50/禁止停车…）进 9 维
     for _i in (fids or []):
         try:
             rec = sub.get(str(int(_i))) or {}
@@ -4897,8 +5223,18 @@ def _sign_cn_of_frames(project, fids):
         _lb = list(rec.get("labels") or [])
         _sc = list(rec.get("scores") or [])
         _sr = list(rec.get("src") or (["yolo"] * len(_lb)))
+        _bx = list(rec.get("boxes") or [])
+        # fine 的框坐标 → 细标签（fill 时坐标与本记录同源，round(,1) 后可精确匹配）
+        fmap = {}
+        for e in (rec.get("fine") or []):
+            try:
+                b2 = tuple(round(float(x), 1) for x in (e.get("box") or []))
+                fmap[b2] = (str(e.get("label") or ""), float(e.get("conf") or 0))
+            except Exception:
+                continue
         seen = set()                       # 同一帧内同类只算一次（多框不重复计数）
-        for l, c, s in zip(_lb, _sc, _sr):
+        seen_fine = set()
+        for l, c, s, bx in zip(_lb, _sc, _sr, _bx):
             if s != "sign":
                 continue
             try:
@@ -4907,9 +5243,23 @@ def _sign_cn_of_frames(project, fids):
             except Exception:
                 continue
             seen.add(str(l))
+            fl, fc = fmap.get(tuple(round(float(x), 1) for x in (bx or [])), ("", 0.0))
+            if fl and fc >= _FINE_SEM_CONF and fl != str(l):
+                # 细标签挂在其 sign 框的大类下（限速50←限速、禁止停车←禁令标志…），替换输出在返回处统一做
+                seen_fine.add((str(l), fl))
         for _v in seen:
             cnt[_v] = cnt.get(_v, 0) + 1
-    return {v for v, n in cnt.items() if n >= _SIGN_SEM_MIN_FRAMES}
+        for pair in seen_fine:
+            fine_cnt[pair] = fine_cnt.get(pair, 0) + 1
+    out = set()
+    for v, n in cnt.items():
+        if n < _SIGN_SEM_MIN_FRAMES:
+            continue
+        subs = {fv for (big, fv), fn in fine_cnt.items()
+                if big == v and fn >= _SIGN_SEM_MIN_FRAMES}
+        # 认得出就填具体值（2026-09-21 口径 + 2026-09-29 用户"限速50这样"）：有细标签替换大类，否则保留大类
+        out.update(subs if subs else {v})
+    return out
 # 检测阶段跑一趟 YOLO-World（由 _patch_yw_detect_stage.py 插入）
 # 用户 2026-09-22：「后者吧」= 把 YOLO-World 挪到**检测阶段**，与 YOLO 同批对全部帧跑一遍、结果落盘，
 # 判定阶段只读不算。
@@ -6530,7 +6880,7 @@ def review_queue(project: str = Query("default"), page: int = 1, size: int = 20)
         proj = _ensure_db_project(db, project)
         if proj is None:
             return {"code": 500, "msg": "数据库未就绪", "items": [], "total": 0}
-        from sqlalchemy import func as _func
+        from sqlalchemy import func as _func, cast as _cast, String as _String
         _cond = ((Asset.status == AssetStatus.REVIEW)
                  | (Asset.decision_status == DecisionStatus.REVIEW))
         # ⚠️ 计数必须用 func.count()：Query.count() 会把**全列**包成子查询再 count，
@@ -7075,10 +7425,14 @@ def _ai_batch_worker(
                     _update_job_progress(job_pk, _done, total,
                                          f"YOLO 检测 {_done}/{len(detect_todo)}（本批 {len(_part)} 帧）")
                     # 复用现有批量检测核心(同进程直接调用端点函数, 返回 {code,results,count})
+                    # 批大小原来写死 16：500 帧被切成 31 个小块，每块一次内核启动 + 一次显存搬运，
+                    # GPU 大量时间耗在启动开销上（nvidia-smi 显示 21% 占用是采样假象，别据此判"喂太慢"）。
+                    # 实测（2026-09-30）加载 16 张只要 0.13s，而每块耗时 1.87s —— 瓶颈在推理而非 IO，
+                    # 加大 batch 摊薄每帧的固定开销。AD_YOLO_BATCH 可调，默认仍 16。
                     resp = yolo_detect_batch(
                         project=project,
                         image_ids=",".join(str(x) for x in _part),
-                        batch_size=16,
+                        batch_size=_env_int("AD_YOLO_BATCH", 16, lo=8, hi=256),
                         fp16="1",
                     )
                     # 关键：检测阶段失败必须中止任务。否则 0 命中会被后面的"无检测目标"逻辑
@@ -7988,7 +8342,7 @@ def analytics_overview(project: str = Query("default"), light: int = 0):
             )
         # 口径分桶：以前 only 有 approved_count，前端把"人工审过的帧"也算进了「AI自动通过」，
         # 而「已人工通过」只统计 Clip -> 人工审帧后那个数字永远不动，看着像没生效。
-        from sqlalchemy import func as _func
+        from sqlalchemy import func as _func, cast as _cast, String as _String
         # 同上：Query.count() 的包装会让覆盖索引失效（0.24s → 0.04s）
         base["pending_count"] = db.query(_func.count()).select_from(Asset).filter(
             Asset.project_id == proj.id,
@@ -8000,7 +8354,7 @@ def analytics_overview(project: str = Query("default"), light: int = 0):
             .filter(
                 Asset.project_id == proj.id,
                 Asset.status == AssetStatus.APPROVED,
-                Asset.final_result.like("%human%"),
+                _cast(Asset.final_result, _String).like("%human%"),
             )
             .count()
         )
@@ -8061,7 +8415,7 @@ def coverage_analyze(project: str = Form("default"), requirement: str = Form(Non
 
     {"weather":["雨天"],"road":["城市道路"],"time":["夜晚"],"events":["行人横穿"],"target":10000}"""
     import json as _json
-    from db_service import get_project, search_assets_by_tags
+    from db_service import get_project
     from models import AssetStatus
     db = get_db_session()
     try:
@@ -8079,10 +8433,9 @@ def coverage_analyze(project: str = Form("default"), requirement: str = Form(Non
         if not req:
             return {"code": 400, "msg": "requirement 不能为空"}
         target = int(req.pop("target", 10000) or 10000)
-        # 用 final_tags 优先匹配，回退 ai_tags（search_assets_by_tags 双查）
-        _, current = search_assets_by_tags(
-            db, proj.id, req, status=AssetStatus.APPROVED, page=1, size=100000
-        )
+        # 只要条数：旧写法 size=100000 会把 10 万个 ORM 对象载入内存，然后只取 len（实测 3.0s / 数 GB）
+        from db_service import count_assets_by_tags
+        current = count_assets_by_tags(db, proj.id, req, status=AssetStatus.APPROVED)
         pct = current / max(1, target) * 100
         return {
             "code": 200,
@@ -9164,15 +9517,14 @@ def search_fusion(
             sem_note = "语义检索本轮降级（显存被其它 AI 任务占用），结果仅按标签匹配"
     # ---- 2) Tag / 结构化过滤（DB 侧，final/ai 双匹配）----
     tag_hits = set()
-    from db_service import search_assets_by_tags, get_project
+    from db_service import search_tag_hits, get_project
     db = get_db_session()
     try:
         proj = _ensure_db_project(db, project)
         if proj is not None and tag_conditions:
-            assets, _ = search_assets_by_tags(
-                db, proj.id, tag_conditions, page=1, size=100000
-            )
-            tag_hits = {a.vector_id for a in assets}
+            # 只要 vector_id：旧写法 size=100000 会真的载入 10 万个 ORM 对象（实测 3.0s / 数 GB）
+            hits = search_tag_hits(db, proj.id, tag_conditions, columns=("vector_id",), limit=100000)
+            tag_hits = {v for (v,) in hits}
     finally:
         db.close()
     # ---- 2.2) 段级判定结果（Clip）按标签筛选 ----
@@ -9215,12 +9567,13 @@ def search_fusion(
         try:
             projp = _ensure_db_project(dbp, project)
             if projp is not None:
-                assets_p, _ = search_assets_by_tags(
-                    dbp, projp.id,
-                    {d: tag_conditions[d] for d in prio_dims},
-                    page=1, size=100000,
-                )
-                prio_hits = {a.vector_id for a in assets_p}
+                prio_hits = {
+                    v for (v,) in search_tag_hits(
+                        dbp, projp.id,
+                        {d: tag_conditions[d] for d in prio_dims},
+                        columns=("vector_id",), limit=100000,
+                    )
+                }
         except Exception as e:
             _log(f"[搜索] 事件/场景加权集合计算失败: {e}")
         finally:
@@ -9570,7 +9923,7 @@ def assets_table(
 ):
     """数据管理明细表：DB Asset 行（帧ID/血缘/标签三层状态/决策），支持状态与天气过滤。
     group=video 时按「原始视频路径」聚合：一个视频一行，标签去重合并（抽出的多帧合并体现）。"""
-    from models import Asset, AssetStatus
+    from models import Asset, AssetStatus, Source
     db = get_db_session()
     try:
         proj = _ensure_db_project(db, project)
@@ -9594,8 +9947,20 @@ def assets_table(
                 _gout = _ghit[1]
                 return {"code": 200, "total": len(_gout), "page": page, "size": size,
                         "rows": _gout[(page - 1) * size: page * size], "cached": True}
-            from sqlalchemy.orm import joinedload
-            assets = (q.options(joinedload(Asset.source))
+            from sqlalchemy.orm import joinedload, load_only
+            # 聚合只读下面这些字段，但旧写法把整行 ORM（25 列，含 detections/final_result 两坨 JSON，
+            # 每列都要 json.loads）都拉出来 —— 实测 7.65 万帧 4290ms，只取需要的列 731ms（5.9x）。
+            # 用 load_only 而不是换成 query(*cols)：下面的聚合代码一行都不用改。
+            # ⚠️ 漏列不会报错，只会退化成"每行一次懒加载"——改完必须跑 tools/_capture_api.py 比对，
+            #    并看 SQL 条数没有暴涨。
+            assets = (q.options(
+                        load_only(Asset.vector_id, Asset.asset_id, Asset.image_path,
+                                  Asset.frame_index, Asset.timestamp, Asset.width, Asset.height,
+                                  Asset.final_tags, Asset.ai_tags, Asset.human_tags,
+                                  Asset.asset_metadata, Asset.status, Asset.decision_status,
+                                  Asset.decision_score),
+                        joinedload(Asset.source).load_only(Source.file_name, Source.directory_chain),
+                      )
                       .order_by(Asset.vector_id.asc()).all())   # 聚合需要全量，先不分页
             total = len(assets)
         else:
@@ -10156,6 +10521,7 @@ def _project_has_yolo(project: str) -> bool:
     只取一行、走 project_id 索引，毫秒级。DB 异常时返回 True（宁可判定也不要静默拦住）。"""
     try:
         from db_service import get_project, Asset
+        from sqlalchemy import cast as _cast, String as _String
         db = get_db_session()
         try:
             proj = get_project(db, project)
@@ -10164,7 +10530,7 @@ def _project_has_yolo(project: str) -> bool:
             return db.query(Asset.id).filter(
                 Asset.project_id == proj.id,
                 Asset.detections.isnot(None),
-                Asset.detections.like('%"yolo"%'),
+                _cast(Asset.detections, _String).like('%"yolo"%'),
             ).first() is not None
         finally:
             db.close()
@@ -10200,7 +10566,8 @@ _YWL_MAP = {
     "crosswalk": "斑马线", "zebra crossing": "斑马线",
 }
 _YWL_CLASSES = list(_YWL_MAP.keys())
-_YWL_CONF = 0.30            # 与落盘口径一致（P1b 的 THR2 也是 0.30）
+_YWL_CONF = 0.45            # 2026-09-28 用户拍板（选项B）：0.30 → 0.45 —— YW 开放词表误检多（锥桶/路灯），
+                            # 抬阈值保精确率；想调回改这一个值即可
 def _yoloworld_of_segment(frame_paths):
     """段内采样帧跑一趟 YOLO-World，返回**本体词表里的中文标签**集合（目标物 + 设施）。
 
@@ -11103,6 +11470,65 @@ def clip_label_stats(project: str = Query("default")):
     return {"code": 200, "total": len(labeled), "aggregate": agg, "disagreements": dis[:80],
             "labeled_ids": list(labeled.keys())[:2000],
             "prf": prf, "events": ev_out}
+
+@app.get("/api/clips/label_trace")
+def clips_label_trace(project: str = Query("default"), clip_id: str = Query(...), dim: str = Query(...), value: str = Query(...)):
+    """9 维标签溯源（2026-09-29 用户要求）：返回段内触发指定标签值的帧与框。
+
+    有逐帧证据的维度：traffic_sign（sign 框 conf≥0.30 + fine 细标签）、objects（YOLO/YW 框按
+    中文名反查）、events（判定证据帧，无框）。其余维度是整段判定 → hits 为空，前端提示。
+    """
+    ctx = load_project_context(project)
+    clip = next((c for c in (load_clips(ctx) or []) if c.get("clip_id") == clip_id), None)
+    if not clip:
+        return {"code": 404, "msg": "段不存在"}
+    sub = detections_cache.get(project or "default") or {}
+    want = str(value).strip()
+    hits = []
+    for fid in (clip.get("frame_ids") or []):
+        try:
+            rec = sub.get(str(int(fid))) or {}
+        except Exception:
+            continue
+        boxes, confs = [], []
+        if dim == "traffic_sign":
+            for l, c, s, b in zip(rec.get("labels") or [], rec.get("scores") or [],
+                                  rec.get("src") or [], rec.get("boxes") or []):
+                if str(s) == "sign" and str(l) == want and float(c) >= _SIGN_SEM_CONF:
+                    boxes.append([float(v) for v in b]); confs.append(round(float(c), 2))
+            for e in (rec.get("fine") or []):
+                if str(e.get("label")) == want and float(e.get("conf") or 0) >= _FINE_SEM_CONF:
+                    boxes.append([float(v) for v in (e.get("box") or [])])
+                    confs.append(round(float(e.get("conf") or 0), 2))
+        elif dim == "objects":
+            for l, c, s, b in zip(rec.get("labels") or [], rec.get("scores") or [],
+                                  rec.get("src") or [], rec.get("boxes") or []):
+                nm = str(l).lower().strip()
+                cn = _YOLO_LABEL2OBJ.get(nm) or _YWL_MAP.get(nm)
+                if cn == want:
+                    boxes.append([float(v) for v in b]); confs.append(round(float(c), 2))
+        if boxes:
+            hits.append({"frame_id": int(fid), "boxes": boxes, "confs": confs,
+                         "w": rec.get("width") or 1920, "h": rec.get("height") or 1080,
+                         "url": "/api/image/%s/%d" % (project, int(fid))})
+    # 事件维度：判定结果里的证据帧（vlm_result.events[].frames / frame_ids，无框）
+    if dim == "events" and not hits:
+        evs = ((clip.get("vlm_result") or {}).get("events")) or []
+        ev_frames = []
+        for ev in evs:
+            if str(ev.get("tag") or ev.get("label") or ev.get("name") or "") != want:
+                continue
+            for f in (ev.get("frames") or ev.get("frame_ids") or []):
+                try:
+                    ev_frames.append(int(f))
+                except Exception:
+                    pass
+        for fid in sorted(set(ev_frames)):
+            hits.append({"frame_id": int(fid), "boxes": [], "confs": [],
+                         "url": "/api/image/%s/%d" % (project, int(fid))})
+    return {"code": 200, "clip_id": clip_id, "dim": dim, "value": want,
+            "hits": hits, "total_frames": len(clip.get("frame_ids") or [])}
+
 
 @app.get("/api/clips/judge_progress")
 def clips_judge_progress(project: str = Query("default")):

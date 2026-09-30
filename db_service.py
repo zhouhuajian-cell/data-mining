@@ -878,6 +878,100 @@ def create_export_record(
 # 搜索与分析服务
 # ============================================================
 
+def _tag_like_pattern(tag: str) -> str:
+    """把标签变成 SQL 的 LIKE 模式：'%"标签"%'。
+
+    原理：JSON 里字符串一定被引号包住，所以带引号的模式只在**某个元素完整等于**该标签时命中。
+    实测对比（tools/_probe_json_extract2.py）：
+      '%晴天%'   会误命中 {"tag":"晴天转阴"}，以及 reason 里出现的"晴天"文字
+      '%"晴天"%' 只在元素确实是 晴天 时命中 —— 与 Python 侧 set 相等判定一致
+    注意转义：% _ 是 LIKE 通配符，调用处统一带 escape="\\"。
+    """
+    esc = tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return '%"{}"%'.format(esc)   # 别用 %-格式化：模式里的 %" 会被当格式符（踩过）
+
+
+def _tag_dim_text(col, dim: str):
+    """取某个维度整段 JSON 文本的 SQL 表达式（两种引擎各一套）。
+
+    ⚠️ 不能用 `$.{dim}[*].tag` —— 生产这台的 SQLite 3.31 的 JSON1 **不支持 [*] 通配**，
+    会直接抛 "JSON path error near '[*].tag'"（上一版没被采用的 SQL 侧实现就是栽在这）。
+    不带通配的 `$.{dim}` 取到该维整段 JSON，配 _tag_like_pattern 已足够做精确判定。
+    """
+    from sqlalchemy import func
+    from settings import db_type
+    if db_type() == "postgresql":
+        return func.jsonb_extract_path_text(col, dim)   # 已是文本
+    return func.json_extract(col, "$.%s" % dim)
+
+
+def _tag_conditions(tag_filters: Dict[str, List[str]]):
+    """构造"标签命中"的 SQL 条件：维度内 OR、维度间 AND，final_tags ∪ ai_tags。
+
+    与旧 Python 实现语义一致：某维度命中 = (final_tags[dim] 或 ai_tags[dim] 里存在**完整等于**
+    任一给定标签的元素)；多维度之间 AND。
+    返回 (conditions, 是否全部可下推)。标签含引号/反斜杠时 LIKE 表达不了，返回 False 由调用方
+    回退到 Python 侧（本体标签实测不会有，纯属兜底）。
+    """
+    from sqlalchemy import or_
+    conds = []
+    for dim, want_tags in (tag_filters or {}).items():
+        if not want_tags:
+            continue
+        if not isinstance(want_tags, (list, tuple, set)):
+            # 调用方偶尔会把 "target": 10000 这类非标签键混进来（旧实现遇到会直接 TypeError 崩掉）
+            continue
+        ors = []
+        for tag in want_tags:
+            if not isinstance(tag, str) or not tag.strip():
+                continue
+            if '"' in tag or "\\" in tag:
+                return [], False
+            pat = _tag_like_pattern(tag)
+            ors.append(_tag_dim_text(Asset.final_tags, dim).like(pat, escape="\\"))
+            ors.append(_tag_dim_text(Asset.ai_tags, dim).like(pat, escape="\\"))
+        if ors:
+            conds.append(or_(*ors))
+    return conds, True
+
+
+def _dim_names(tags_obj, dim) -> set:
+    """Python 侧取某维度标签名集合（回退路径用，与旧实现逐字一致）"""
+    vals = (tags_obj or {}).get(dim) or []
+    names = set()
+    for v in vals:
+        if isinstance(v, dict):
+            names.add(v.get("tag", ""))
+        elif isinstance(v, str):
+            names.add(v)
+    names.discard("")
+    return names
+
+
+def _python_tag_filter(db: Session, project_id: int, tag_filters: Dict[str, List[str]], status=None):
+    """兜底：只在标签含引号/反斜杠（LIKE 表达不了）时走。
+
+    只取 (vector_id, source_id, final_tags, ai_tags) 四列，而不是整个 ORM 对象 ——
+    旧实现 query(Asset).all() 在 7.6 万行项目上要 3.0 秒（实测 tools/_probe_hotspots.py）。
+    """
+    colq = db.query(Asset.vector_id, Asset.source_id, Asset.final_tags, Asset.ai_tags).filter(
+        Asset.project_id == project_id)
+    if status:
+        colq = colq.filter(Asset.status == status)
+    out = []
+    for vid, sid, ft, at in colq.all():
+        ok = True
+        for dim, want_tags in (tag_filters or {}).items():
+            if not want_tags:
+                continue
+            if not (_dim_names(ft, dim) | _dim_names(at, dim)).intersection(want_tags):
+                ok = False
+                break
+        if ok:
+            out.append((vid, sid))
+    return out
+
+
 def search_assets_by_tags(
     db: Session,
     project_id: int,
@@ -886,41 +980,67 @@ def search_assets_by_tags(
     page: int = 1,
     size: int = 50,
 ) -> Tuple[List[Asset], int]:
-    """按标签筛选 Asset（结构化搜索，Python 侧匹配 final_tags/ai_tags）
+    """按标签筛选 Asset（SQL 侧过滤：维度内 OR、维度间 AND，final_tags ∪ ai_tags，精确标签匹配）
     维度值支持 dict 溯源标签（{tag:...,confidence:...}）或纯字符串。"""
-    query = db.query(Asset).filter(Asset.project_id == project_id)
+    q = db.query(Asset).filter(Asset.project_id == project_id)
     if status:
-        query = query.filter(Asset.status == status)
-
-    def _dim_names(tags_obj, dim):
-        vals = (tags_obj or {}).get(dim) or []
-        names = set()
-        for v in vals:
-            if isinstance(v, dict):
-                names.add(v.get("tag", ""))
-            elif isinstance(v, str):
-                names.add(v)
-        names.discard("")
-        return names
-
-    all_assets = query.all()  # 数据量适中；超大规模需换 SQL JSON path 或倒排
-    filtered = []
-    for a in all_assets:
-        ok = True
-        for dim, want_tags in tag_filters.items():
-            if not want_tags:
-                continue
-            have = _dim_names(a.final_tags, dim) | _dim_names(a.ai_tags, dim)
-            if not have.intersection(want_tags):
-                ok = False
-                break
-        if ok:
-            filtered.append(a)
-
-    total = len(filtered)
+        q = q.filter(Asset.status == status)
+    conds, ok = _tag_conditions(tag_filters)
+    if not ok:
+        hits = _python_tag_filter(db, project_id, tag_filters, status)
+        total = len(hits)
+        start = (page - 1) * size
+        page_ids = [v for v, _s in hits[start:start + size]]
+        if not page_ids:
+            return [], total
+        return db.query(Asset).filter(Asset.vector_id.in_(page_ids)).all(), total
+    if conds:
+        q = q.filter(*conds)
+    total = q.count()
     start = (page - 1) * size
-    assets = filtered[start:start + size]
-    return assets, total
+    return q.order_by(Asset.id.asc()).offset(start).limit(size).all(), total
+
+
+def count_assets_by_tags(db: Session, project_id: int, tag_filters: Dict[str, List[str]],
+                         status: AssetStatus = None) -> int:
+    """只要命中条数（不白载入对象）。
+
+    旧调用方给 size=100000 只为拿 total，却真去载入 10 万个 ORM 对象 —— 实测 3.0 秒 / 数 GB。
+    """
+    from sqlalchemy import func
+    conds, ok = _tag_conditions(tag_filters)
+    if not ok:
+        return len(_python_tag_filter(db, project_id, tag_filters, status))
+    q = db.query(func.count()).select_from(Asset).filter(Asset.project_id == project_id)
+    if status:
+        q = q.filter(Asset.status == status)
+    if conds:
+        q = q.filter(*conds)
+    return int(q.scalar() or 0)
+
+
+def search_tag_hits(db: Session, project_id: int, tag_filters: Dict[str, List[str]],
+                    status: AssetStatus = None, columns=("vector_id",), limit: int = 100000):
+    """只取命中行的指定列（不构造 ORM 对象）—— 给"只要 id 集合"的调用方。
+
+    实测（tools/_probe_hotspots.py，7.6 万行）：全量 ORM 2964ms → 只取 vector_id 42ms。
+    """
+    conds, ok = _tag_conditions(tag_filters)
+    if not ok:
+        pairs = _python_tag_filter(db, project_id, tag_filters, status)
+        idx = {"vector_id": 0, "source_id": 1}
+        pos = [idx[c] for c in columns if c in idx]
+        return [tuple(p[i] for i in pos) for p in pairs[:limit]]
+    try:
+        cols = [getattr(Asset, c) for c in columns]
+    except AttributeError as e:
+        raise ValueError("search_tag_hits 不支持这些列: %s" % (e,))
+    q = db.query(*cols).filter(Asset.project_id == project_id)
+    if status:
+        q = q.filter(Asset.status == status)
+    if conds:
+        q = q.filter(*conds)
+    return q.order_by(Asset.id.asc()).limit(limit).all()
 
 
 def get_analytics_overview(db: Session, project_id: int) -> Dict[str, Any]:

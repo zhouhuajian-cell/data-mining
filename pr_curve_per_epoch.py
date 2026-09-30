@@ -2,13 +2,15 @@
 #         产出【逐类 × 每轮】的 P/R/mAP 表 —— Ultralytics 每轮只把总体 P/R 写进 results.csv，
 #         逐类 P/R 必须用每轮权重后置跑才能拿到（2026-09-24 用户明确要过，上一轮因没存权重拿不到）。
 # 怎么跑：AD_CLIP_PICK=8 AD_VLM_THUMB=448 AD_VLM_MAX_PX=768 /venv/bin/python -u tools/_pr_curve_per_epoch.py
-# 怎么判定成功：打印 "轮次 × 类" 矩阵（P/R/mAP50），并写 reports/pr_curve_<run>.html。
+# 怎么判定成功：打印 "轮次 × 类" 的 P/R 矩阵（无 HTML 产物，别去找文件）。
 # ⚠️ 训练刚结束时用：GPU 空着才跑得动；imgsz 640、batch 4，别在现场抢显存。
 import glob, io, os, re, sys
 
 RUN = os.environ.get("AD_PR_RUN", "/opt/datasets/tsr_runs/tsr7_v2")
 DATA = os.environ.get("AD_PR_DATA", "/opt/datasets/tsr7_v2/data.yaml")
-MINI = "/opt/datasets/tsr7_v2_mini"          # 小验证子集，20 个权重才跑得完
+# ⚠️ MINI 必须跟着 DATA 走。写死成 tsr7_v2_mini 时，数据集一换/一删就变成拿旧空壳去验证，
+#    报 "No valid images found"（2026-09-28 第五轮收尾就是栽在这，整个曲线白跑）。
+MINI = os.environ.get("AD_PR_MINI") or (os.path.dirname(DATA.rstrip("/")) + "_mini")
 N_MINI = 300
 CLASSES = ["speed_limit", "prohibition", "warning", "mandatory", "guide", "signal", "crosswalk"]
 
@@ -45,8 +47,24 @@ def build_mini():
     return n
 
 
+def mini_ok():
+    """已有的 MINI 还能用吗 —— 换数据集后复用旧 MINI 会让软链全指向已删文件，
+    验证报 "No valid images found"。所以链接断了一条就重建。"""
+    d = os.path.join(MINI, "images", "val")
+    if not os.path.isdir(d):
+        return False
+    fs = os.listdir(d)
+    if not fs:
+        return False
+    for f in fs:
+        p = os.path.join(d, f)
+        if os.path.islink(p) and not os.path.exists(p):
+            return False
+    return True
+
+
 def main():
-    if not os.path.isdir(MINI):
+    if not mini_ok():
         if build_mini() == 0:
             print("✗ mini val 建不出来"); sys.exit(2)
     ws = []

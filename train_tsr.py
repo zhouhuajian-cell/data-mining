@@ -16,6 +16,41 @@
 """
 import argparse, os, shutil, subprocess, sys
 
+def start_mem_watch(log_path, interval=30):
+    """后台每 30s 记一行内存：/dev/shm、本进程 RSS、系统可用内存。
+
+    为什么必须单独盯 /dev/shm：2026-09-28 第五轮（tsr7_v4）在第 3 轮被 OOM 杀掉，
+    dmesg 是 `shmem-rss:12.99G, anon-rss:2.5G` —— DataLoader 用共享内存把张量从
+    worker 传给主进程，**只看进程 RSS 完全看不出问题**，所以必须把 shm 和可用内存一起记。
+    """
+    import threading, time
+    def _loop():
+        while True:
+            try:
+                shm = 0
+                if os.path.isdir("/dev/shm"):
+                    for f in os.listdir("/dev/shm"):
+                        try:
+                            shm += os.path.getsize(os.path.join("/dev/shm", f))
+                        except Exception:
+                            pass
+                rss = avail = 0
+                with open("/proc/self/status") as fh:
+                    for ln in fh:
+                        if ln.startswith("VmRSS"):
+                            rss = int(ln.split()[1]) * 1024
+                with open("/proc/meminfo") as fh:
+                    for ln in fh:
+                        if ln.startswith("MemAvailable"):
+                            avail = int(ln.split()[1]) * 1024
+                with open(log_path, "a") as fh:
+                    fh.write("[%s] shm=%.1fG rss=%.1fG 系统可用=%.1fG\n"
+                             % (time.strftime("%H:%M:%S"), shm / 2**30, rss / 2**30, avail / 2**30))
+            except Exception:
+                pass
+            time.sleep(interval)
+    threading.Thread(target=_loop, daemon=True).start()
+
 def gpu_free_gb():
     try:
         out = subprocess.check_output(
@@ -40,7 +75,9 @@ def main():
     ap.add_argument("--imgsz", type=int, default=960)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--workers", type=int, default=3,
+                    help="DataLoader worker 数。默认 3（原为 6）：worker 越多，/dev/shm 占用越大，"
+                         "2026-09-28 用 6 时 shm 涨到 13G 把 31G 机器打爆、训练被 OOM 杀掉")
     ap.add_argument("--name", default="tsr_v1")
     ap.add_argument("--lr0", type=float, default=0.01, help="暖启动微调时调小（如 0.005）")
     ap.add_argument("--save-period", type=int, default=-1,
@@ -63,6 +100,13 @@ def main():
     print("[数据] %d 张图；weights=%s" % (n, a.weights))
 
     from ultralytics import YOLO
+    import torch
+    # worker 传张量默认走 /dev/shm（内存），进程被杀时共享段不回收 → 内存一路涨到 OOM。
+    # file_system 改用 /tmp 下的文件（页缓存，可回收），是本机 31G 内存下更稳的选法。
+    torch.multiprocessing.set_sharing_strategy("file_system")
+    mem_log = "/opt/ad_mining/logs/train_mem_%s.log" % a.name
+    start_mem_watch(mem_log)
+    print("[监控] 内存采样 -> %s（每 30s 一行：shm / 进程 RSS / 系统可用）" % mem_log)
     m = YOLO(a.weights)
     m.train(data=a.data, imgsz=a.imgsz, epochs=a.epochs, batch=a.batch, workers=a.workers,
             project="/opt/datasets/tsr_runs", name=a.name, device=0, seed=0, patience=15,

@@ -762,7 +762,11 @@
     </div>
     <!-- 搜索结果连播器：把抽出来的帧按 视频+时间 顺序连着播，像看片段回放 -->
     <div id="fsPlayer" style="display:none; position:fixed; inset:0; z-index:10070; background:rgba(0,0,0,0.96); flex-direction:column; align-items:center; justify-content:center; padding:16px;">
-        <img id="fsPlayerImg" data-nozoom="1" alt="" style="max-width:96vw; max-height:78vh; object-fit:contain; border-radius:6px; background:#000;">
+        <div style="position:relative; display:inline-block;">
+            <img id="fsPlayerImg" data-nozoom="1" alt="" style="max-width:96vw; max-height:78vh; object-fit:contain; border-radius:6px; background:#000; display:block;">
+            <!-- 检测框叠加层：随帧切换重画（框按原图坐标百分比定位，层与 img 的 contain 显示区对齐） -->
+            <div id="fsPlayerBoxes" style="position:absolute; pointer-events:none; display:none; left:0; top:0;"></div>
+        </div>
         <div id="fsPlayerCap" style="color:#cbd5e1; font-size:13px; margin-top:8px; max-width:92vw; word-break:break-all; text-align:center;"></div>
         <!-- 本段综合标签：放右下角，便于一边看画面一边核对标签是否打得对（原来只有图，验证不了） -->
         <div id="fsPlayerTags" style="display:none; position:absolute; right:14px; bottom:14px; max-width:46vw; max-height:46vh; overflow:auto; background:rgba(8,14,26,0.9); border:1px solid rgba(148,163,184,0.35); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.6; text-align:left; color:#cbd5e1;"></div>
@@ -775,6 +779,9 @@
                    title="拖动跳到任意帧" style="width:200px; vertical-align:middle; cursor:pointer;">
             <label style="color:var(--text-muted); font-size:12px;" title="播到最后一帧后自动从头继续">
                 <input type="checkbox" id="fsPlayLoop"> 循环
+            </label>
+            <label style="color:var(--text-muted); font-size:12px;" title="框太多会挡住物体，看不清时可先关掉（快捷键 B）">
+                <input type="checkbox" id="fsPlayBoxes" checked onchange="fsPlayToggleBoxes(this.checked)"> 检测框
             </label>
             <label style="color:var(--text-muted); font-size:12px;">速度
                 <select id="fsPlaySpeed" onchange="fsPlayApplySpeed()" style="padding:4px;">
@@ -928,6 +935,7 @@
         let cachedDetections = {};
         let detectionsLoadedFor = '';
         let detectionsDirty = true;
+        let detectionsLoadingPromise = null;   // 单飞锁：缓存可能上百 MB，并发拉取会把浏览器打爆
         let isDetectCancelled = false;   // 目标检测急停手刹
         window.onload = async function() {
             await loadProjectList();
@@ -1595,6 +1603,49 @@
 
 
 
+        // 牌面细分类/数字识别的后缀显示（2026-09-29 接入）：rec.fine 按坐标匹配 sign 框，
+        // 容差 2px（fine 的框坐标来自同一份记录，本可精确相等，2px 只兜边界误差）
+        function fineTextFor(dets, i) {
+            try {
+                const f = dets && dets.fine; if (!f || !f.length) return '';
+                const b = dets.boxes && dets.boxes[i]; if (!b) return '';
+                for (let e of f) {
+                    if (Math.abs(e.box[0]-b[0])<2 && Math.abs(e.box[1]-b[1])<2
+                        && Math.abs(e.box[2]-b[2])<2 && Math.abs(e.box[3]-b[3])<2) return ' · ' + e.label;
+                }
+            } catch (err) {}
+            return '';
+        }
+
+        // 9 维标签溯源弹层（2026-09-29）：traffic_sign/objects 显示框，events 显示证据帧，整段判定维度提示无逐帧溯源
+        async function labelTraceShow(clipId, dim, value) {
+            if (!clipId) return;
+            let hits = [], note = '';
+            try {
+                const res = await fetch(`${API_BASE}/api/clips/label_trace?project=${encodeURIComponent(currentProject)}&clip_id=${encodeURIComponent(clipId)}&dim=${encodeURIComponent(dim)}&value=${encodeURIComponent(value)}`);
+                const d = await res.json();
+                hits = (d && d.hits) || [];
+                if (!hits.length) note = '该维度为整段判定（无逐帧框证据）';
+            } catch (e) { note = '加载失败: ' + e.message; }
+            let ov = document.getElementById('ltOverlay');
+            if (!ov) {
+                ov = document.createElement('div');
+                ov.id = 'ltOverlay';
+                ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9999;overflow:auto;padding:24px;';
+                ov.onclick = function(ev) { if (ev.target === ov) ov.remove(); };
+                document.body.appendChild(ov);
+            }
+            const cards = (hits || []).map(h => {
+                const w = h.w || 1920, hh = h.h || 1080;
+                const bx = (h.boxes || []).map(b =>
+                    `<div class="box-overlay" style="left:${(b[0]/w)*100}%;top:${(b[1]/hh)*100}%;width:${((b[2]-b[0])/w)*100}%;height:${((b[3]-b[1])/hh)*100}%;border-width:2px;"></div>`).join('');
+                return `<div style="display:inline-block;margin:6px;text-align:center;"><img src="${h.url}" style="width:300px;display:block;border-radius:6px;position:relative;">${bx.replace(/box-overlay/g, 'box-overlay ltabs') }<div style="font-size:11px;color:#94a3b8;margin-top:2px;">帧 ${h.frame_id}${(h.confs && h.confs.length) ? ' · ' + h.confs.join('/') : ''}</div></div>`;
+            }).join('');
+            ov.innerHTML = `<div style="max-width:1200px;margin:0 auto;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><div style="font-size:16px;color:#e2e8f0;">溯源：${value} <span style="font-size:12px;color:#94a3b8;">（${dim} · ${hits.length} 帧命中）</span></div><button class="secondary" onclick="document.getElementById('ltOverlay').remove()">关闭</button></div>${note ? `<div style="color:#94a3b8;padding:20px 0;">${note}</div>` : ''}<div>${cards}</div></div>`;
+            // 框叠加层需要相对定位容器：包一层
+            ov.querySelectorAll('img').forEach(function(im) { im.parentElement.style.position = 'relative'; });
+        }
+
         function openModal(index) {
 
             const item = currentResults[index];
@@ -1609,13 +1660,13 @@
 
                 const oW = item.detections.width, oH = item.detections.height;
 
-                let validBoxes = item.detections.scores ? item.detections.scores.map((s, i) => ({ score:s, label:item.detections.labels[i], box:item.detections.boxes[i] })).filter(b => b.score >= currentBoxThreshold) : [];
+                let validBoxes = item.detections.scores ? item.detections.scores.map((s, i) => ({ score:s, oi:i, label:item.detections.labels[i], box:item.detections.boxes[i] })).filter(b => b.score >= currentBoxThreshold) : [];
 
                 let html = '';
 
                 validBoxes.forEach(b => {
 
-                    html += `<div class="box-overlay" style="left: ${(b.box[0]/oW)*100}%; top: ${(b.box[1]/oH)*100}%; width: ${((b.box[2]-b.box[0])/oW)*100}%; height: ${((b.box[3]-b.box[1])/oH)*100}%; border-width:2px;"><div class="box-label" style="top:-24px; font-size:14px;">${b.label} ${b.score.toFixed(2)}</div></div>`;
+                    html += `<div class="box-overlay" style="left: ${(b.box[0]/oW)*100}%; top: ${(b.box[1]/oH)*100}%; width: ${((b.box[2]-b.box[0])/oW)*100}%; height: ${((b.box[3]-b.box[1])/oH)*100}%; border-width:2px;"><div class="box-label" style="top:-24px; font-size:14px;">${b.label}${fineTextFor(item.detections, b.oi)} ${b.score.toFixed(2)}</div></div>`;
 
                 });
 
@@ -1755,24 +1806,34 @@
 
 
         // ---- 持久化目标检测：拉取后端 /api/get_all_detections 并按当前项目缓存 ----
-
+        // ⚠️ 必须单飞：大项目这份 JSON 上百 MB，播放器每帧都会调进来——没有单飞锁时
+        //    首次拉取完成前每一帧都再发一个全量请求，浏览器被并发大响应淹没、一个都完不成
+        //    （实测症状：播放全程无框）。有了锁，后续调用复用同一个在途 Promise。
         async function ensureDetectionsLoaded() {
 
             if (!detectionsDirty && detectionsLoadedFor === currentProject) return;
 
-            try {
+            if (detectionsLoadingPromise) { await detectionsLoadingPromise; return; }
 
-                const res = await fetch(`${API_BASE}/api/get_all_detections?project=${encodeURIComponent(currentProject)}`);
+            detectionsLoadingPromise = (async () => {
 
-                const data = await res.json();
+                try {
 
-                cachedDetections = (data && data.detections) || {};
+                    const res = await fetch(`${API_BASE}/api/get_all_detections?project=${encodeURIComponent(currentProject)}`);
 
-            } catch (e) { cachedDetections = {}; }
+                    const data = await res.json();
 
-            detectionsLoadedFor = currentProject;
+                    cachedDetections = (data && data.detections) || {};
 
-            detectionsDirty = false;
+                } catch (e) { cachedDetections = {}; }
+
+                detectionsLoadedFor = currentProject;
+
+                detectionsDirty = false;
+
+            })();
+
+            try { await detectionsLoadingPromise; } finally { detectionsLoadingPromise = null; }
 
         }
 
@@ -3481,7 +3542,7 @@
 
             currentResults.forEach((item, index) => {
 
-                let validBoxes = item.detections && item.detections.scores ? item.detections.scores.map((score, i) => ({ score, label: item.detections.labels[i], box: item.detections.boxes[i] })).filter(b => b.score >= currentBoxThreshold) : [];
+                let validBoxes = item.detections && item.detections.scores ? item.detections.scores.map((score, i) => ({ score, oi:i, label: item.detections.labels[i], box: item.detections.boxes[i] })).filter(b => b.score >= currentBoxThreshold) : [];
 
                 if (validBoxes.length > 0 || (item.userTags && item.userTags.length > 0)) withTarget++;
 
@@ -3495,7 +3556,7 @@
 
                     const oW = item.detections.width, oH = item.detections.height;
 
-                    validBoxes.forEach(b => { boxesHTML += `<div class="box-overlay" style="left: ${(b.box[0]/oW)*100}%; top: ${(b.box[1]/oH)*100}%; width: ${((b.box[2]-b.box[0])/oW)*100}%; height: ${((b.box[3]-b.box[1])/oH)*100}%;"><div class="box-label">${b.label} ${b.score.toFixed(2)}</div></div>`; });
+                    validBoxes.forEach(b => { boxesHTML += `<div class="box-overlay" style="left: ${(b.box[0]/oW)*100}%; top: ${(b.box[1]/oH)*100}%; width: ${((b.box[2]-b.box[0])/oW)*100}%; height: ${((b.box[3]-b.box[1])/oH)*100}%;"><div class="box-label">${b.label}${fineTextFor(item.detections, b.oi)} ${b.score.toFixed(2)}</div></div>`; });
 
                 }
 
@@ -5458,6 +5519,7 @@ function fsPlayStart() {
         fids.forEach(function (fid) {
             if (flat.length < CAP) {
                 flat.push({
+                    fid: fid,
                     url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid,
                     txt: '<b>' + ((it.segment && it.segment.video) || it.filename || '') + '</b> · #' + fid
                 });
@@ -5479,10 +5541,152 @@ function fsPlayStart() {
     return false;
 }
 
+// ===== 检测框随帧叠加（2026-09-30）：播放器切到哪帧，就画那帧的 YOLO/闭集框 =====
+// 数据源直接复用页面已有的全量缓存 cachedDetections（ensureDetectionsLoaded 拉过一次），
+// 不新增任何接口；阈值沿用搜索页那个分数滑块 currentBoxThreshold。
+function _boxColor(label) {
+    let h = 0;
+    const s = String(label || '');
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+    return 'hsl(' + h + ',95%,60%)';
+}
+// 通用画框核心：全屏播放器与审核/评测的 stage 播放器共用（同一个检测缓存、同一套百分比映射）
+function drawDetBoxesInto(fid, img, layer, syncFn) {
+    if (!layer || !img) return 0;
+    layer.innerHTML = '';
+    layer.dataset.on = '';
+    layer.style.display = 'none';
+    if (!_fsBoxesOn) return 0;   // 开关关闭：整层不画
+    // ⚠️ cachedDetections/currentBoxThreshold 都是 let 声明 —— 不在 window 上，
+    // 必须用裸标识符访问（跨 script 块共享全局词法绑定）；写 window.xxx 永远是 undefined
+    const rec = cachedDetections[String(fid)];
+    if (!rec || !rec.boxes || !rec.scores) { if (syncFn) syncFn(); return 0; }
+    // 坐标空间与「融合语义搜索」同一口径：**优先 rec.width/height**（框就是在这个空间里存的，
+    // 搜索页用它对齐无误）；仅当框坐标超出 rec 空间（= 缓存里的 w/h 是历史脏值，实测东南亚
+    // 老帧文件 2912×1184、缓存却写 1280×520）才回退到图片自身尺寸。
+    const boxesAll = rec.boxes.map((b, i) => ({ b, i, s: rec.scores[i] || 0 }));
+    let W = rec.width || 1, H = rec.height || 1;
+    const _dirty = boxesAll.some(x => x.b && x.b.length >= 4 && (x.b[2] > W + 1 || x.b[3] > H + 1));
+    if (_dirty && img.naturalWidth) { W = img.naturalWidth; H = img.naturalHeight; }
+    const boxes = boxesAll
+        .filter(x => x.s >= (typeof currentBoxThreshold === 'number' ? currentBoxThreshold : 0));
+    if (!boxes.length) { if (syncFn) syncFn(); return 0; }
+    boxes.forEach(x => {
+        const b = x.b || [];
+        if (b.length < 4) return;
+        const lab = (rec.labels || [])[x.i] || '';
+        const fine = typeof fineTextFor === 'function' ? (fineTextFor(rec, x.i) || '') : '';
+        const c = _boxColor(lab);
+        const d = document.createElement('div');
+        d.style.cssText = 'position:absolute; pointer-events:none;'
+            + 'left:' + (b[0] / W * 100) + '%; top:' + (b[1] / H * 100) + '%;'
+            + 'width:' + ((b[2] - b[0]) / W * 100) + '%; height:' + ((b[3] - b[1]) / H * 100) + '%;'
+            + 'border:2px solid ' + c + '; border-radius:2px;';
+        const t = document.createElement('div');
+        t.style.cssText = 'position:absolute; left:0; top:-16px; white-space:nowrap;'
+            + 'font-size:11px; font-weight:600; color:#0b1220; background:' + c + ';'
+            + 'padding:0 4px; border-radius:2px; line-height:15px;';
+        t.textContent = lab + (fine || '') + ' ' + x.s.toFixed(2);
+        d.appendChild(t);
+        layer.appendChild(d);
+    });
+    layer.dataset.on = '1';
+    if (syncFn) syncFn();
+    return boxes.length;
+}
+function fsSyncBoxLayer() {
+    const img = document.getElementById('fsPlayerImg');
+    const layer = document.getElementById('fsPlayerBoxes');
+    _syncBoxLayerRect(img, layer);
+}
+function fsPlayDrawBoxes(fid) {
+    const layer = document.getElementById('fsPlayerBoxes');
+    const img = document.getElementById('fsPlayerImg');
+    drawDetBoxesInto(fid, img, layer, fsSyncBoxLayer);
+}
+function _syncBoxLayerRect(img, layer) {
+    if (!img || !layer) return;
+    const nw = img.naturalWidth, nh = img.naturalHeight, cw = img.clientWidth, ch = img.clientHeight;
+    if (!nw || !nh || !cw || !ch) return;
+    // img 是 object-fit:contain —— 叠加层必须对齐"实际显示的画面矩形"，否则框会漂
+    const s = Math.min(cw / nw, ch / nh);
+    const dw = nw * s, dh = nh * s;
+    layer.style.left = ((cw - dw) / 2) + 'px';
+    layer.style.top = ((ch - dh) / 2) + 'px';
+    layer.style.width = dw + 'px';
+    layer.style.height = dh + 'px';
+    layer.style.display = 'block';
+}
+// stage 播放器（数据审核 'au' / 人机评测 'cl'）的框叠加：切帧即画当前帧
+function stageDrawBoxes(pfx) {
+    const st = _stg(pfx);
+    const img = document.getElementById(pfx + 'StageImg');
+    const layer = document.getElementById(pfx + 'StageBoxes');
+    if (!st || !img || !layer) return;
+    // 缓存未就绪（首次进项目要拉全量检测）→ 触发拉取，完成后本帧会随播放/翻页重画
+    if (detectionsDirty || detectionsLoadedFor !== currentProject) {
+        ensureDetectionsLoaded().then(function () { stageDrawBoxes(pfx); }).catch(function () {});
+        return;
+    }
+    const fid = (st.fids || [])[st.idx || 0];
+    drawDetBoxesInto(fid, img, layer, function () { _syncBoxLayerRect(img, layer); });
+}
+// 框开关：一处切换，三个播放器（全屏 / 审核 stage / 评测 stage）同步生效
+function fsPlayToggleBoxes(on) {
+    _fsBoxesOn = !!on;
+    ['fsPlayBoxes', 'auStageBoxCb', 'clStageBoxCb'].forEach(function (id) {
+        const cb = document.getElementById(id);
+        if (cb && cb.checked !== _fsBoxesOn) cb.checked = _fsBoxesOn;
+    });
+    const layer = document.getElementById('fsPlayerBoxes');
+    if (layer && !_fsBoxesOn) { layer.style.display = 'none'; layer.innerHTML = ''; layer.dataset.on = ''; }
+    fsPlayDrawBoxes(window.cur);
+    ['au', 'cl'].forEach(function (p) {
+        const ly = document.getElementById(p + 'StageBoxes');
+        if (ly && !_fsBoxesOn) { ly.style.display = 'none'; ly.innerHTML = ''; ly.dataset.on = ''; }
+        if (_fsBoxesOn) stageDrawBoxes(p);
+    });
+}
+// 框开关（用户 2026-09-30：框太多会挡住物体影响判断，要与数据审核一致支持隐藏）
+let _fsBoxesOn = true;
+async function fsPlayShowBoxes(fid) {
+    if (!_fsBoxesOn) { fsPlayDrawBoxes(fid); return; }   // 关闭状态：清层即可，不提示不拉取
+    const layer = document.getElementById('fsPlayerBoxes');
+    // 缓存未就绪时给出提示（首次要拉全量检测，大项目可能十几秒）
+    if (detectionsDirty || detectionsLoadedFor !== currentProject) {
+        if (layer) {
+            layer.innerHTML = '<div style="position:absolute; left:12px; bottom:12px;'
+                + 'background:rgba(8,14,26,0.85); color:#93c5fd; font-size:12px;'
+                + 'padding:4px 10px; border-radius:6px; border:1px solid rgba(148,163,184,0.35);">'
+                + '检测数据加载中…（首次需拉取全量，稍后框会自动出现）</div>';
+            layer.dataset.on = '1';
+            layer.style.display = 'block';
+            fsSyncBoxLayer();
+        }
+    }
+    try { await ensureDetectionsLoaded(); } catch (e) {}
+    fsPlayDrawBoxes(fid);
+}
+// 图片加载完成 / 窗口缩放 / 全屏切换都要重新对齐叠加层
+(function () {
+    const img = document.getElementById('fsPlayerImg');
+    if (img) img.addEventListener('load', function () {
+        fsSyncBoxLayer();
+        // 图片真实尺寸到位后重画一次：首画时可能 naturalWidth 还没 ready，用的是缓存里的脏 w/h
+        const _ly = document.getElementById('fsPlayerBoxes');
+        if (_ly && _ly.dataset.on && _fsBoxesOn && window.cur != null) fsPlayDrawBoxes(window.cur);
+    });
+    window.addEventListener('resize', function () {
+        const layer = document.getElementById('fsPlayerBoxes');
+        if (layer && layer.dataset.on) fsSyncBoxLayer();
+    });
+})();
+
 function fsPlayShow() {
     const it = fsPlayList[fsPlayI];
     if (!it) return;
     window.cur = it.fid || it.id;      // 当前帧号：给"回看原帧"用
+    fsPlayShowBoxes(window.cur);       // 检测框随帧叠加（异步取缓存，取不到就是无检测）
     document.getElementById('fsPlayerImg').src = it.url
         ? fullUrl(it.url)
         : fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id);
@@ -5555,6 +5759,11 @@ document.addEventListener('keydown', function (ev) {
         ev.preventDefault(); fsPlayNext();
     } else if (ev.key === 'r' || ev.key === 'R') {
         fsPlayRestart();
+    } else if (ev.key === 'b' || ev.key === 'B') {
+        if (tag !== 'INPUT' && tag !== 'SELECT') {          // B：显示/隐藏检测框
+            const cb = document.getElementById('fsPlayBoxes');
+            if (cb) { cb.checked = !cb.checked; fsPlayToggleBoxes(cb.checked); }
+        }
     } else if (ev.key === 'Escape') {
         fsPlayClose();
     }
@@ -6191,6 +6400,22 @@ async function auditShowCard(it) {
 
 
     const aiTags = detail.ai_tags || {};
+    // 事件在 vlm_result 里按「相邻帧对」逐条存（F1→F2、F2→F3…同事件会存 4 条）——
+    // 证据链要逐对理由，保持原样；但标签 chips 只表达"有没有这个事件"，必须按 tag 去重
+    // （置信度取最大），否则审核卡上"行人横穿90%"连排 4 遍（用户 2026-09-30）。
+    const _dd = function (a) {
+        const m = {};
+        (a || []).forEach(function (t) {
+            const n = (typeof t === 'string') ? t : (t.tag || '');
+            if (!n) return;
+            const cf = (t && t.confidence) || 0;
+            const cur = m[n];
+            if (!cur || cf > ((cur && cur.confidence) || 0)) m[n] = (typeof t === 'object') ? t : { tag: n, confidence: cf };
+        });
+        return Object.keys(m).map(k => m[k]);
+    };
+    if (aiTags.events) aiTags.events = _dd(aiTags.events);
+    if (aiTags.objects) aiTags.objects = _dd(aiTags.objects);
 
     const humanTags = detail.human_tags || {};
 
@@ -6262,7 +6487,8 @@ let html = auStageHtml;
                 const isVLM = typeof t === 'object' && t.source === 'VLM';
                   const conf = (!isVLM && typeof t === 'object' && t.confidence) ? `<span class="c">${(t.confidence*100).toFixed(0)}%</span>` : '';
 
-                return `<span class="audit-chip ${kind}">${tagName}${conf}</span>`;
+                // 9 维标签溯源（2026-09-29 用户要求）：点标签 → 显示触发帧与框（整段判定型维度后端返回空，前端提示）
+                return `<span class="audit-chip ${kind}" style="cursor:pointer;" onclick="labelTraceShow('${it.clip_id || it.id || ''}','${dim}','${String(tagName).replace(/'/g, '')}')">${tagName}${conf}</span>`;
 
             }).join('');
 
@@ -7021,6 +7247,7 @@ function stageHtml(pfx) {
   };
   return '<div style="flex:0 0 auto; aspect-ratio:16/9; position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:0;">'
     + '<img id="' + pfx + 'StageImg" src="" onclick="stageZoom(\'' + pfx + '\')" style="width:100%; height:100%; object-fit:contain; cursor:zoom-in;" title="点击可放大（滚轮缩放 / ←→ 翻页）">'
+    + '<div id="' + pfx + 'StageBoxes" style="position:absolute; pointer-events:none; display:none; left:0; top:0;"></div>'
     + '<div style="position:absolute; left:0; right:0; bottom:0; padding:8px 12px; display:flex; gap:10px; align-items:center; background:linear-gradient(transparent, rgba(0,0,0,0.85));">'
     + btn('stageStep(\'' + pfx + '\',-5)', '⏪', '快退 5 帧')
     + btn('stageStep(\'' + pfx + '\',-1)', '⏮', '上一帧（←）')
@@ -7030,6 +7257,8 @@ function stageHtml(pfx) {
     + '<input id="' + pfx + 'Seek" type="range" min="0" max="0" value="0" oninput="stageSeek(\'' + pfx + '\',this.value)" style="flex:1; min-width:80px; cursor:pointer;">'
     + '<select id="' + pfx + 'Speed" onchange="stageSetSpeed(\'' + pfx + '\',this.value)" style="font-size:12px; padding:3px 4px;" title="播放速度（快进）">'
     + '<option value="1000">0.5x</option><option value="500" selected>1x</option><option value="250">2x</option><option value="125">4x</option><option value="60">8x</option></select>'
+    + '<label style="font-size:12px; color:#cbd5e1; display:inline-flex; align-items:center; gap:4px; cursor:pointer;" title="框太多会挡住物体，看不清时可关掉（与全屏播放器同一个开关）">'
+    + '<input type="checkbox" id="' + pfx + 'StageBoxCb" style="cursor:pointer;" onchange="fsPlayToggleBoxes(this.checked)"> 检测框</label>'
     + '<label style="font-size:12px; color:#cbd5e1; display:inline-flex; align-items:center; gap:4px; cursor:pointer;" title="播完自动从头再播（默认关，避免一直占用解码）">'
     + '<input type="checkbox" id="' + pfx + 'Loop" style="cursor:pointer;"> 循环</label>'
     + '<span id="' + pfx + 'Info" style="font-size:12px; color:#cbd5e1; min-width:80px; text-align:right;"></span>'
@@ -7037,10 +7266,12 @@ function stageHtml(pfx) {
     + '<div id="' + pfx + 'Frames" style="flex:0 0 auto; max-height:118px; display:grid; grid-template-columns:repeat(auto-fill,minmax(74px,1fr)); gap:4px; overflow-y:auto; align-content:start;"></div>';
 }
 // 装载新的一段：复位播放器 + 重建缩略图条（默认 1x、循环关、停在第 1 帧）
-function stageInit(pfx, urls, bigUrls, thumbs) {
+// fids 可选：与 urls 一一对应的帧 id——给检测框叠加层用（审核 'au' / 评测 'cl' 都传）
+function stageInit(pfx, urls, bigUrls, thumbs, fids) {
   const st = _stg(pfx);
   if (st.timer) { clearInterval(st.timer); st.timer = null; }
   st.urls = urls || []; st.bigUrls = bigUrls || st.urls; st.thumbs = thumbs || st.urls;
+  st.fids = fids || [];
   st.idx = 0; st.playing = false; st.speed = 500;
   const fr = document.getElementById(pfx + 'Frames');
   if (fr) fr.innerHTML = st.thumbs.map(function (u, i) {
@@ -7058,7 +7289,18 @@ function stageShow(pfx, idx) {
   idx = Math.max(0, Math.min(parseInt(idx) || 0, urls.length - 1));
   st.idx = idx;
   const img = document.getElementById(pfx + 'StageImg');
-  if (img) img.src = urls[idx];
+  if (img) {
+    img.src = urls[idx];
+    // 图片加载完成后重画框（natural 尺寸此时才可靠）；监听只挂一次
+    if (!img.dataset.boxListener) {
+      img.dataset.boxListener = '1';
+      img.addEventListener('load', function () {
+        const ly = document.getElementById(pfx + 'StageBoxes');
+        if (ly && ly.dataset.on) stageDrawBoxes(pfx);
+      });
+    }
+  }
+  stageDrawBoxes(pfx);   // 切帧即画（缓存未就绪时画不出，加载完成后下一帧会带框）
   const seek = document.getElementById(pfx + 'Seek');
   if (seek) { seek.max = Math.max(0, urls.length - 1); seek.value = idx; }
   const info = document.getElementById(pfx + 'Info');
@@ -7102,7 +7344,7 @@ function stageSetSpeed(pfx, ms) {           // 倍速（快进）：播放中立
   st.speed = parseInt(ms) || 500;
   if (st.playing) { stagePause(pfx); stagePlay(pfx); }
 }
-function stageZoom(pfx) { const st = _stg(pfx); ivOpen(st.bigUrls, st.idx); }
+function stageZoom(pfx) { const st = _stg(pfx); ivOpen(st.bigUrls, st.idx, st.fids); }   // fids 一起带上：放大后框仍在
 // 键盘：只驱动当前可见面板那一个舞台（输入框内不抢键；全屏查看器开着时交给它）
 function _activeStagePfx() {
   const vw = document.getElementById('imgViewer');
@@ -7190,7 +7432,7 @@ function auStageApply() {
   const mk = function (w) {
     return fids.map(function (f) { return '/api/image/' + encodeURIComponent(currentProject) + '/' + f + '?w=' + w; });
   };
-  stageInit('au', mk(800), mk(1600), mk(240));
+  stageInit('au', mk(800), mk(1600), mk(240), fids);
   if (note) note.textContent = '';   // 帧数/来源说明在切换按钮上已能看出，不再重复一行文字
 }
 function clipLabelPlay() {
@@ -7222,9 +7464,15 @@ async function clipLabelRender() {
   _cl.bigUrls = _mk(1600);     // 点开放大：1600 看细节
   _cl.thumbs = _mk(240);       // 缩略图条
   (_cl.stageUrls || []).forEach(function (u) { var _im = new Image(); _im.src = u; });   // 预加载（800px 体积小）
+  // 帧号给检测框叠加层用：_fidList 里是数字的直接用；URL 形式的取末段数字（/api/image/<项目>/<帧id>）
+  const _fidNums = _fidList.map(function (v) {
+    if (typeof v === 'number') return v;
+    const m = String(v).match(/\/(\d+)(?:\?|$)/);
+    return m ? parseInt(m[1], 10) : null;
+  });
   const _sh = document.getElementById('clStageHost');       // 共用播放器：首次渲染时生成控件
   if (_sh && !_sh.innerHTML) _sh.innerHTML = stageHtml('cl');
-  stageInit('cl', _cl.stageUrls, _cl.bigUrls, _cl.thumbs);  // 装载本段帧序列（默认 1x / 循环关 / 停首帧）
+  stageInit('cl', _cl.stageUrls, _cl.bigUrls, _cl.thumbs, _fidNums);  // 装载本段帧序列（默认 1x / 循环关 / 停首帧）
   document.getElementById('clMeta').innerHTML = 'clip: ' + c.clip_id + '<br>帧数: ' + (c.frame_count || 0)
     + '<div style="margin-top:6px; display:flex; gap:6px;">'
     + '<button class="secondary" onclick="clipLabelToggleAll()" style="padding:3px 10px; font-size:11px;">' + (_cl.showAll ? '◀ 只看送模型的 ' + ((c.sample_urls || []).length) + ' 帧' : '看整段 ' + ((c.frame_ids || []).length) + ' 帧 ▶') + '</button>'
@@ -7305,7 +7553,8 @@ function clipLabelModelTags(c) {
                      sc.road_marking || [], sc.road || [])
              .filter(Boolean);
   m.objects = (r.objects || []).map(function (o) { return o && o.type; }).filter(Boolean);
-  m.events = (r.events || []).map(function (e) { return e && e.type; }).filter(Boolean);
+  // 事件按帧对逐条存（同事件多条），chips 只表达"有没有" → 去重
+  m.events = Array.from(new Set((r.events || []).map(function (e) { return e && e.type; }).filter(Boolean)));
   return m;
 }
 // 单个 chip 的四态：人工(绿) / 仅模型(黄) / 已被人工否决(灰删除线) / 未标(灰)
@@ -7516,36 +7765,71 @@ async function clipLabelShowStats() {
 <!-- ===== 通用图片查看器：滚轮缩放 / 拖动平移 / ←→ 翻页 / 0 复位 / Esc 关闭 ===== -->
 <div id="imgViewer" style="display:none; position:fixed; inset:0; z-index:10070; background:rgba(0,0,0,0.95);">
   <div id="ivStage" style="position:absolute; inset:0; overflow:hidden; display:flex; align-items:center; justify-content:center; cursor:grab;">
-    <img id="ivImg" src="" draggable="false" style="max-width:100%; max-height:100%; transform-origin:0 0; user-select:none; pointer-events:none;">
+    <!-- 框层包在同一个 transform 容器里：放大/平移时框跟着走，不用换算坐标 -->
+    <div id="ivWrap" style="position:relative; user-select:none;">
+      <img id="ivImg" src="" draggable="false" style="max-width:100%; max-height:100%; user-select:none; pointer-events:none; display:block;">
+      <div id="ivBoxes" style="position:absolute; left:0; top:0; pointer-events:none; display:none;"></div>
+    </div>
   </div>
   <button onclick="ivClose()" style="position:absolute; top:14px; right:18px; padding:6px 14px; font-size:14px; background:rgba(30,41,59,.9); color:#e2e8f0; border:1px solid rgba(148,163,184,.4); border-radius:6px; cursor:pointer;">✕ 关闭（单击画面亦可）</button>
   <div id="ivBar" style="position:absolute; bottom:0; left:0; right:0; padding:12px 16px; text-align:center; color:#cbd5e1; font-size:13px; background:linear-gradient(transparent, rgba(0,0,0,.8)); pointer-events:none;">
     <b id="ivInfo"></b>
+    <label style="margin-left:16px; display:inline-flex; align-items:center; gap:4px; cursor:pointer; pointer-events:auto;" title="框太多会挡住物体时可关掉">
+      <input type="checkbox" id="ivBoxCb" style="cursor:pointer;" onchange="fsPlayToggleBoxes(this.checked)"> 检测框</label>
     <span style="margin-left:16px; color:#94a3b8;">单击关闭 · 滚轮/±缩放 · 拖动平移 · ← → 翻页 · 0 复位 · Esc 关闭</span>
   </div>
 </div>
 <script>
-let _iv = { urls: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0, down: null };
-function ivOpen(urls, idx) {
+let _iv = { urls: [], fids: [], i: 0, scale: 1, tx: 0, ty: 0, drag: false, sx: 0, sy: 0, down: null };
+function ivOpen(urls, idx, fids) {
   _iv.urls = (urls || []).filter(Boolean);
+  _iv.fids = fids || [];
   if (!_iv.urls.length) return;
   _iv.i = Math.max(0, Math.min(idx || 0, _iv.urls.length - 1));
   document.getElementById('imgViewer').style.display = 'block';
+  const cb = document.getElementById('ivBoxCb');
+  if (cb) cb.checked = _fsBoxesOn;
   ivShow();
 }
 function ivShow() {
   const img = document.getElementById('ivImg');
   img.style.opacity = '0.4';
-  img.onload = function () { img.style.opacity = '1'; };
+  img.onload = function () { img.style.opacity = '1'; ivDrawBoxes(); };
   img.src = _iv.urls[_iv.i];
   _iv.scale = 1; _iv.tx = 0; _iv.ty = 0;
   ivApply();
+  ivDrawBoxes();   // 先按缓存画一次（图片 onLoad 后会再画一次校正）
   const info = document.getElementById('ivInfo');
   if (info) info.textContent = '第 ' + (_iv.i + 1) + ' / ' + _iv.urls.length + ' 张';
 }
+// 放大查看器的框：层与 img 同处一个 transform 容器，缩放/平移自动跟随
+function ivDrawBoxes() {
+    const img = document.getElementById('ivImg');
+    const layer = document.getElementById('ivBoxes');
+    if (!img || !layer) return;
+    if (detectionsDirty || detectionsLoadedFor !== currentProject) {
+        ensureDetectionsLoaded().then(function () { ivDrawBoxes(); }).catch(function () {});
+        return;
+    }
+    drawDetBoxesInto((_iv.fids || [])[_iv.i], img, layer, function () {
+        // ivWrap 紧贴 img（flex 居中项），层尺寸= img 渲染尺寸即可
+        layer.style.width = img.clientWidth + 'px';
+        layer.style.height = img.clientHeight + 'px';
+        layer.style.display = layer.dataset.on ? 'block' : 'none';
+    });
+}
+function ivClose() {
+  document.getElementById('imgViewer').style.display = 'none';
+  const layer = document.getElementById('ivBoxes');
+  if (layer) { layer.innerHTML = ''; layer.dataset.on = ''; layer.style.display = 'none'; }
+  _iv.urls = []; _iv.fids = [];
+}
 function ivApply() {
   const img = document.getElementById('ivImg');
-  img.style.transform = 'translate(' + _iv.tx + 'px,' + _iv.ty + 'px) scale(' + _iv.scale + ')';
+  const wrap = document.getElementById('ivWrap');
+  const tgt = wrap || img;
+  tgt.style.transformOrigin = '0 0';
+  tgt.style.transform = 'translate(' + _iv.tx + 'px,' + _iv.ty + 'px) scale(' + _iv.scale + ')';
   img.style.maxWidth = _iv.scale > 1 ? 'none' : '100%';
   img.style.maxHeight = _iv.scale > 1 ? 'none' : '100%';
   const st = document.getElementById('ivStage');
@@ -7562,10 +7846,6 @@ function ivZoomAt(factor, cx, cy) {
   _iv.ty = cy - (cy - _iv.ty) * (ns / _iv.scale);
   _iv.scale = ns;
   ivApply();
-}
-function ivClose() {
-  document.getElementById('imgViewer').style.display = 'none';
-  _iv.urls = [];
 }
 (function initImageViewer() {
   const stage = document.getElementById('ivStage');
