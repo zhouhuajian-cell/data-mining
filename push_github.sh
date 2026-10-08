@@ -102,5 +102,12 @@ if git diff --cached --quiet; then
 fi
 git -c core.safecrlf=false commit -q -m "$MSG"
 echo "→ 推送到 GitHub…"
-git push origin main
+# ⚠️ 这台机器**直连 GitHub 会 SSL 握手失败**（2026-10-08 实测 schannel handshake 失败），
+#    必须走本地代理；没装代理/换了端口时用 GIT_PROXY=... 覆盖，或设 GIT_PROXY= 关掉。
+: "${GIT_PROXY:=http://127.0.0.1:7897}"
+if [ -n "$GIT_PROXY" ]; then
+  git -c http.proxy="$GIT_PROXY" -c https.proxy="$GIT_PROXY" push origin main
+else
+  git push origin main
+fi
 echo "✅ 完成：$(git log --oneline -1)"
