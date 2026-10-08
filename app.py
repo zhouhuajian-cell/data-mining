@@ -260,9 +260,25 @@ def _start_compression():
 # 重启打断即截断 → 启动迁移无容错直接崩溃循环 —— 2026-09-19 21:20 事故）。
 # NAS 上那份 detections_cache.json 是遗留文件，仅 migrate 兼容读取。
 DETECTIONS_CACHE_FILE = os.path.join(PROJECT_DIR, "workspace", "detections_cache.json")
+# 🚀 生产级「千万帧」改造 P0（2026-10-07）：检测记录改走 SQLite + 内存 LRU。
+#    旧实现把**所有项目所有帧**的检测框全量常驻内存（90.2 万帧实测 RSS 22.8G、机器只剩 5G 可用），
+#    且每检测一批就往上加。新实现冷帧落本地 NVMe，内存只留最近 AD_DET_LRU 帧。
+#    开关 AD_DET_STORE=sqlite 才启用；默认 json = 老行为，零风险回滚。
+DET_STORE_FILE = os.path.join(PROJECT_DIR, "workspace", "detections.db")
+_AD_DET_STORE = os.environ.get("AD_DET_STORE", "json").strip().lower()
 detections_cache = {}
 _detections_lock = threading.Lock()
-if os.path.exists(DETECTIONS_CACHE_FILE):
+if _AD_DET_STORE == "sqlite":
+    try:
+        from det_store import DetStore as _DetStore, migrate_from_json as _mig_det
+        detections_cache = _DetStore(DET_STORE_FILE,
+                                     lru_max=int(os.environ.get("AD_DET_LRU", "50000")))
+        _mig = _mig_det(detections_cache, DETECTIONS_CACHE_FILE)
+        print(f"✅ 检测记录改用 SQLite（本次迁移 {_mig} 条；内存只留最近 {detections_cache.lru_max()} 帧）")
+    except Exception as _e:
+        print(f"[!] DetStore 初始化失败，退回 JSON 内存模式: {_e}")
+        detections_cache = {}
+if isinstance(detections_cache, dict) and os.path.exists(DETECTIONS_CACHE_FILE):
     try:
         with open(DETECTIONS_CACHE_FILE, "r", encoding="utf-8") as f:
             _loaded = json.load(f)
@@ -272,7 +288,13 @@ if os.path.exists(DETECTIONS_CACHE_FILE):
     except Exception:
         detections_cache = {}
 def _persist_detections():
-    """原子写本地 NVMe：tmp + os.replace，任何时刻中断都不会产生半截文件。"""
+    """落盘：SQLite 模式只 flush；JSON 模式原子写本地 NVMe（tmp + os.replace）。"""
+    if not isinstance(detections_cache, dict):
+        try:
+            detections_cache.flush()
+        except Exception:
+            pass
+        return
     os.makedirs(os.path.dirname(DETECTIONS_CACHE_FILE), exist_ok=True)
     _tmp = DETECTIONS_CACHE_FILE + ".tmp"
     with open(_tmp, "w", encoding="utf-8") as f:
@@ -3762,6 +3784,82 @@ async def export_delivery(
         "code": 200,
         "msg": f"正在后台自动打包 {len(req.selected_image_names)} 帧数据及其伴生文件！",
     }
+# ===== 前端"导出粗筛(SigLIP-JSON)"专用：服务端落盘到交付目录（用户 2026-10-08）=====
+# 为什么单独做：原来前端是 `a.download=...; a.click()` **纯浏览器下载** —— 文件只落到用户
+# Downloads 文件夹，网盘的 test/json 与 test/jiaofu 里什么都没有（用户报"这里没有导出的"）。
+# 现在改成：前端把条目 POST 上来，服务端写 json + 硬链接原图，落到交付目录并自动合并。
+@app.post("/api/export_selected")
+async def export_selected(
+    project: str = Form("default"),
+    tag: str = Form("siglip"),
+    items: str = Form("[]"),          # JSON 字符串：前端选中的条目数组
+):
+    proj = project or "default"
+    try:
+        items = json.loads(items or "[]")
+    except Exception:
+        items = []
+    if not items:
+        return {"code": 400, "msg": "没有可导出的条目"}
+
+    def _work():
+        try:
+            ctx = load_project_context(proj)
+            _by_fn = {}
+            for m in (ctx.get("metadata") or []):
+                _fn = os.path.basename(m.get("path") or "")
+                if _fn:
+                    _by_fn.setdefault(_fn, m.get("path"))
+            sub = "Dino" if str(tag).lower().startswith("dino") else "siglip"
+            jdir = os.path.join(EXPORT_JSON_DIR, sub)
+            ddir = os.path.join(EXPORT_DELIVERY_DIR, sub)
+            _ts = time.strftime("%Y%m%d_%H%M%S")
+            _stem = "%s_%s" % (proj, _ts)
+            # 交付：一个 json 对应一个同名文件夹，json 与该 json 匹配的图片都放在里面
+            _bundle = os.path.join(ddir, _stem)
+            img_dir = _bundle
+            for d in (jdir, _bundle):
+                os.makedirs(d, exist_ok=True)
+            _txt = json.dumps(items, ensure_ascii=False, indent=1)
+            for _p in (os.path.join(jdir, _stem + ".json"), os.path.join(_bundle, _stem + ".json")):
+                with open(_p, "w", encoding="utf-8") as f:
+                    f.write(_txt)
+            hit = miss = 0
+            for it in items:
+                fn = it.get("filename") or ""
+                src = _by_fn.get(fn)
+                if not src or not os.path.exists(src):
+                    miss += 1
+                    continue
+                dst = os.path.join(img_dir, fn)
+                if os.path.exists(dst):
+                    hit += 1
+                    continue
+                try:
+                    os.link(src, dst)          # 同卷硬链接：瞬时、零额外空间
+                    hit += 1
+                except Exception:
+                    try:
+                        shutil.copy2(src, dst)
+                        hit += 1
+                    except Exception:
+                        miss += 1
+            _log("[导出-选中] %s tag=%s 条=%d -> %s（图片 %d 硬链接/复制，缺 %d）"
+                 % (proj, sub, len(items), os.path.join(jdir, _stem + ".json"), hit, miss))
+            # 合并成一个 json（用户 2026-10-08："多个 json 合成一个"）
+            try:
+                import subprocess as _sp
+                _sp.run([sys.executable, "-u", "/opt/ad_mining/tools/_merge_export_json.py", "--dir", jdir],
+                        capture_output=True, text=True, timeout=900)
+            except Exception:
+                pass
+        except Exception as _e:
+            _log("[导出-选中] 失败: %s" % str(_e)[:150])
+
+    threading.Thread(target=_work, daemon=True).start()
+    return {"code": 200, "msg": "已开始后台导出到交付目录（json + 匹配原图）"}
+
+
 @app.post("/api/upload_batch")
 async def upload_batch(
     project: str = Form("default"), files: List[UploadFile] = File(...)
@@ -4360,6 +4458,12 @@ def _detect_load_px():
     """检测读图的最长边上限（0=原图）。缩图能把 ultralytics 的 letterbox 成本降一个量级，
     且 GPU 功率实测只有 37W/285W —— 时间花在 CPU 预处理上，不在算力。"""
     return _env_int("AD_DETECT_LOAD_PX", 0, lo=0, hi=4096)
+def _preload_workers(n):
+    """并行读图/解码的线程数。默认 8；`AD_PRELOAD_WORKERS` 可调。
+    为什么给这个旋钮（2026-10-07 实测）：检测时 **GPU 只有 120W/285W、利用率 31~54%，
+    1/3 的采样 GPU 直接空闲** —— 瓶颈在主机侧的读图/解码，不在算力。这个数就是"喂饱 GPU"的旋钮。
+    ⚠️ 别盲目调大：每线程一份 1080p 解码缓冲，20 核机器给 12~16 就够，再多是抢内存。"""
+    return max(1, min(_env_int("AD_PRELOAD_WORKERS", 8, lo=1, hi=32), n))
 def _preload_bgr(paths, workers=8, max_px=0):
     return _preload_images(paths, rgb=False, workers=workers, max_px=max_px)
 def _preload_rgb(paths, workers=8, max_px=0):
@@ -4440,11 +4544,23 @@ def _yolo_detect_batch_locked(
         # 必须自己分块：ultralytics 收到"内存数组列表"时会忽略 batch 参数，
         # 把整份列表堆成单个张量再上 GPU（2034 张 640x640 ≈ 10G，fp16 转换峰值 ≈ 18.6G），
         # 之前整轮检测就是这样 OOM 失败的。分块后显存/内存都被 bs 限制住。
-        for _s in range(0, len(paths), bs):
+        # ⚡ 块间预取（2026-09-30 调优 P0#1）：原来是「加载16张 → 推理 → 加载 → 推理」串行，
+        #   推理期间 GPU 干等 CPU 解码。改成提交下一块的加载到后台线程，与本次推理重叠。
+        #   实测依据：检测时 GPU 功率仅 120W/285W，而主进程 CPU 钉在 100%（1 核）—— 卡在等数据。
+        #   额外内存：预取一块 ≈ bs×1080p×3B（bs=16 时约 100MB），可接受。
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _chunks = list(range(0, len(paths), bs))
+        _ld_pool = _TPE(max_workers=1)   # 单线程调度：_preload_bgr 内部自己还有 8 线程解码
+        _submit = lambda _st: _ld_pool.submit(
+            _preload_bgr, paths[_st:_st + bs],
+            workers=_preload_workers(len(paths[_st:_st + bs])), max_px=_detect_load_px())
+        _fut = _submit(_chunks[0]) if _chunks else None
+        for _ci_i, _s in enumerate(_chunks):
             _cp = paths[_s:_s + bs]
             _ci = idxs[_s:_s + bs]
-            _items = _preload_bgr(_cp, workers=min(8, max(1, len(_cp))),
-                                  max_px=_detect_load_px())
+            _items = _fut.result()
+            _nxt_s = _chunks[_ci_i + 1] if _ci_i + 1 < len(_chunks) else None
+            _fut = _submit(_nxt_s) if _nxt_s is not None else None   # 先派活，再推理 → 重叠
             _keep = [k for k in range(len(_ci)) if _items[k] is not None]
             if not _keep:
                 continue
@@ -4498,6 +4614,7 @@ def _yolo_detect_batch_locked(
                 except Exception:
                     continue
             del _arr, _items      # 及时释放这一块的 BGR 数组（每张 1080p 约 6MB）
+        _ld_pool.shutdown(wait=False)   # 预取线程池收摊（此时已无在途任务）
         _persist_detections()  # 全部块跑完一次落盘，避免逐张反复写文件
     _t_yolo = time.time() - _t_stage0
     # 用户 2026-09-22：检测阶段顺带跑一趟 YOLO-World（开放词表：目标物 + 设施）。
@@ -4897,14 +5014,27 @@ def _fine_digit_fill(project, ids):
     if not _ensure_fine():
         return 0
     n = 0
+    # ⚡ 并行预读（2026-10-07 提速）：原来这里是**逐帧串行 cv2.imread**，网盘实测 **33ms/帧**，
+    #    500 帧光读图就 16.5 秒（占本阶段 ~40%）。检测的前两路早就是 `_preload_*` 并行读，
+    #    只有这一路漏了。改成并行后读的是**同一张图、同样的 crop、同样的模型与阈值** ——
+    #    纯去掉无用功，不碰 P/R。
+    _M = load_project_context(project).get("metadata") or []
+    _jobs, _pl = [], []
     for _i, rec, sb in todo:
         try:
-            _p = (load_project_context(project).get("metadata") or [])[int(_i)]["path"]
+            _p = _M[int(_i)]["path"]
         except Exception:
-            continue
-        if not _p or not os.path.exists(_p):
-            continue
-        img = cv2.imread(_p)
+            _p = None
+        _jobs.append((_i, rec, sb, _p))
+        if _p and os.path.exists(_p):
+            _pl.append(_p)
+    _img_of = {}
+    if _pl:
+        for _p, _it in zip(_pl, _preload_bgr(_pl, workers=_preload_workers(len(_pl)), max_px=0)):
+            if _it is not None:
+                _img_of[_p] = _it[0]
+    for _i, rec, sb, _p in _jobs:
+        img = _img_of.get(_p)
         if img is None:
             continue
         H, W = img.shape[:2]
@@ -5027,7 +5157,7 @@ def _sign_batch_fill(project, ids):
         _bx = [x[2] for x in _keep]; _sr = [x[3] for x in _keep]
         # ② 闭集框入列；闭集模型的 signal 类与已有灯框重叠时让给灯（它那类样本太少，不抢）
         _lights = [b for l, s, b in zip(_lb, _sr, _bx)
-                   if s != "sign" and _YOLO_LABEL2OBJ.get(str(l).lower()) == "红绿灯"]
+                   if s != "sign" and str(l).lower().strip() in _LIGHT_LABELS]
         for b in r.boxes:
             try:
                 cf = float(b.conf[0]); nm = str(r.names[int(b.cls[0])]).lower().strip()
@@ -5088,10 +5218,25 @@ def _yw_sign_batch_fill(project, ids):
     _szi = _env_int("AD_SIGN_IMGSZ", 1280, lo=640, hi=1536)
     _bs = max(1, min(int(os.environ.get("AD_SIGN_BATCH", "8")), len(sel)))
     n_yw = n_sg = replaced = 0
-    for _s in range(0, len(sel), _bs):
-        part = sel[_s:_s + _bs]
-        _items = _preload_bgr([p for _i, p in part], workers=min(8, max(1, len(part))),
-                              max_px=_detect_load_px())
+    # ⚡ 块间预取（2026-10-07 提速）：原来是「读一块 → 两张模型推理 → 再读下一块」**串行**，
+    #    推理期间 CPU 干等、GPU 也跟着等短（实测检测时 GPU 只有 120W/285W、利用率 31~54%，
+    #    有 1/3 的采样 GPU 直接空闲 —— 瓶颈在主机侧，不在算力）。
+    #    改成「提交下一块的读解码到后台线程，与本次推理重叠」，与 YOLO 那趟同款。
+    #    额外内存：一块 ≈ bs×1080p×3B（bs=8 时约 50MB），可接受。
+    from concurrent.futures import ThreadPoolExecutor as _TPE2
+    _chunks2 = list(range(0, len(sel), _bs))
+
+    def _load2(_st):
+        _p2 = sel[_st:_st + _bs]
+        return _preload_bgr([p for _i, p in _p2],
+                            workers=_preload_workers(len(_p2)), max_px=_detect_load_px()), _p2
+
+    _ld2 = _TPE2(max_workers=1)
+    _fut2 = _ld2.submit(_load2, _chunks2[0]) if _chunks2 else None
+    for _ci2, _s in enumerate(_chunks2):
+        _items, part = _fut2.result()
+        _nxt2 = _chunks2[_ci2 + 1] if _ci2 + 1 < len(_chunks2) else None
+        _fut2 = _ld2.submit(_load2, _nxt2) if _nxt2 is not None else None   # 先派活，再推理
         keep = [(i, it) for (i, _p), it in zip(part, _items) if it is not None]
         if not keep:
             continue
@@ -5171,7 +5316,7 @@ def _yw_sign_batch_fill(project, ids):
             if _rs is not None and _k < len(_rs):
                 r2 = _rs[_k]
                 _lights = [b for l, s, b in zip(_lb, _sr, _bx)
-                           if str(s) != "sign" and _YOLO_LABEL2OBJ.get(str(l).lower()) == "红绿灯"]
+                           if str(s) != "sign" and str(l).lower().strip() in _LIGHT_LABELS]
                 for b in r2.boxes:
                     try:
                         cf = float(b.conf[0]); nm = str(r2.names[int(b.cls[0])]).lower().strip()
@@ -5184,7 +5329,11 @@ def _yw_sign_batch_fill(project, ids):
                     _sxf, _syf = _sc_map.get(_i, (1.0, 1.0))
                     bxx = ([bxx_a[0] * _sxf, bxx_a[1] * _syf, bxx_a[2] * _sxf, bxx_a[3] * _syf]
                            if (_sxf != 1.0 or _syf != 1.0) else bxx_a)   # 原图空间（入库/IoU）
-                    if cn == "红绿灯" and any(_iou(bxx, hb) >= 0.5 for hb in _lights):
+                    # 灯腔假阳性（用户 2026-09-30 定规则）：红灯球面/面板内部图案会被闭集模型
+                    # 认成限速/禁令圆牌（实测限速 conf 高到 0.73）。禁令/限速牌不可能嵌在信号灯
+                    # 背板里面 —— 用【交集占标志框自身面积的比例】判 containment（比 IoU 好：
+                    # 大背板包小标志时 IoU 被背板面积稀释），ratio>0.35 丢弃（对所有闭集类）。
+                    if any(_contain_ratio(bxx, hb) > 0.35 for hb in _lights):
                         continue
                     if cn == "红绿灯" and not _signal_recheck(_arr[_k], bxx_a):
                         continue
@@ -5196,6 +5345,7 @@ def _yw_sign_batch_fill(project, ids):
                         "labels": _lb, "scores": _sc, "boxes": _bx, "src": _sr})
             sub[str(_i)] = rec
         del _arr          # 及时释放（每张 1080p BGR 约 6MB）
+    _ld2.shutdown(wait=False)   # 预取线程池收摊（此时已无在途任务）
     _persist_detections()
     _log("[检测] 开放词表+闭集标志 合并跑完 %d 帧（YW %d / 闭集 %d；摘掉或拦下 YW 牌子框 %d 个）"
          % (len(sel), n_yw, n_sg, replaced))
@@ -5277,6 +5427,17 @@ def _sign_cn_of_frames(project, fids):
 #   - YOLO 侧按 `_YOLO_THR` 过滤（红绿灯已从 0.30 提到 0.35），YW 侧按 `_YWL_CONF`；
 #   - **来源分流**：判定里"检测摘要 / 轨迹 / 事件闸门"只吃 `src=="yolo"` 的框（`_yolo_of` 里过滤），
 #     免得 YW 的框改变闸门行为；补全证据则专门吃 `src=="yoloworld"` 的框（`_yoloworld_cn_of_frames`）。
+def _contain_ratio(inner, outer):
+    """交集面积占 inner 框自身面积的比例（0~1）——判"小框是否嵌在大框里"用，
+    比 IoU 好：背板框很大时 IoU 被背板面积稀释，containment 比例不受影响。"""
+    try:
+        ax1, ay1, ax2, ay2 = [float(v) for v in inner]
+        bx1, by1, bx2, by2 = [float(v) for v in outer]
+    except Exception:
+        return 0.0
+    inter = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
+    area = max(0.0, (ax2 - ax1) * (ay2 - ay1))
+    return inter / area if area > 0 else 0.0
 def _iou(a, b):
     """两个 [x1,y1,x2,y2] 的 IoU（去重用）。"""
     try:
@@ -5487,11 +5648,33 @@ def _yoloworld_detect_batch_locked(project, image_ids, text_prompt):
 def get_all_detections(project: str = Query("default")):
     """返回某项目下已持久化的所有目标检测结果，供前端加载页面时全量同步。
 
-    仅返回当前项目，保证项目隔离。"""
-    global detections_cache
+    仅返回当前项目，保证项目隔离。
+    ⚠️ 大项目慎用：这是**全量物化**（90 万帧约 500MB JSON，浏览器扛不住）。新前端应改用
+    /api/detections?fids=...（按帧批量）。SQLite 模式下这里会把冷帧读回内存再返回，用完即释放。"""
     proj = project or "default"
-    sub = detections_cache.get(proj, {}) if isinstance(detections_cache, dict) else {}
-    return {"code": 200, "project": proj, "detections": sub}
+    sub = detections_cache.get(proj) or {}
+    if isinstance(detections_cache, dict):
+        return {"code": 200, "project": proj, "detections": sub}
+    d = sub.to_dict() if hasattr(sub, "to_dict") else {}
+    if len(d) > 200000:
+        _log(f"[检测] /api/get_all_detections 全量返回 {proj} {len(d)} 帧（建议前端改用按帧接口）")
+    return {"code": 200, "project": proj, "detections": d}
+
+@app.get("/api/detections")
+def get_detections_batch(project: str = Query("default"), fids: str = Query("")):
+    """按帧批量取检测记录（生产级改造配套）：fids 逗号分隔，最多 512 帧。
+    前端播放/审核/框渲染改用它，避免一次性拉全量。"""
+    proj = project or "default"
+    sub = detections_cache.get(proj) or {}
+    out = {}
+    for _f in fids.split(",")[:512]:
+        _f = _f.strip()
+        if not _f:
+            continue
+        _r = sub.get(_f)
+        if _r:
+            out[_f] = _r
+    return {"code": 200, "project": proj, "detections": out}
 # ----------------- [可选扩展] Qwen2-VL 综合场景判定 -----------------
 vlm_model = None
 vlm_processor = None
@@ -8824,6 +9007,93 @@ def hard_cases_stats(project: str = Query("default")):
 # ============================================================
 EXPORT_ROOT = os.path.join(WORKSPACE, "exports")
 os.makedirs(EXPORT_ROOT, exist_ok=True)
+# ===== 导出交付路由（用户 2026-10-08）=====
+# 要求：① 导出的 JSON 统一放 test/json（siglip / dino 分开命名）；
+#      ② json + 匹配到的原图 一起放 test/jiaofu，**后续环节从这里取交付物**；
+#      ③ 导出后自动把 json 与图片匹配好，不要让下游再去猜。
+# 路径可用环境变量覆盖；默认就取用户给的这两个网盘目录。
+EXPORT_JSON_DIR = os.environ.get("AD_EXPORT_JSON_DIR", "/mnt/Data_Platform/zhj_datamining/test/json")
+EXPORT_DELIVERY_DIR = os.environ.get("AD_EXPORT_DELIVERY_DIR", "/mnt/Data_Platform/zhj_datamining/test/jiaofu")
+# 交付目录里最多随带多少张原图：粗筛（搜索导出）通常是几十~几百条，随带方便；
+# 全量导出（90 万帧）随带原图不现实，只放 JSON 并在日志里说明。
+_EXPORT_BUNDLE_MAX_IMG = int(os.environ.get("AD_EXPORT_BUNDLE_MAX_IMG", "2000"))
+
+
+def _route_delivery(project, fmt, result, export_id, tag="siglip"):
+    """导出后把产物路由到交付目录。tag 区分 siglip / dino。"""
+    src = (result or {}).get("path") or ""
+    if not src or not os.path.exists(src):
+        return
+    _ts = time.strftime("%Y%m%d_%H%M%S")
+    # 按类型进子目录（用户已建 test/json/siglip 与 test/json/Dino）——大小写与用户目录一致
+    _sub = "Dino" if str(tag).lower().startswith("dino") else "siglip"
+    _jdir = os.path.join(EXPORT_JSON_DIR, _sub)
+    _ddir = os.path.join(EXPORT_DELIVERY_DIR, _sub)
+    os.makedirs(_jdir, exist_ok=True)
+    os.makedirs(_ddir, exist_ok=True)
+    dst_json = os.path.join(_jdir, "%s_%s.json" % (project, _ts))
+    shutil.copy2(src, dst_json)
+    _log("[导出] JSON 归档 -> %s" % dst_json)
+    # 交付目录：**一个 json 对应一个同名文件夹**（用户 2026-10-08：文件夹命名要和 json 文件名对应）
+    _base = "%s_%s" % (project, _ts)
+    _bundle = os.path.join(_ddir, _base)
+    os.makedirs(_bundle, exist_ok=True)
+    dl_json = os.path.join(_bundle, _base + ".json")
+    shutil.copy2(src, dl_json)
+    cnt = int((result or {}).get("count") or 0)
+    if cnt <= 0:
+        _log("[导出] 交付目录只放 JSON（无记录）-> %s" % dl_json)
+        return
+    _img_dir = _bundle          # 图片直接放进这个同名文件夹
+    os.makedirs(_img_dir, exist_ok=True)
+    _hit = _miss = 0
+    try:
+        with open(src, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line) if fmt in ("jsonl", "json") else None
+                except Exception:
+                    rec = None
+                if not rec:
+                    continue
+                _src_img = rec.get("path") or rec.get("image_path")
+                if not _src_img or not os.path.exists(_src_img):
+                    _miss += 1
+                    continue
+                _dst_img = os.path.join(_img_dir, os.path.basename(_src_img))
+                if os.path.exists(_dst_img):
+                    _hit += 1
+                    continue
+                try:
+                    os.link(_src_img, _dst_img)      # 同卷硬链接：瞬时、零额外空间
+                    _hit += 1
+                except Exception:
+                    try:
+                        shutil.copy2(_src_img, _dst_img)   # 跨卷/不支持硬链接时退回复制
+                        _hit += 1
+                    except Exception:
+                        _miss += 1
+    except Exception as _e:
+        _log("[导出] 交付图片匹配失败: %s" % str(_e)[:120])
+    _log("[导出] 交付目录就绪 %s（json + 匹配图片 %d 张，缺 %d；同卷走硬链接不占空间）" % (_ddir, _hit, _miss))
+    # 合并成一个 json（用户 2026-10-08："多文件合成一个，多个 json 合成一个 json"）
+    try:
+        import subprocess as _sp
+        _r = _sp.run([sys.executable, "-u", "/opt/ad_mining/tools/_merge_export_json.py", "--dir", _jdir],
+                     capture_output=True, text=True, timeout=1800)
+        _tail = (_r.stdout or "").strip().splitlines()[-1:] or [""]
+        _log("[导出] 合并 %s -> %s" % (_jdir, _tail[0][:120]))
+        _r2 = _sp.run([sys.executable, "-u", "/opt/ad_mining/tools/_merge_export_json.py", "--dir", _ddir],
+                      capture_output=True, text=True, timeout=1800)
+        _tail2 = (_r2.stdout or "").strip().splitlines()[-1:] or [""]
+        _log("[导出] 合并 %s -> %s" % (_ddir, _tail2[0][:120]))
+    except Exception as _me:
+        _log("[导出] 合并 json 失败(不影响导出): %s" % str(_me)[:120])
+
+
 def _export_worker(
     export_id: str, project: str, fmt: str, approved_only: bool, include_images: bool
 ):
@@ -8843,7 +9113,44 @@ def _export_worker(
         q = db.query(Asset).filter(Asset.project_id == rec.project_id)
         if approved_only:
             q = q.filter(Asset.status == AssetStatus.APPROVED)
-        assets = q.order_by(Asset.vector_id).all()
+        # ⚠️ 别 .all()：90 万帧的 ORM 对象会一次吃 27GB → 服务被 OOM 杀掉
+        #    （2026-10-08 实测 anon-rss 28.4GB，dmesg 有 Killed process）。
+        #    改成"可重复遍历 + 分批流式"：exporter 里 assets 会被遍历两次（先 serialize 再打包），
+        #    所以不能直接传生成器（第二次就空了），必须给个能反复取、但每次都是流式的包装。
+        _q = q.order_by(Asset.vector_id)
+
+        class _StreamAssets:
+            """可重复遍历的流式资产源：每批 2000 条按偏移查、查完清 identity map，内存有界。
+            ⚠️ 不用 yield_per：本查询带 unique()（joinedload），SQLAlchemy 直接拒绝
+            （实测报 "Can't use the ORM yield_per feature in conjunction with unique()"）。"""
+            def __init__(self, query, session):
+                self._q = query
+                self._db = session
+            def __iter__(self):
+                off, B = 0, 2000
+                while True:
+                    batch = self._q.offset(off).limit(B).all()
+                    if not batch:
+                        break
+                    for a in batch:
+                        yield a
+                    off += len(batch)
+                    try:
+                        self._db.expunge_all()      # 关键：否则 Session 身份映射会把对象全留着
+                    except Exception:
+                        pass
+            def __len__(self):
+                try:
+                    return int(self._q.count())
+                except Exception:
+                    return 0
+
+        assets = _StreamAssets(_q, db)
+        _tag = "siglip"
+        try:
+            _tag = str((rec.filter_criteria or {}).get("tag") or "siglip")
+        except Exception:
+            pass
         if not assets:
             rec.status = "failed"
             rec.error = "没有可导出的资产（approved_only=" + str(approved_only) + "）"
@@ -8875,6 +9182,11 @@ def _export_worker(
             pass
         rec.output_path = result["path"]
         rec.asset_count = result["count"]
+        # 交付路由：JSON 统一归档 + json/原图匹配后放交付目录（用户 2026-10-08）
+        try:
+            _route_delivery(project, fmt, result, export_id, tag=_tag)
+        except Exception as _re:
+            _log("[导出] 交付路由失败(不影响导出本身): %s" % str(_re)[:150])
         rec.manifest = result["manifest"]
         rec.status = "completed"
         rec.completed_at = _dt.utcnow()
@@ -8900,6 +9212,7 @@ def export_run(
     fmt: str = Form("jsonl"),
     approved_only: int = Form(1),
     include_images: int = Form(1),
+    tag: str = Form(""),          # siglip / dino —— 决定归档到哪个子目录
 ):
     """导出资产：fmt=jsonl/csv/parquet/zip；approved_only=1 仅导出已通过；
 
@@ -8921,6 +9234,7 @@ def export_run(
             filter_criteria={
                 "approved_only": bool(approved_only),
                 "include_images": bool(include_images),
+                "tag": (tag or "siglip"),      # 交付归档到 siglip / Dino 哪个子目录
             },
             status="pending",
         )
@@ -10554,6 +10868,11 @@ def _project_has_yolo(project: str) -> bool:
 #
 # 代价实测：模型约 1.5G 显存（可与 7B VLM 8.8G 同卡共存）；单段 8 帧约 0.5~1 秒
 # （对比：DINO 13 秒/帧、VLM 判定约 10 秒/段）。任何异常都返回空集合 → 退化成"没有这一路证据"，不影响判定。
+# 灯框标签集合（「灯腔假阳性」containment 过滤用；两处推理路径共用）。
+# ⚠️ 必须同时含 yoloworld 的 traffic signal：YW 框入库存的是**原始标签**，而 _YOLO_LABEL2OBJ
+#    只映射了 traffic light → 只查它会漏掉库内 22 万框的大头（traffic signal 221,421 框，
+#    是 traffic light 的 1.25 倍），那条 containment 规则会基本不生效（2026-10-02 查实）。
+_LIGHT_LABELS = {"traffic light", "traffic signal", "signal light", "红绿灯"}
 _YWL_MAP = {
     # 参与类（本体 objects 的取值）
     "person": "行人", "bicycle": "两轮车", "motorcycle": "两轮车", "tricycle": "三轮车",

@@ -932,10 +932,13 @@
         let isImporting = false;
         let statusPollingTimer = null;
         // 持久化目标检测缓存（翻页/重开/切项目后自动把已存盘的检测框补回来）
+        // 持久化目标检测缓存（**按帧**缓存；生产级改造 2026-10-07：大项目不再全量拉取）
+        // 语义：cachedDetections[fid] = 记录 | null(=后端确认该帧无框)；undefined = 还没请求过。
+        // 单飞锁 detFetching + 已请求集合 detRequested：同一帧只请求一次，避免播放时每帧重复打请求。
         let cachedDetections = {};
-        let detectionsLoadedFor = '';
-        let detectionsDirty = true;
-        let detectionsLoadingPromise = null;   // 单飞锁：缓存可能上百 MB，并发拉取会把浏览器打爆
+        let detCacheProject = '';
+        let detFetching = null;
+        const detRequested = new Set();
         let isDetectCancelled = false;   // 目标检测急停手刹
         window.onload = async function() {
             await loadProjectList();
@@ -970,6 +973,7 @@
         }
         function syncProjectSelection(projectName) {
             currentProject = projectName;
+            try { localStorage.setItem('ad_last_project', projectName); } catch (e) {}   // 记住上次的项目（2026-10-07）
             document.getElementById('projectSelector').value = projectName;
             document.getElementById('landingProjectSelector').value = projectName;
             document.getElementById('currentProjectTitle').innerText = (window.projDisplay && window.projDisplay[currentProject]) || currentProject;
@@ -993,9 +997,18 @@
 
                 // 切换项目后需重新拉取该项目已持久化的检测结果
 
-                detectionsLoadedFor = '';
+                detCacheProject = '';   // 换项目：按帧缓存整块作废
 
-                detectionsDirty = true;
+                cachedDetections = {}; detRequested.clear();
+
+                // 🔄 项目级面板全部重来（用户 2026-10-07："切换项目后数据还是老项目的，要刷新才行"）
+                //    原来只重载"浏览"视图；停在 数据审核/Benchmark 上切项目时，那两块不会重拉。
+                try { clipCache = []; } catch (e) {}
+                try { _cl.queue = []; _cl.idx = 0; _cl.loadedFor = null; _cl.cur = null; } catch (e) {}
+                try { _auditFilter = 'REVIEW'; } catch (e) {}
+                // 切项目不再自动刷审核面板：它是重活（几百条卡片），用户进面板时自然会刷
+                // （2026-10-08：东南亚切过去会瞬间渲染大量卡片把浏览器压死）
+                try { allFrontendData = []; currentResults = []; } catch (e) {}
 
                 fetchDbStats();
 
@@ -1044,6 +1057,11 @@
 
                 
 
+                // 恢复到上次选的项目（用户 2026-10-07：切项目要丝滑，别每次重选回 default）
+                try {
+                    const _last = localStorage.getItem('ad_last_project');
+                    if (_last && window.projDisplay[_last]) syncProjectSelection(_last);
+                } catch (e) {}
                 document.getElementById('currentProjectTitle').innerText = (window.projDisplay && window.projDisplay[currentProject]) || currentProject;
 
             } catch (e) { console.error("加载项目列表失败", e); }
@@ -1805,36 +1823,74 @@
 
 
 
-        // ---- 持久化目标检测：拉取后端 /api/get_all_detections 并按当前项目缓存 ----
-        // ⚠️ 必须单飞：大项目这份 JSON 上百 MB，播放器每帧都会调进来——没有单飞锁时
-        //    首次拉取完成前每一帧都再发一个全量请求，浏览器被并发大响应淹没、一个都完不成
-        //    （实测症状：播放全程无框）。有了锁，后续调用复用同一个在途 Promise。
-        async function ensureDetectionsLoaded() {
+        // ---- 持久化目标检测：**按帧**从 /api/detections 批量拉取（生产级改造 2026-10-07）----
+        // 为什么不再用 /api/get_all_detections：那是全量返回，90 万帧 ≈ 500MB，浏览器必爆。
+        // 现在只拉"这一屏 / 这一段"的帧，512 帧一批；单飞 + 已请求集合避免重复打请求。
+        async function ensureDetectionsFor(fids) {
 
-            if (!detectionsDirty && detectionsLoadedFor === currentProject) return;
+            const proj = currentProject;
 
-            if (detectionsLoadingPromise) { await detectionsLoadingPromise; return; }
+            if (detCacheProject !== proj) { cachedDetections = {}; detRequested.clear(); detCacheProject = proj; }
 
-            detectionsLoadingPromise = (async () => {
+            const seen = new Set(); const want = [];
 
-                try {
+            (fids || []).forEach(f => {
+                const k = String(f);
+                if (k === 'undefined' || k === 'null' || seen.has(k)) return;
+                seen.add(k);
+                if (cachedDetections[k] === undefined && !detRequested.has(k)) want.push(k);
+            });
 
-                    const res = await fetch(`${API_BASE}/api/get_all_detections?project=${encodeURIComponent(currentProject)}`);
+            if (!want.length) return;
 
-                    const data = await res.json();
+            if (detFetching) { try { await detFetching; } catch (e) {} }
 
-                    cachedDetections = (data && data.detections) || {};
+            const missing = want.filter(k => cachedDetections[k] === undefined && !detRequested.has(k));
 
-                } catch (e) { cachedDetections = {}; }
+            if (!missing.length) return;
 
-                detectionsLoadedFor = currentProject;
-
-                detectionsDirty = false;
-
+            detFetching = (async () => {
+                for (let i = 0; i < missing.length; i += 512) {
+                    const ch = missing.slice(i, i + 512);
+                    ch.forEach(k => detRequested.add(k));
+                    try {
+                        const res = await fetch(`${API_BASE}/api/detections?project=${encodeURIComponent(proj)}&fids=${encodeURIComponent(ch.join(','))}`);
+                        const data = await res.json();
+                        const got = (data && data.detections) || {};
+                        ch.forEach(k => { cachedDetections[k] = got[k] || null; });   // null = 后端确认无框
+                    } catch (e) {
+                        ch.forEach(k => { detRequested.delete(k); });   // 失败放回，下次还能重试
+                    }
+                }
             })();
 
-            try { await detectionsLoadingPromise; } finally { detectionsLoadingPromise = null; }
+            try { await detFetching; } finally { detFetching = null; }
 
+        }
+
+        // 批量检测/列表页用：把这一批 items 的检测记录都拉进缓存
+        async function ensureDetectionsForItems(items) {
+            await ensureDetectionsFor((items || []).map(it => it.id));
+        }
+
+        // 兼容旧调用点（不再全量拉取；要哪些帧由上面按需决定）。失败静默，调用方照旧往下走。
+        async function ensureDetectionsLoaded() { return; }
+
+        // 某帧的检测结果被重新检测覆盖后，作废它的缓存（下次会重拉）
+        function invalidateDetections(fids) {
+            (fids || []).forEach(f => {
+                const k = String(f);
+                delete cachedDetections[k];
+                detRequested.delete(k);
+            });
+        }
+
+        // 图片统一走缩略图（后端按需缩放 + 落盘缓存；实测 448px 仅 17KB，原图 0.5~1.2MB）
+        // ⚠️ 别再传原图：画廊一屏 40 张 = 45MB，这是"切项目不丝滑"的根因（2026-10-07 实测）
+        function _thumbUrl(u, w) {
+            u = String(u || '');
+            if (!u || u.indexOf('?w=') >= 0) return u;
+            return u + (u.indexOf('?') >= 0 ? '&' : '?') + 'w=' + (w || 448);
         }
 
         function applyCachedDetections(items) {
@@ -1881,7 +1937,7 @@
 
         async function attachPersistedDetections(items, isAll) {
 
-            await ensureDetectionsLoaded();
+            await ensureDetectionsForItems(items);
 
             if (applyCachedDetections(items)) {
 
@@ -2624,7 +2680,7 @@
 
 
 
-            await ensureDetectionsLoaded();
+            await ensureDetectionsForItems(targetList);
 
             const reuse = [], fresh = [];
 
@@ -2730,7 +2786,7 @@
 
             refreshTags(targetList);
 
-            detectionsDirty = true;
+            invalidateDetections(targetList.map(it => it.id));
 
             updateSelectionStats();
 
@@ -2808,7 +2864,7 @@
 
 
 
-            await ensureDetectionsLoaded();
+            await ensureDetectionsForItems(targetList);
 
             const reuse = [], fresh = [];
 
@@ -2918,7 +2974,7 @@
 
             refreshTags(targetList);
 
-            detectionsDirty = true;
+            invalidateDetections(targetList.map(it => it.id));
 
             updateSelectionStats();
 
@@ -2989,7 +3045,7 @@
             const prompt = document.getElementById('dinoPrompt').value;
             if (!prompt || !prompt.trim()) return alert('请填写提示词（与 DINO 共用上面那个框；多个词用 . 或 、 分隔）');
             const promptTrim = prompt.trim();
-            await ensureDetectionsLoaded();
+            await ensureDetectionsForItems(targetList);
             const reuse = [], fresh = [];
             targetList.forEach(it => {
                 const c = cachedDetections[String(it.id)] || it.detections;
@@ -3112,7 +3168,7 @@
 
             // 先把本项目已持久化的检测结果拉进前端缓存，供增量跳过判断
 
-            await ensureDetectionsLoaded();
+            await ensureDetectionsForItems(targetList);
 
 
 
@@ -3300,7 +3356,7 @@
 
                 updateSelectionStats();
 
-                detectionsDirty = true; // 新检测结果已落盘，下次回填需重新拉取
+                invalidateDetections(targetList.map(it => it.id));   // 新结果已落盘，作废这批帧缓存
 
 
 
@@ -3570,7 +3626,7 @@
 
                 card.innerHTML = `
                     <div class="img-wrapper">
-                        <img src="${item.url}?w=480" onclick="openModal(${index})" loading="lazy">
+                        <img src="${_thumbUrl(item.url, 480)}" onclick="openModal(${index})" loading="lazy">
                         ${boxesHTML}
                     </div>
                     <div class="card-info">
@@ -3675,11 +3731,19 @@
 
             });
 
-            const a = document.createElement('a');
-
-            a.href = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
-
-            a.download = `AD_${currentProject}_${prefix}_${Date.now()}.json`; a.click();
+            // ⚠️ 改成**服务端落盘**（用户 2026-10-08）：原来这三行是纯浏览器下载 ——
+            //    json 只落到用户 Downloads，网盘 test/json、test/jiaofu 里什么都没有
+            //    （用户报"这里没有导出的"）。现在 POST 给后端：
+            //    json 归档 test/json/<siglip|Dino>/，json + 匹配原图放 test/jiaofu/<...>/，并自动合并。
+            try {
+                const _fd = new FormData();
+                _fd.append('project', currentProject);
+                _fd.append('tag', String(prefix || '').toLowerCase().indexOf('dino') >= 0 ? 'dino' : 'siglip');
+                _fd.append('items', JSON.stringify(payload));
+                const _r = await fetch(`${API_BASE}/api/export_selected`, { method: 'POST', body: _fd });
+                const _jd = await _r.json();
+                alert(_jd.msg || '已提交导出（落盘到网盘交付目录）');
+            } catch (e) { alert('导出失败: ' + e.message); }
 
         }
 
@@ -4541,7 +4605,7 @@ async function hcRefresh() {
 
                 <div style="display:flex; gap:8px; align-items:center;">
 
-                    <img src="${fullUrl('/api/image/' + encodeURIComponent(proj) + '/' + h.image_id)}" style="width:96px; height:60px; object-fit:cover; border-radius:6px; background:#000;" onerror="this.style.visibility='hidden'">
+                    <img src="${fullUrl('/api/image/' + encodeURIComponent(proj) + '/' + h.image_id + '?w=192')}" style="width:96px; height:60px; object-fit:cover; border-radius:6px; background:#000;" onerror="this.style.visibility='hidden'">
                     <div style="flex:1; min-width:0; font-size:12px;">
                         <div><b style="color:${stColor};">${h.status}</b> · #${h.image_id} · ${h.case_id.slice(0,8)}</div>
                         <div style="margin-top:3px;">AI多标: ${aiChips || '—'}</div>
@@ -5093,7 +5157,7 @@ async function fsSearch() {
             };
             card.innerHTML = `
 
-                <img data-nozoom="1" src="${fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id)}" style="width:100%; height:110px; object-fit:cover; display:block; background:#000;" onerror="this.style.visibility='hidden'">
+                <img data-nozoom="1" src="${fullUrl('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id + '?w=448')}" style="width:100%; height:110px; object-fit:cover; display:block; background:#000;" onerror="this.style.visibility='hidden'">
                 <button class="secondary" title="查看这一段的完整信息"
                         style="position:absolute; top:4px; right:4px; font-size:10px; padding:1px 7px; opacity:.85;"
                         onclick="event.stopPropagation();fsShowDetail(_fsCardRef(this))">详情</button>`;
@@ -5187,8 +5251,9 @@ async function fsPlaySeqFrames(it) {
     fsPlayStop();
     if (cap) cap.textContent = '正在加载 ' + fids.length + ' 帧序列画面…';
     const urls = fids.map(function (fid) {
-        return '/api/image/' + encodeURIComponent(currentProject) + '/' + fid;
+        return '/api/image/' + encodeURIComponent(currentProject) + '/' + fid + '?w=1280';
     });
+    try { ensureDetectionsFor(fids); } catch (e) {}   // 本段检测记录一次拉齐
     // 先预载前 8 帧就开播，其余边播边取（浏览器自行缓存）
     await Promise.all(urls.slice(0, 8).map(function (u) {
         return new Promise(function (res) {
@@ -5426,7 +5491,7 @@ async function fsPlayFrames(frameIds, videoName, tags, repId) {
     const entries = frameIds.map(function (fid, i) {
         return {
             fid: fid,
-            url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid,
+            url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid + '?w=1280',
             txt: '<b>' + (videoName || '') + '</b> · 段内第 ' + (i + 1) + '/' + frameIds.length + ' 帧 · #' + fid
         };
     });
@@ -5520,7 +5585,7 @@ function fsPlayStart() {
             if (flat.length < CAP) {
                 flat.push({
                     fid: fid,
-                    url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid,
+                    url: '/api/image/' + encodeURIComponent(currentProject) + '/' + fid + '?w=1280',
                     txt: '<b>' + ((it.segment && it.segment.video) || it.filename || '') + '</b> · #' + fid
                 });
             }
@@ -5542,7 +5607,7 @@ function fsPlayStart() {
 }
 
 // ===== 检测框随帧叠加（2026-09-30）：播放器切到哪帧，就画那帧的 YOLO/闭集框 =====
-// 数据源直接复用页面已有的全量缓存 cachedDetections（ensureDetectionsLoaded 拉过一次），
+// 数据源是**按帧**缓存 cachedDetections（由 ensureDetectionsFor 按需拉取，见其注释），
 // 不新增任何接口；阈值沿用搜索页那个分数滑块 currentBoxThreshold。
 function _boxColor(label) {
     let h = 0;
@@ -5623,12 +5688,12 @@ function stageDrawBoxes(pfx) {
     const img = document.getElementById(pfx + 'StageImg');
     const layer = document.getElementById(pfx + 'StageBoxes');
     if (!st || !img || !layer) return;
-    // 缓存未就绪（首次进项目要拉全量检测）→ 触发拉取，完成后本帧会随播放/翻页重画
-    if (detectionsDirty || detectionsLoadedFor !== currentProject) {
-        ensureDetectionsLoaded().then(function () { stageDrawBoxes(pfx); }).catch(function () {});
+    const fid = (st.fids || [])[st.idx || 0];
+    // 该帧还没拉过检测记录 → 按帧拉取，完成后重画本帧（不再全量拉取）
+    if (cachedDetections[String(fid)] === undefined) {
+        ensureDetectionsFor([fid]).then(function () { stageDrawBoxes(pfx); }).catch(function () {});
         return;
     }
-    const fid = (st.fids || [])[st.idx || 0];
     drawDetBoxesInto(fid, img, layer, function () { _syncBoxLayerRect(img, layer); });
 }
 // 框开关：一处切换，三个播放器（全屏 / 审核 stage / 评测 stage）同步生效
@@ -5653,18 +5718,18 @@ async function fsPlayShowBoxes(fid) {
     if (!_fsBoxesOn) { fsPlayDrawBoxes(fid); return; }   // 关闭状态：清层即可，不提示不拉取
     const layer = document.getElementById('fsPlayerBoxes');
     // 缓存未就绪时给出提示（首次要拉全量检测，大项目可能十几秒）
-    if (detectionsDirty || detectionsLoadedFor !== currentProject) {
+    if (cachedDetections[String(fid)] === undefined) {
         if (layer) {
             layer.innerHTML = '<div style="position:absolute; left:12px; bottom:12px;'
                 + 'background:rgba(8,14,26,0.85); color:#93c5fd; font-size:12px;'
                 + 'padding:4px 10px; border-radius:6px; border:1px solid rgba(148,163,184,0.35);">'
-                + '检测数据加载中…（首次需拉取全量，稍后框会自动出现）</div>';
+                + '检测数据加载中…（正在按帧拉取，稍后会自动出现）</div>';
             layer.dataset.on = '1';
             layer.style.display = 'block';
             fsSyncBoxLayer();
         }
     }
-    try { await ensureDetectionsLoaded(); } catch (e) {}
+    try { await ensureDetectionsFor([fid]); } catch (e) {}
     fsPlayDrawBoxes(fid);
 }
 // 图片加载完成 / 窗口缩放 / 全屏切换都要重新对齐叠加层
@@ -6253,7 +6318,11 @@ async function auditRefresh() {
         let pendingClips = ((cd && cd.items) || []).map(clipMiniToItem);
         let clipDec = (st && st.decisions) || null;
         // 待审段超过一页才补取（正常只有几十条，一页就够）
-        for (let page = 2; pendingClips.length < ((cd && cd.total) || 0) && page <= 10; page++) {
+        // ⚠️ 必须设上限：东南亚待审 6,942 段，原来会一直补到 10 页 = 2,000 张卡片 + 2,000 张图
+        //    → 浏览器直接卡死（2026-10-08 实测 renderAuditQueue 后 DOM 2000 行 / 2000 图）。
+        //    审核面板一次看几百条足够，剩下的靠筛选/分页。
+        const _AUDIT_MAX = 400;
+        for (let page = 2; pendingClips.length < Math.min(((cd && cd.total) || 0), _AUDIT_MAX) && page <= 10; page++) {
             const more = await auditFetch('/api/clips/list?project=' + _q
                 + '&decision=' + _f + '&mini=1&size=200&page=' + page).catch(() => null);
             const its = (more && more.items) || [];
@@ -6307,7 +6376,7 @@ function renderAuditQueue() {
         const statusColor = it.status === 'APPROVED' ? '#10b981' : (it.status === 'FILTERED' ? '#ef4444' : '#f59e0b');
         card.innerHTML = `
 
-            <img data-nozoom="1" src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" onerror="this.style.visibility='hidden'">
+            <img data-nozoom="1" loading="lazy" src="${fullUrl(it.img_url || ('/api/image/' + encodeURIComponent(currentProject) + '/' + it.id))}" onerror="this.style.visibility='hidden'">
             <div class="audit-card-info">
                 <div><b>#${it.id}</b> <span style="color:${statusColor};">${it.status || ''}</span></div>
                 <div>${reason || ''}</div>
@@ -7199,7 +7268,11 @@ async function clipLabelOpen() {
   // 过去是 40 页 × 100 条全量拉回来再在浏览器里 filter（4.66MB / 42 个请求），
   // 真正能标的只有判定过的那一部分；每段的完整详情在翻到它时才取。
   let q = [];
-  for (let page = 1; page <= 40; page++) {
+  // ⚠️ 页数必须设上限：东南亚 has_vlm 有 21,025 段，原来会连打 40 页、攒 8,000 条队列
+  //    → 打开评测面板就把浏览器压死（2026-10-08 实测：点心跳不动、截图超时）。
+  //    评测一次看几百条足够，其余靠筛选。
+  const _BENCH_PAGES = 2;
+  for (let page = 1; page <= _BENCH_PAGES; page++) {
     let d = null;
     try { d = await auditFetch('/api/clips/list?project=' + encodeURIComponent(currentProject) + '&has_vlm=1&mini=1&size=200&page=' + page); } catch (e) { break; }
     const items = (d && d.items) || [];
@@ -7273,6 +7346,8 @@ function stageInit(pfx, urls, bigUrls, thumbs, fids) {
   st.urls = urls || []; st.bigUrls = bigUrls || st.urls; st.thumbs = thumbs || st.urls;
   st.fids = fids || [];
   st.idx = 0; st.playing = false; st.speed = 500;
+  // 整段检测记录一次拉齐（原来切帧才逐帧拉，播放时每帧一次请求）
+  if (st.fids.length) { try { ensureDetectionsFor(st.fids); } catch (e) {} }
   const fr = document.getElementById(pfx + 'Frames');
   if (fr) fr.innerHTML = st.thumbs.map(function (u, i) {
     return '<img data-fi="' + i + '" src="' + u + '" onclick="stageSeek(\'' + pfx + '\',' + i + ')" '
@@ -7820,11 +7895,12 @@ function ivDrawBoxes() {
     const img = document.getElementById('ivImg');
     const layer = document.getElementById('ivBoxes');
     if (!img || !layer) return;
-    if (detectionsDirty || detectionsLoadedFor !== currentProject) {
-        ensureDetectionsLoaded().then(function () { ivDrawBoxes(); }).catch(function () {});
+    const _ivf = (_iv.fids || [])[_iv.i];
+    if (cachedDetections[String(_ivf)] === undefined) {
+        ensureDetectionsFor([_ivf]).then(function () { ivDrawBoxes(); }).catch(function () {});
         return;
     }
-    drawDetBoxesInto((_iv.fids || [])[_iv.i], img, layer, function () {
+    drawDetBoxesInto(_ivf, img, layer, function () {
         // ivWrap 紧贴 img（flex 居中项），层尺寸= img 渲染尺寸即可
         layer.style.width = img.clientWidth + 'px';
         layer.style.height = img.clientHeight + 'px';

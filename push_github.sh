@@ -25,7 +25,7 @@ fi
 
 # 核心文件（有改动才同步）
 CORE_FILES=(
-  app.py front.html
+  app.py front.html det_store.py
   db_service.py db_patch.py models.py gpu_patch.py
   vlm_clip.py clip_service.py
   settings.py sampling.py decision_engine.py tag_system.py
@@ -36,6 +36,7 @@ CORE_FILES=(
 # 生产脚本：本地 _xxx.py -> 仓库 xxx.py（下划线前缀是本地临时脚本的命名习惯）
 SCRIPT_MAP=(
   "_auto_ingest.py:auto_ingest.py"
+  "_merge_export_json.py:merge_export_json.py"
   "_daily_backup.py:daily_backup.py"
   "_restore_eu.py:restore_index_from_db.py"
   "_build_tsr_dataset.py:build_tsr_dataset.py"
